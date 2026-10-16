@@ -158,11 +158,9 @@ def secretbox_decrypt(key: bytes, blob: bytes) -> bytes:
 
 class Vault:
     """
-    Manages encrypted credential persistence with master key management.
-    Supports either:
-    1. Machine/user-isolated key stored in a protected local keyfile
-       (Windows DPAPI on Windows, 0600 permissions on Linux).
-    2. Master password protected key derived via Argon2id.
+    Manages encrypted credential persistence using libsodium SecretBox (XSalsa20-Poly1305).
+    Credentials are encrypted at rest with a dedicated 256-bit key stored in a protected
+    local keyfile with strict POSIX DAC permissions (0700 directory, 0600 file).
     """
 
     def __init__(self, key_file_path: Path):

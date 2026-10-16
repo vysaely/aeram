@@ -13,7 +13,7 @@ import logging
 from contextlib import contextmanager
 from pathlib import Path
 import sys
-from typing import List, Optional, Dict, Any, Generator, Set
+from typing import List, Optional, Dict, Any, Generator, Set, Union
 
 from .models import RobloxAccount, FavoriteGame
 from .vault import Vault
@@ -481,6 +481,7 @@ class StorageManager:
 
     def delete_account(self, account_id: str) -> None:
         """Deletes an account from the database and removes its isolated container directory."""
+        self.cleanup_runtime_cookie(account_id)
         acc = self.get_account(account_id)
         with self._db() as cursor:
             cursor.execute("DELETE FROM accounts WHERE account_id = ?", (account_id,))
@@ -981,7 +982,7 @@ class StorageManager:
 
         return ff
 
-    def init_profile_sandbox(self, account: RobloxAccount) -> Path:
+    def init_profile_sandbox(self, account: RobloxAccount, write_cookie: bool = False) -> Path:
         """
         Sets up the isolated profile filesystem for native Mocktail:
         <profile_dir>/
@@ -992,7 +993,7 @@ class StorageManager:
           ├── config/mocktail/config.yaml (mode 0600, automatic updates disabled)
           ├── cache/mocktail/
           ├── state/mocktail/
-          └── roblox.cookie (mode 0600)
+          └── roblox.cookie (mode 0600, written only on active launch)
         """
         profile_dir = self.get_profile_dir(account)
         data_dir = profile_dir / "data" / "mocktail"
@@ -1011,23 +1012,9 @@ class StorageManager:
         # 1. Provision dedicated binary hardlink to decouple single-instance FNV-1a lock (Linux)
         self.get_instance_binary(account)
 
-        # 2. Write the cookie file securely with mode 0600
-        if account.cookie:
-            cleaned = clean_cookie(account.cookie)
-            cookie_line = cleaned if cleaned.startswith(".ROBLOSECURITY=") else f".ROBLOSECURITY={cleaned}"
-            for c_path in (profile_dir / "roblox.cookie", data_dir / "roblox.cookie"):
-                tmp_cookies = c_path.with_suffix(".tmp")
-                with open(tmp_cookies, "w", encoding="utf-8") as f:
-                    try:
-                        os.chmod(tmp_cookies, 0o600)
-                    except OSError:
-                        pass
-                    f.write(cookie_line + "\n")
-                os.replace(tmp_cookies, c_path)
-                try:
-                    os.chmod(c_path, 0o600)
-                except OSError:
-                    pass
+        # 2. Write the cookie file securely with mode 0600 ONLY if requested for active launch
+        if write_cookie and account.cookie:
+            self.write_runtime_cookie(account)
 
         def _link_directory(src: Path, dest: Path) -> None:
             """Creates a directory symlink."""
@@ -1047,8 +1034,6 @@ class StorageManager:
 
         shared_current = self.mocktail_data / "current.json"
         for cur_dest in (
-            data_dir / "current.json",
-            data_dir / "mocktail" / "current.json",
             profile_dir / "data" / "current.json",
             profile_dir / "data" / "mocktail" / "current.json",
         ):
@@ -1187,6 +1172,157 @@ class StorageManager:
         self._provision_engine_settings(run_dir, account)
 
         return profile_dir
+
+    def write_runtime_cookie(self, account: RobloxAccount) -> List[Path]:
+        """
+        Writes the decrypted authentication cookie to the account's runtime sandbox
+        with mode 0600 immediately prior to process launch.
+        Validates target paths to ensure writes remain strictly within the account's profile directory.
+        """
+        if not account.cookie:
+            return []
+
+        profile_dir = self.get_profile_dir(account).resolve()
+        instances_dir = self.instances_dir.resolve()
+
+        try:
+            profile_dir.relative_to(instances_dir)
+        except ValueError:
+            log.error(f"Refusing to write runtime cookie: {profile_dir} is outside {instances_dir}")
+            return []
+
+        data_dir = (profile_dir / "data" / "mocktail").resolve()
+        data_dir.mkdir(parents=True, exist_ok=True)
+
+        cleaned = clean_cookie(account.cookie)
+        if not cleaned:
+            return []
+        cookie_line = cleaned if cleaned.startswith(".ROBLOSECURITY=") else f".ROBLOSECURITY={cleaned}"
+
+        written_paths = []
+        for c_path in (profile_dir / "roblox.cookie", data_dir / "roblox.cookie"):
+            try:
+                c_path.resolve().relative_to(profile_dir)
+            except ValueError:
+                continue
+            tmp_cookies = c_path.with_suffix(".tmp")
+            try:
+                fd = os.open(tmp_cookies, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+                with open(fd, "w", encoding="utf-8") as f:
+                    f.write(cookie_line + "\n")
+                os.replace(tmp_cookies, c_path)
+                try:
+                    os.chmod(c_path, 0o600)
+                except OSError:
+                    pass
+                written_paths.append(c_path)
+            except Exception as e:
+                log.warning(f"Could not write runtime cookie to {c_path}: {e}")
+
+        return written_paths
+
+    def cleanup_runtime_cookie(self, account_or_id: Union[RobloxAccount, str]) -> int:
+        """
+        Safely removes plaintext runtime cookie files for an account.
+        Validates paths to prevent traversal outside the designated instance profile.
+        Idempotent and safe to call multiple times.
+        """
+        if isinstance(account_or_id, RobloxAccount):
+            account = account_or_id
+        else:
+            account = self.get_account(account_or_id)
+
+        if account:
+            profile_dir = self.get_profile_dir(account)
+        else:
+            clean_id = str(account_or_id).strip()
+            if not clean_id or "/" in clean_id or "\\" in clean_id or ".." in clean_id:
+                return 0
+            matches = list(self.instances_dir.glob(f"*_{clean_id[:8]}"))
+            if matches:
+                profile_dir = matches[0]
+            else:
+                profile_dir = self.instances_dir / clean_id
+
+        if not profile_dir.exists():
+            return 0
+
+        profile_dir_resolved = profile_dir.resolve()
+        instances_dir_resolved = self.instances_dir.resolve()
+        try:
+            profile_dir_resolved.relative_to(instances_dir_resolved)
+        except ValueError:
+            log.error(f"Refusing to cleanup cookie: {profile_dir_resolved} is outside {instances_dir_resolved}")
+            return 0
+
+        target_candidates = [
+            profile_dir_resolved / "roblox.cookie",
+            profile_dir_resolved / "roblox.cookie.tmp",
+            profile_dir_resolved / "data" / "mocktail" / "roblox.cookie",
+            profile_dir_resolved / "data" / "mocktail" / "roblox.cookie.tmp",
+        ]
+
+        cleaned_count = 0
+        for candidate in target_candidates:
+            if candidate.is_symlink():
+                try:
+                    candidate.unlink(missing_ok=True)
+                    cleaned_count += 1
+                except Exception:
+                    pass
+                continue
+            if candidate.exists() and candidate.is_file():
+                try:
+                    candidate.unlink(missing_ok=True)
+                    cleaned_count += 1
+                except Exception as e:
+                    log.debug(f"Failed to unlink {candidate}: {e}")
+
+        return cleaned_count
+
+    def cleanup_stale_runtime_cookies(self, running_account_ids: Optional[Set[str]] = None) -> int:
+        """
+        Startup and recovery scanner: removes leftover plaintext cookie files for any account
+        that is NOT currently executing in an active instance.
+        """
+        if running_account_ids is None:
+            running_account_ids = set()
+
+        if not self.instances_dir.exists():
+            return 0
+
+        instances_dir_resolved = self.instances_dir.resolve()
+        cleaned_total = 0
+
+        try:
+            for entry in self.instances_dir.iterdir():
+                if not entry.is_dir() or entry.is_symlink():
+                    continue
+                try:
+                    entry.resolve().relative_to(instances_dir_resolved)
+                except ValueError:
+                    continue
+
+                folder_name = entry.name
+                is_running = False
+                for aid in running_account_ids:
+                    if folder_name.endswith(f"_{aid[:8]}") or folder_name == aid:
+                        is_running = True
+                        break
+
+                if not is_running:
+                    for cookie_name in ("roblox.cookie", "roblox.cookie.tmp"):
+                        for cand in (entry / cookie_name, entry / "data" / "mocktail" / cookie_name):
+                            if cand.exists() or cand.is_symlink():
+                                try:
+                                    cand.unlink(missing_ok=True)
+                                    cleaned_total += 1
+                                except Exception:
+                                    pass
+        except Exception as e:
+            log.warning(f"Error during stale cookie recovery: {e}")
+
+        return cleaned_total
 
     def get_runtime_dir(self, account: RobloxAccount) -> Path:
         """

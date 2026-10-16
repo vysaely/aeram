@@ -13,6 +13,7 @@ import re
 import shutil
 import json
 import sys
+import atexit
 try:
     import resource
 except ImportError:
@@ -90,6 +91,25 @@ class InstanceRunner:
         self.last_errors: Dict[str, str] = {}
         self.auth_state_manager = AccountAuthStateManager()
         self.scan_running_instances()
+        try:
+            running_ids = set(self.active_instances.keys())
+            stale_cleaned = self.storage.cleanup_stale_runtime_cookies(running_ids)
+            if stale_cleaned > 0:
+                log.info(f"Startup recovery: cleaned up {stale_cleaned} stale runtime cookie file(s)")
+        except Exception as e:
+            log.debug(f"Startup stale cookie cleanup note: {e}")
+        try:
+            atexit.register(self._atexit_cleanup)
+        except Exception:
+            pass
+
+    def _atexit_cleanup(self) -> None:
+        """Emergency process exit handler to ensure runtime cookies are unlinked on application shutdown."""
+        for aid in list(self.active_instances.keys()):
+            try:
+                self.storage.cleanup_runtime_cookie(aid)
+            except Exception:
+                pass
 
     def scan_running_instances(self) -> None:
         """Discovers any existing Roblox instances already running on the system efficiently."""
@@ -152,6 +172,11 @@ class InstanceRunner:
 
     def _handle_instance_exit(self, account_id: str, inst: RunningInstance) -> None:
         """Cleans up active instance tracking, transitions auth state, and inspects logs for early exit cause."""
+        try:
+            self.storage.cleanup_runtime_cookie(account_id)
+        except Exception as e:
+            log.debug(f"Error cleaning up runtime cookie for {account_id}: {e}")
+
         if account_id in self.active_instances:
             del self.active_instances[account_id]
 
@@ -314,6 +339,11 @@ class InstanceRunner:
 
 
         profile_dir = self.storage.init_profile_sandbox(account)
+        try:
+            self.storage.write_runtime_cookie(account)
+        except Exception as e:
+            log.error(f"Failed to write runtime cookie for '{account.username}': {e}")
+            raise RuntimeError(f"Failed to write runtime authentication: {e}")
         bin_path = self.storage.get_instance_binary(account)
 
 
@@ -652,6 +682,10 @@ class InstanceRunner:
 
             return inst
         except Exception as e:
+            try:
+                self.storage.cleanup_runtime_cookie(account)
+            except Exception:
+                pass
             log.error(f"Failed to launch instance for '{account.username}': {e}")
             raise RuntimeError(f"Failed to launch Mocktail for {account.username}: {e}")
 
@@ -697,6 +731,12 @@ class InstanceRunner:
                         pass
         except Exception as e:
             log.debug(f"Error cleaning runtime directory for {account_id}: {e}")
+
+        # Clean up runtime cookie
+        try:
+            self.storage.cleanup_runtime_cookie(account_id)
+        except Exception as e:
+            log.debug(f"Error cleaning runtime cookie for {account_id}: {e}")
 
         if account_id in self.active_instances:
             del self.active_instances[account_id]

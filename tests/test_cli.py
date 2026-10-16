@@ -124,6 +124,119 @@ class TestCLI(unittest.TestCase):
                     self.assertEqual(cm.exception.code, 2)
                     self.assertIn("aeram: error:", fake_err.getvalue())
 
+    def test_cli_add_via_stdin(self):
+        self.api.enrich_account.return_value = {
+            "username": "StdinUser",
+            "display_name": "Stdin Display",
+            "user_id": 112233,
+            "avatar_url": "",
+            "robux_balance": 50,
+        }
+        args = MagicMock()
+        args.install_desktop = False
+        args.list = False
+        args.status = False
+        args.stop = None
+        args.stop_all = False
+        args.add = "-"
+        args.import_file = None
+        args.launch = None
+        args.multi = None
+        args.group = "Default"
+        args.notes = ""
+
+        with patch("sys.stdin", StringIO("_|WARNING:-DO-NOT-SHARE-THIS...stdin_tok")), \
+             patch("sys.stdout", new=StringIO()) as fake_out:
+            run_cli(args, self.storage, self.api, self.runner)
+            self.assertIn("Added account @StdinUser", fake_out.getvalue())
+            acc = self.storage.find_account_by_username("StdinUser")
+            self.assertIsNotNone(acc)
+            self.assertEqual(acc.username, "StdinUser")
+
+    def test_cli_add_via_getpass_prompt(self):
+        self.api.enrich_account.return_value = {
+            "username": "PromptUser",
+            "display_name": "Prompt Display",
+            "user_id": 445566,
+            "avatar_url": "",
+            "robux_balance": 100,
+        }
+        args = MagicMock()
+        args.install_desktop = False
+        args.list = False
+        args.status = False
+        args.stop = None
+        args.stop_all = False
+        args.add = "-"
+        args.import_file = None
+        args.launch = None
+        args.multi = None
+        args.group = "Default"
+        args.notes = ""
+
+        fake_stdin = MagicMock()
+        fake_stdin.isatty.return_value = True
+
+        with patch("sys.stdin", fake_stdin), \
+             patch("getpass.getpass", return_value="_|WARNING:-DO-NOT-SHARE-THIS...prompt_tok"), \
+             patch("sys.stdout", new=StringIO()) as fake_out:
+            run_cli(args, self.storage, self.api, self.runner)
+            self.assertIn("Added account @PromptUser", fake_out.getvalue())
+            acc = self.storage.find_account_by_username("PromptUser")
+            self.assertIsNotNone(acc)
+            self.assertEqual(acc.username, "PromptUser")
+
+    def test_cli_import_password_stdin(self):
+        acc_file = Path(self.tmp_dir.name) / "enc_accounts.txt"
+        acc_file.write_text("DummyEncryptedPayload")
+
+        args = MagicMock()
+        args.install_desktop = False
+        args.list = False
+        args.status = False
+        args.stop = None
+        args.stop_all = False
+        args.add = None
+        args.import_file = str(acc_file)
+        args.password = "-"
+        args.launch = None
+        args.multi = None
+
+        with patch("sys.stdin", StringIO("my_secret_pwd\n")), \
+             patch("cli.import_from_file_or_text", return_value=([], False)) as mock_import, \
+             patch("sys.stdout", new=StringIO()):
+            run_cli(args, self.storage, self.api, self.runner)
+            mock_import.assert_called_once()
+            self.assertEqual(mock_import.call_args[0][1], "my_secret_pwd")
+
+    def test_cli_import_password_prompt(self):
+        acc_file = Path(self.tmp_dir.name) / "enc_accounts2.txt"
+        acc_file.write_text("DummyEncryptedPayload2")
+
+        args = MagicMock()
+        args.install_desktop = False
+        args.list = False
+        args.status = False
+        args.stop = None
+        args.stop_all = False
+        args.add = None
+        args.import_file = str(acc_file)
+        args.password = "-"
+        args.launch = None
+        args.multi = None
+
+        fake_stdin = MagicMock()
+        fake_stdin.isatty.return_value = True
+
+        with patch("sys.stdin", fake_stdin), \
+             patch("getpass.getpass", return_value="prompted_pwd"), \
+             patch("cli.import_from_file_or_text", return_value=([], False)) as mock_import, \
+             patch("sys.stdout", new=StringIO()):
+            run_cli(args, self.storage, self.api, self.runner)
+            mock_import.assert_called_once()
+            self.assertEqual(mock_import.call_args[0][1], "prompted_pwd")
+
 
 if __name__ == "__main__":
     unittest.main()
+

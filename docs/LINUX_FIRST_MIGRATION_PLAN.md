@@ -39,8 +39,8 @@ Ensure that all historical states, uncommitted work, and active user databases a
 
 ### Target Files & Paths
 - User Data: `~/.local/share/ram-linux/manager.db`, `~/.local/share/ram-linux/vault.key`
-- User Backup: `/home/vysaely/Roblox_Linux_Milestone_Backup_2026/`
-- Git Bundle: `/home/vysaely/aeram_git_checkpoint_20261013.bundle`
+- User Backup: `~/Roblox_Linux_Milestone_Backup_2026/`
+- Git Bundle: `~/aeram_git_checkpoint_20261013.bundle`
 - Repository Branches: `main`, `audit/windows-port-salvage`, `checkpoint/pre-github-publication-20261013`
 
 ### Exact Implementation Steps
@@ -62,7 +62,7 @@ Ensure that all historical states, uncommitted work, and active user databases a
 - *Mitigation:* All unit tests use `tempfile.TemporaryDirectory` and isolate their storage paths.
 
 ### Rollback Procedure
-If any branch issues occur, reset to `archive/windows-port-20261013` or restore from `/home/vysaely/aeram_git_checkpoint_20261013.bundle`.
+If any branch issues occur, reset to `archive/windows-port-20261013` or restore from `~/aeram_git_checkpoint_20261013.bundle`.
 
 ---
 

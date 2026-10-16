@@ -9,6 +9,7 @@ import shutil
 import json
 import logging
 import subprocess
+import tempfile
 from enum import Enum
 from pathlib import Path
 from typing import Optional, List, Dict, Any, Tuple
@@ -228,10 +229,16 @@ class KWinWaylandCompositor(BaseCompositor):
             }}
         }}
         """
-        script_file = Path(f"/tmp/aeram_kwin_{os.getpid()}.js")
+        script_path = None
         try:
-            script_file.write_text(cycle_js, encoding="utf-8")
-            sid = self._iface.loadScript(str(script_file))
+            with tempfile.NamedTemporaryFile(mode="w", suffix=".js", prefix="aeram_kwin_", delete=False, encoding="utf-8") as tf:
+                tf.write(cycle_js)
+                script_path = Path(tf.name)
+            try:
+                os.chmod(script_path, 0o600)
+            except OSError:
+                pass
+            sid = self._iface.loadScript(str(script_path))
             script_obj = self._bus.get_object("org.kde.KWin", f"/Scripting/Script{sid}")
             import dbus
             dbus.Interface(script_obj, "org.kde.kwin.Script").run()
@@ -241,10 +248,11 @@ class KWinWaylandCompositor(BaseCompositor):
             log.debug(f"KWin cycle note: {e}")
             return 0
         finally:
-            try:
-                script_file.unlink(missing_ok=True)
-            except Exception:
-                pass
+            if script_path:
+                try:
+                    script_path.unlink(missing_ok=True)
+                except Exception:
+                    pass
 
 
 class X11Compositor(BaseCompositor):
