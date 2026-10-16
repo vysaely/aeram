@@ -68,17 +68,24 @@ class TestStorageManager(unittest.TestCase):
         self.assertEqual(loaded.group, "VIP")
         self.assertEqual(loaded.tags, ["trader", "alt"])
 
-        # Check isolated sandbox directory structure was created
+        # Check isolated sandbox directory structure was created without leaving plaintext cookie at rest
         profile_dir = self.storage.get_profile_dir(acc)
         self.assertTrue(profile_dir.exists())
 
         cookie_file = profile_dir / "roblox.cookie"
+        self.assertFalse(cookie_file.exists(), "Plaintext cookie must not remain at rest upon save")
+
+        # Verify write_runtime_cookie provisions the cookie file with mode 0600
+        written = self.storage.write_runtime_cookie(acc)
         self.assertTrue(cookie_file.exists())
         self.assertEqual(cookie_file.read_text().strip(), ".ROBLOSECURITY=_|WARNING:-DO-NOT-SHARE-THIS...12345")
-
-        # Verify permissions: 0600 on cookie file
         mode = cookie_file.stat().st_mode & 0o777
         self.assertEqual(mode, 0o600)
+
+        # Verify cleanup_runtime_cookie safely unlinks the runtime cookie
+        cleaned = self.storage.cleanup_runtime_cookie(acc)
+        self.assertGreaterEqual(cleaned, 1)
+        self.assertFalse(cookie_file.exists(), "Runtime cookie must be unlinked after cleanup")
 
         # Verify Mocktail directories and payloads
         self.assertTrue((profile_dir / "data" / "mocktail" / "payloads").exists())

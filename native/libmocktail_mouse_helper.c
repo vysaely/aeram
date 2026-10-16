@@ -206,8 +206,14 @@ static void inject_anti_afk_event(SDL_Window *window) {
 }
 
 static FILE *dbg_fp = NULL;
-#define DBG(...) do { if (!dbg_fp) dbg_fp = fopen("/tmp/mocktail_overlay_debug.log", "a"); \
-    if (dbg_fp) { fprintf(dbg_fp, __VA_ARGS__); fflush(dbg_fp); } } while (0)
+static int dbg_checked = 0;
+#define DBG(...) do { \
+    if (!dbg_checked) { \
+        dbg_checked = 1; \
+        if (getenv("AERAM_OVERLAY_DEBUG")) dbg_fp = fopen("/tmp/mocktail_overlay_debug.log", "a"); \
+    } \
+    if (dbg_fp) { fprintf(dbg_fp, __VA_ARGS__); fflush(dbg_fp); } \
+} while (0)
 
 // =============================================================================
 // Mocktail Text Overlay Geometry: Kept native to prevent binary stack corruption
@@ -574,15 +580,18 @@ static void render_text_overlay(SDL_Window *window) {
             overlay_buf_cap = overlay_buf ? info.data_size : 0;
         }
         if (overlay_buf && real_mocktail_text_overlay_copy(info.generation, overlay_buf, info.data_size)) {
-            glActiveTexture(GL_TEXTURE0);
-            glBindTexture(GL_TEXTURE_2D, overlay_tex);
-            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
-            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
-            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
-            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-            glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
-            glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, info.bitmap_w, info.bitmap_h, 0, GL_RGBA, GL_UNSIGNED_BYTE, overlay_buf);
-            last_rendered_gen = info.generation;
+            size_t min_req = (size_t)info.bitmap_w * (size_t)info.bitmap_h * 4;
+            if (info.data_size >= min_req && info.bitmap_w > 0 && info.bitmap_h > 0) {
+                glActiveTexture(GL_TEXTURE0);
+                glBindTexture(GL_TEXTURE_2D, overlay_tex);
+                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+                glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
+                glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, info.bitmap_w, info.bitmap_h, 0, GL_RGBA, GL_UNSIGNED_BYTE, overlay_buf);
+                last_rendered_gen = info.generation;
+            }
         }
     } else {
         glActiveTexture(GL_TEXTURE0);

@@ -176,7 +176,19 @@ def run_cli(args: argparse.Namespace, storage: StorageManager, api: RobloxAPI, r
 
     # Add account directly
     if args.add:
-        cookie = clean_cookie(args.add)
+        if args.add == "-":
+            if sys.stdin.isatty():
+                import getpass
+                raw_input_cookie = getpass.getpass("Enter .ROBLOSECURITY cookie: ").strip()
+            else:
+                raw_input_cookie = sys.stdin.read().strip()
+        else:
+            raw_input_cookie = args.add
+
+        cookie = clean_cookie(raw_input_cookie)
+        if not cookie:
+            print("[ERROR] No valid cookie provided.")
+            sys.exit(1)
         print("Validating session cookie against Roblox API...")
         data = api.enrich_account(cookie)
         if not data:
@@ -194,7 +206,7 @@ def run_cli(args: argparse.Namespace, storage: StorageManager, api: RobloxAPI, r
             avatar_url=data["avatar_url"],
             robux_balance=data["robux_balance"],
             group=args.group or "Default",
-            notes=args.notes or "",
+            notes=getattr(args, "notes", "") or "",
         )
         storage.save_account(acc)
         print(f"[OK] Added account @{acc.username} ({acc.display_name})!")
@@ -207,10 +219,22 @@ def run_cli(args: argparse.Namespace, storage: StorageManager, api: RobloxAPI, r
             print(f"[ERROR] File not found: {source_path}")
             sys.exit(1)
 
+        pwd = args.password
+        if pwd == "-":
+            if sys.stdin.isatty():
+                import getpass
+                pwd = getpass.getpass("Enter decryption password: ")
+            else:
+                pwd = sys.stdin.readline().strip()
+
         print(f"Reading {source_path}...")
-        accounts, pw_needed = import_from_file_or_text(str(source_path), args.password)
+        accounts, pw_needed = import_from_file_or_text(str(source_path), pwd)
+        if pw_needed and not pwd and sys.stdin.isatty():
+            import getpass
+            pwd = getpass.getpass("Encrypted file detected. Enter password: ")
+            accounts, pw_needed = import_from_file_or_text(str(source_path), pwd)
         if pw_needed:
-            print("[ERROR] Encrypted RAM file detected. Please provide --password <password>.")
+            print("[ERROR] Encrypted RAM file detected. Please provide password via prompt or --password.")
             sys.exit(1)
 
         print(f"Found {len(accounts)} accounts. Importing...")
@@ -276,9 +300,12 @@ def run_cli(args: argparse.Namespace, storage: StorageManager, api: RobloxAPI, r
             print("[WARN] No accounts found to export.")
             return
         pwd = args.password
-        if not pwd:
-            import getpass
-            pwd = getpass.getpass("Enter master password to encrypt export archive: ")
+        if not pwd or pwd == "-":
+            if sys.stdin.isatty():
+                import getpass
+                pwd = getpass.getpass("Enter master password to encrypt export archive: ")
+            else:
+                pwd = sys.stdin.readline().strip()
         from core.migration import export_accounts_encrypted
         out_path = export_accounts_encrypted(accounts, pwd, Path(args.export_file))
         print(f"[OK] Successfully exported {len(accounts)} accounts into encrypted archive: {out_path}")

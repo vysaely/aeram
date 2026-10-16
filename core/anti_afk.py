@@ -27,6 +27,7 @@ import platform  # Pre-import standard library platform before evdev uses it
 import glob
 import time
 import json
+import tempfile
 import signal
 import select
 import logging
@@ -144,10 +145,16 @@ class AntiAfkEngine:
         self._ensure_kwin()
         if not self._kwin_iface:
             return
-        script_file = Path(f"/tmp/aeram_afk_{os.getpid()}.js")
+        script_path = None
         try:
-            script_file.write_text(js_code, encoding="utf-8")
-            sid = self._kwin_iface.loadScript(str(script_file))
+            with tempfile.NamedTemporaryFile(mode="w", suffix=".js", prefix="aeram_afk_", delete=False, encoding="utf-8") as tf:
+                tf.write(js_code)
+                script_path = Path(tf.name)
+            try:
+                os.chmod(script_path, 0o600)
+            except OSError:
+                pass
+            sid = self._kwin_iface.loadScript(str(script_path))
             script_obj = self._bus.get_object("org.kde.KWin", f"/Scripting/Script{sid}")
             dbus.Interface(script_obj, "org.kde.kwin.Script").run()
             self._kwin_iface.unloadScript(f"/Scripting/Script{sid}")
@@ -155,10 +162,11 @@ class AntiAfkEngine:
             if self.verbose:
                 log.warning(f"KWin script note: {e}")
         finally:
-            try:
-                script_file.unlink(missing_ok=True)
-            except Exception:
-                pass
+            if script_path:
+                try:
+                    script_path.unlink(missing_ok=True)
+                except Exception:
+                    pass
 
     def get_mocktail_pids(self) -> List[int]:
         """
