@@ -1,0 +1,78 @@
+# ==============================================================================
+# AERAM (.gitignore)
+# Roblox Account Manager
+# ==============================================================================
+
+# Python Caches & Bytecode
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Virtual Environments & Packaging
+.venv/
+venv/
+env/
+ENV/
+build/
+dist/
+*.egg-info/
+
+# Native Build Artifacts
+native/*.so
+native/*.o
+native/*.a
+
+# Sensitive Database, Key & Vault Files (Zero Credential Leakage)
+manager.db
+manager.db*
+vault.key
+vault.key*
+*.db
+*.db-wal
+*.db-shm
+*.sqlite
+*.sqlite3
+*.key
+*.secret
+.env
+.env.*
+
+# Account Exports, Cookie Lists & Local Sandboxes
+:memory:/
+instances/
+current.json
+AccountData.json
+AccountData.enc
+accounts.csv
+cookies.txt
+mains.txt
+*.cookie
+*.cookies
+*.aeram
+
+# Logs & Temporary Files
+*.log
+logs/
+*.tmp
+*.tmp.*
+.tmp*
+no_gamescope
+
+# Reference Clones & Git Bundles
+references/
+bundles/
+*.bundle
+
+# Editor & OS Metadata
+.vscode/
+.idea/
+*.swp
+*~
+.DS_Store
+Thumbs.db
+
+:memory:

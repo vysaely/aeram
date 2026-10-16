@@ -1,0 +1,4 @@
+PyQt6>=6.4.0
+PyQt6-WebEngine>=6.4.0
+pynacl>=1.5.0
+evdev>=1.6.0

@@ -1,0 +1,29 @@
+pkgbase = aeram
+	pkgdesc = Lightweight Roblox Account Manager for Linux with Mocktail integration
+	pkgver = 0.1.0
+	pkgrel = 1
+	url = https://github.com/vysaely/aeram
+	arch = x86_64
+	license = GPL-3.0-or-later
+	makedepends = python-build
+	makedepends = python-installer
+	makedepends = python-wheel
+	makedepends = python-setuptools
+	makedepends = gcc
+	makedepends = make
+	makedepends = git
+	depends = python>=3.10
+	depends = python-pyqt6>=6.4.0
+	depends = python-pyqt6-webengine>=6.4.0
+	depends = python-pynacl>=1.5.0
+	depends = python-evdev>=1.6.0
+	optdepends = mocktail-bin: native Linux Roblox runtime for multi-instance launching
+	optdepends = python-dbus: KWin Wayland scripting integration for KDE Plasma
+	optdepends = hyprland: Wayland compositor support via hyprctl window focus IPC
+	optdepends = xdotool: active window focus cycling for X11 sessions
+	source = git+https://github.com/vysaely/aeram.git#branch=main
+	source = aeram.desktop
+	sha256sums = SKIP
+	sha256sums = SKIP
+
+pkgname = aeram

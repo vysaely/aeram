@@ -1,0 +1,830 @@
+"""
+Process supervisor for launching isolated Roblox instances via native Mocktail runtime.
+Manages isolated execution, decoupled locks, direct-vulkan acceleration,
+cookie authentication, instance lifecycle, and concurrent multi-launching.
+"""
+
+import os
+import signal
+import subprocess
+import time
+import logging
+import re
+import shutil
+import json
+import sys
+try:
+    import resource
+except ImportError:
+    resource = None
+
+from typing import Dict, Optional, List, Callable, Any
+from pathlib import Path
+from urllib.parse import urlparse, parse_qs
+import urllib.request
+
+from .models import RobloxAccount, RunningInstance
+from .storage import StorageManager
+from .auth_state import AccountAuthState, AccountAuthStateManager
+
+log = logging.getLogger("InstanceRunner")
+
+
+def extract_private_server_link_code(link: str) -> Optional[str]:
+    """Extracts the link code from a Roblox private server link."""
+    if not link:
+        return None
+    # Check for direct link code
+    if re.match(r'^[a-zA-Z0-9_\-]+$', link) and len(link) > 15:
+        return link
+
+    # Check for url params: privateServerLinkCode=xxx or linkCode=xxx
+    try:
+        parsed = urlparse(link)
+        query = parse_qs(parsed.query)
+        if "privateServerLinkCode" in query:
+            return query["privateServerLinkCode"][0]
+        if "linkCode" in query:
+            return query["linkCode"][0]
+    except Exception:
+        pass
+    return None
+
+
+def compute_cpu_sets(total_cpus: int, custom_alt_cpus: Optional[str] = None) -> Tuple[set[int], set[int]]:
+    """
+    Computes portable CPU affinity sets for main and background alt instances.
+    Guarantees all cores are within range and dynamically scales across 2 to 128+ core systems.
+    """
+    if total_cpus <= 2:
+        all_cpus = set(range(total_cpus))
+        return all_cpus, all_cpus
+
+    if custom_alt_cpus:
+        try:
+            custom_set = {int(x.strip()) for x in custom_alt_cpus.split(",") if x.strip().isdigit() and int(x.strip()) < total_cpus}
+            if custom_set:
+                main_set = set(range(total_cpus)) - custom_set
+                return main_set or set(range(total_cpus)), custom_set
+        except Exception:
+            pass
+
+    if total_cpus >= 8:
+        # On 8+ core systems, allocate upper ~35% of cores to alts and lower ~65% to main
+        alt_count = max(2, int(total_cpus * 0.35))
+        alt_set = set(range(total_cpus - alt_count, total_cpus))
+        main_set = set(range(0, total_cpus - alt_count))
+    else:
+        # On 4-7 core systems, allocate upper half to alts and all cores to main
+        alt_set = set(range(total_cpus // 2, total_cpus))
+        main_set = set(range(total_cpus))
+
+    return main_set, alt_set
+
+
+class InstanceRunner:
+    def __init__(self, storage: StorageManager, api: Any = None):
+        self.storage = storage
+        self.api = api
+        self.active_instances: Dict[str, RunningInstance] = {}
+        self.last_errors: Dict[str, str] = {}
+        self.auth_state_manager = AccountAuthStateManager()
+        self.scan_running_instances()
+
+    def scan_running_instances(self) -> None:
+        """Discovers any existing Roblox instances already running on the system efficiently."""
+        accounts = self.storage.list_accounts()
+        if not accounts:
+            return
+
+
+        try:
+            my_uid = os.getuid()
+        except AttributeError:
+            return
+
+        try:
+            with os.scandir("/proc") as it:
+                for entry in it:
+                    if not entry.name.isdigit():
+                        continue
+                    try:
+                        if entry.stat().st_uid != my_uid:
+                            continue
+                        cmdline_file = os.path.join(entry.path, "cmdline")
+                        with open(cmdline_file, "rb") as f:
+                            raw = f.read()
+                        if b"mocktail_acc_" not in raw:
+                            continue
+
+                        # Check status: ignore zombies and dead processes
+                        status_file = os.path.join(entry.path, "status")
+                        with open(status_file, "r", errors="ignore") as f:
+                            status_text = f.read()
+                        if "State:\tZ" in status_text or "State:\tX" in status_text:
+                            continue
+
+                        pid = int(entry.name)
+                        content = raw.split(b"\x00")
+                        exe = content[0].decode("utf-8", errors="ignore") if content else ""
+                        fname = Path(exe).name
+
+                        for acc in accounts:
+                            if acc.account_id in fname or fname == f"mocktail_{acc.account_id}":
+                                if acc.account_id not in self.active_instances:
+                                    profile_dir = self.storage.get_profile_dir(acc)
+                                    self.active_instances[acc.account_id] = RunningInstance(
+                                        account_id=acc.account_id,
+                                        username=acc.username,
+                                        pid=pid,
+                                        start_time=time.time(),
+                                        log_path=str(profile_dir / "instance.log"),
+                                    )
+                                break
+                    except Exception:
+                        continue
+        except Exception as e:
+            log.warning(f"Failed to scan running instances: {e}")
+
+    def get_instance_error(self, account_id: str) -> Optional[str]:
+        """Returns the most recent exit or launch error message for the given account."""
+        return self.last_errors.get(account_id)
+
+    def _handle_instance_exit(self, account_id: str, inst: RunningInstance) -> None:
+        """Cleans up active instance tracking, transitions auth state, and inspects logs for early exit cause."""
+        if account_id in self.active_instances:
+            del self.active_instances[account_id]
+
+        is_expired = False
+        # Check instance log for fatal authentication failure or errors
+        if inst.log_path and Path(inst.log_path).exists():
+            try:
+                log_text = Path(inst.log_path).read_text(errors="ignore")[-2048:]
+                if "HTTP 401" in log_text or "authentication rejected" in log_text.lower():
+                    self.last_errors[account_id] = "HTTP 401: Authentication Rejected (Cookie Expired)"
+                    self.auth_state_manager.mark_session_expired(account_id, "HTTP 401: Authentication Rejected (Cookie Expired)")
+                    is_expired = True
+                    return
+                if "[FATAL]" in log_text:
+                    for line in reversed(log_text.splitlines()):
+                        if "[FATAL]" in line:
+                            self.last_errors[account_id] = line.strip()
+                            self.auth_state_manager.set_state(account_id, AccountAuthState.ERROR, line.strip())
+                            return
+            except Exception:
+                pass
+
+        if not is_expired:
+            current_st = self.auth_state_manager.get_state(account_id)
+            if current_st == AccountAuthState.RUNNING:
+                self.auth_state_manager.mark_ready(account_id)
+
+
+    def is_instance_running(self, account_id: str) -> bool:
+        """Checks if a given account's instance is currently alive and healthy."""
+        if account_id not in self.active_instances:
+            return False
+
+        inst = self.active_instances[account_id]
+
+        # 1. Non-blocking child reaping if direct child
+        try:
+            reaped_pid, status = os.waitpid(inst.pid, os.WNOHANG)
+            if reaped_pid == inst.pid:
+                self._handle_instance_exit(account_id, inst)
+                return False
+        except (ChildProcessError, OSError):
+            pass
+
+        # 2. Check proc status for zombie or dead state
+        proc_status = Path(f"/proc/{inst.pid}/status")
+        if not proc_status.exists():
+            self._handle_instance_exit(account_id, inst)
+            return False
+
+        try:
+            for line in proc_status.read_text().splitlines():
+                if line.startswith("State:"):
+                    state = line.split()[1]
+                    if state in ("Z", "X"):  # Zombie or Dead
+                        self._handle_instance_exit(account_id, inst)
+                        return False
+                    break
+        except (ProcessLookupError, FileNotFoundError):
+            self._handle_instance_exit(account_id, inst)
+            return False
+        except Exception:
+            pass
+
+        # 3. Check signal 0 for process liveness
+        try:
+            os.kill(inst.pid, 0)
+            return True
+        except (ProcessLookupError, PermissionError):
+            self._handle_instance_exit(account_id, inst)
+            return False
+
+    def get_running_instance(self, account_id: str) -> Optional[RunningInstance]:
+        """Returns the RunningInstance if active, otherwise None."""
+        if self.is_instance_running(account_id):
+            return self.active_instances[account_id]
+        return None
+
+    def get_running_account_ids(self) -> List[str]:
+        """Returns list of account IDs currently running."""
+        return [aid for aid in list(self.active_instances.keys()) if self.is_instance_running(aid)]
+
+    def is_account_running(self, account_id: str) -> bool:
+        """Alias for is_instance_running."""
+        return self.is_instance_running(account_id)
+
+    def stop_instance(self, account_id: str) -> bool:
+        """Alias for terminate_instance."""
+        return self.terminate_instance(account_id)
+
+    def resolve_active_server_id(self, place_id: int) -> Optional[str]:
+        """
+        Queries Roblox's public server list to locate an active game instance with open slots.
+        Supplying a specific gameInstanceId causes the client to route through join-game-instance
+        rather than join-game, enabling the client GenericChallenge openWindow handler so
+        Arkose CAPTCHA verification windows pop up reliably instead of hanging in matchmaker queues.
+        """
+        try:
+            url = f"https://games.roblox.com/v1/games/{place_id}/servers/0?sortOrder=2&excludeFullGames=true&limit=10"
+            req = urllib.request.Request(url, headers={"User-Agent": "Roblox/Linux"})
+            with urllib.request.urlopen(req, timeout=1.8) as resp:
+                data = json.loads(resp.read().decode("utf-8"))
+                for s in data.get("data", []):
+                    sid = s.get("id")
+                    playing = s.get("playing", 0)
+                    max_players = s.get("maxPlayers", 0)
+                    if sid and (max_players <= 0 or playing < max_players):
+                        log.info(f"Resolved live server {sid} ({playing}/{max_players}) for place {place_id}")
+                        return str(sid)
+        except Exception as e:
+            log.debug(f"Could not resolve active server for place {place_id}: {e}")
+        return None
+
+    def launch_instance(
+        self,
+        account: RobloxAccount,
+        place_id: Optional[int] = None,
+        job_id: Optional[str] = None,
+        private_server_link: Optional[str] = None,
+        follow_user_id: Optional[int] = None,
+    ) -> RunningInstance:
+        """
+        Launches an isolated Roblox instance for the given account.
+        Enforces lifecycle states, suppresses retries on Arkose challenges,
+        and prevents concurrent launching of the same account.
+        """
+        if self.is_instance_running(account.account_id):
+            log.warning(f"Account {account.username} is already running with PID {self.active_instances[account.account_id].pid}")
+            return self.active_instances[account.account_id]
+
+        can_launch, reason = self.auth_state_manager.can_launch(account.account_id)
+        if not can_launch:
+            self.last_errors[account.account_id] = reason
+            raise RuntimeError(reason)
+
+        if not self.auth_state_manager.acquire_launch_lock(account.account_id):
+            raise RuntimeError(f"Account {account.username} is already launching.")
+
+        try:
+            return self._launch_instance_internal(
+                account=account,
+                place_id=place_id,
+                job_id=job_id,
+                private_server_link=private_server_link,
+                follow_user_id=follow_user_id,
+            )
+        finally:
+            self.auth_state_manager.release_launch_lock(account.account_id)
+
+    def _launch_instance_internal(
+        self,
+        account: RobloxAccount,
+        place_id: Optional[int] = None,
+        job_id: Optional[str] = None,
+        private_server_link: Optional[str] = None,
+        follow_user_id: Optional[int] = None,
+    ) -> RunningInstance:
+        self.last_errors.pop(account.account_id, None)
+        self.auth_state_manager.set_state(account.account_id, AccountAuthState.AUTHENTICATING)
+
+
+        profile_dir = self.storage.init_profile_sandbox(account)
+        bin_path = self.storage.get_instance_binary(account)
+
+
+        is_main = self.storage.is_main_account(account)
+        is_alt = not is_main
+
+        # Build native Mocktail execution command
+        base_cmd = [str(bin_path), "--windowed", "--graphics", "opengl"]
+
+        env = os.environ.copy()
+
+        # Build game launch URI if requested
+        if follow_user_id:
+            if place_id:
+                uri = f"roblox://experiences/start?placeId={place_id}&userId={follow_user_id}"
+            else:
+                uri = f"roblox://experiences/start?userId={follow_user_id}"
+            base_cmd.extend(["--launch-uri", uri])
+        elif place_id:
+            uri = f"roblox://experiences/start?placeId={place_id}"
+            if job_id:
+                uri += f"&gameInstanceId={job_id.strip()}"
+            elif private_server_link:
+                code = extract_private_server_link_code(private_server_link)
+                if code:
+                    uri += f"&linkCode={code}"
+            base_cmd.extend(["--launch-uri", uri])
+
+        cmd = base_cmd
+        runtime_dir = self.storage.get_runtime_dir(account)
+
+        # Decouple instance locks and state
+        env["XDG_RUNTIME_DIR"] = str(runtime_dir)
+        env["MOCKTAIL_RUNTIME_ROOT"] = str(profile_dir)
+        env["MOCKTAIL_DATA_ROOT"] = str(profile_dir / "data")
+        env["MOCKTAIL_CONFIG_ROOT"] = str(profile_dir / "config")
+        env["MOCKTAIL_CACHE_ROOT"] = str(profile_dir / "cache")
+        env["MOCKTAIL_STATE_ROOT"] = str(profile_dir / "state")
+        env["XDG_DATA_HOME"] = str(profile_dir / "data")
+        env["XDG_CONFIG_HOME"] = str(profile_dir / "config")
+        env["XDG_CACHE_HOME"] = str(profile_dir / "cache")
+        env["XDG_STATE_HOME"] = str(profile_dir / "state")
+        env["MOCKTAIL_COOKIE_FILE"] = str(profile_dir / "roblox.cookie")
+        env["MOCKTAIL_DISABLE_FAILURE_DIALOG"] = "1"
+        env["MOCKTAIL_GRAPHICS_BACKEND"] = "opengl"
+
+        # Detect Mocktail installation details
+        from core.mocktail_manager import MocktailManager
+        mock_info = MocktailManager().detect()
+
+        # Dynamic font resolution from active Mocktail payload for crisp chat overlay
+        font_path = None
+        if mock_info.data_dir and mock_info.payload_id:
+            candidate_font = mock_info.data_dir / "payloads" / mock_info.payload_id / "assets" / "fonts" / "SourceSansPro-Regular.ttf"
+            if candidate_font.exists():
+                font_path = candidate_font
+
+        # Fallback to system fonts if payload font is unavailable
+        if not font_path or not font_path.exists():
+            for fallback_candidate in (
+                Path("/usr/share/fonts/noto/NotoSans-Regular.ttf"),
+                Path("/usr/share/fonts/TTF/DejaVuSans.ttf"),
+                Path("/usr/share/fonts/dejavu-sans-fonts/DejaVuSans.ttf"),
+            ):
+                if fallback_candidate.exists():
+                    font_path = fallback_candidate
+                    break
+
+        if font_path and font_path.exists():
+            env["MOCKTAIL_TEXT_FONT"] = str(font_path)
+
+        try:
+            alt_fps = int(self.storage.get_setting("alt_fps", "15"))
+        except (ValueError, TypeError):
+            alt_fps = 15
+
+        target_w = "1920" if is_main else "800"
+        target_h = "1080" if is_main else "600"
+
+        env["MOCKTAIL_WIN_WIDTH"] = target_w
+        env["MOCKTAIL_WIN_HEIGHT"] = target_h
+        env["MOCKTAIL_WIN_HIGH_DPI"] = "0"
+
+        # Preload companion native helper to center cursor and handle in-process Anti-AFK
+        mouse_helper = mock_info.helper_path or (Path.home() / ".local" / "lib" / "mocktail" / "libmocktail_mouse_helper.so")
+        if mouse_helper and mouse_helper.exists():
+            existing_preload = env.get("LD_PRELOAD", "")
+            env["LD_PRELOAD"] = f"{mouse_helper}:{existing_preload}".rstrip(":") if existing_preload else str(mouse_helper)
+
+        try:
+            target_fps = int(self.storage.get_account_target_fps(account))
+        except (ValueError, TypeError):
+            target_fps = 330 if is_main else alt_fps
+        try:
+            main_gfx = int(self.storage.get_setting("graphics_quality_level", "7"))
+        except (ValueError, TypeError):
+            main_gfx = 7
+        frm_scale_map = {1: 1, 2: 3, 3: 5, 4: 7, 5: 9, 6: 11, 7: 14, 8: 16, 9: 18, 10: 21}
+        frm_quality = frm_scale_map.get(main_gfx, 14) if is_main else 1
+        graphics_quality = "manual" if is_main else str(frm_quality)
+        texture_quality = 3 if is_main else 1
+
+        is_unlimited = (target_fps >= 1000 or target_fps <= 0)
+        # Setting integer 10000 instructs Mocktail and libroblox to uncap TaskSchedulerTargetFps completely
+        limit_fps = 10000 if is_unlimited else target_fps
+
+        env["MOCKTAIL_GRAPHICS_QUALITY"] = graphics_quality
+        env["vblank_mode"] = "0"
+        env["MOCKTAIL_FRAME_RATE_LIMIT"] = str(limit_fps)
+        env["MOCKTAIL_VSYNC"] = "off"
+        env["SDL_VIDEO_WAYLAND_ALLOW_TEARING"] = "1"
+        env["MOCKTAIL_SWAPCHAIN_IMAGES"] = "3"
+
+        # Completely mute audio and cap frame rate to prevent CPU starvation for alts
+        if is_alt:
+            env["SDL_AUDIODRIVER"] = "dummy"
+            env["MOCKTAIL_DISABLE_AUDIO"] = "1"
+            env["PULSE_SERVER"] = "/dev/null"
+            env["ALSA_CARD"] = "Dummy"
+            env["MOCKTAIL_F11_FULLSCREEN"] = "0"
+            env["MOCKTAIL_FULLSCREEN_READINESS"] = "0"
+            env["MOCKTAIL_MULTITHREADED_RENDERING"] = "1"  # Keep Luau script execution independent of rendering
+            env["MOCKTAIL_PHYSICS_WORKER_MODE"] = "auto"
+        else:
+            env["MOCKTAIL_F11_FULLSCREEN"] = "1"
+            env["MOCKTAIL_FULLSCREEN_READINESS"] = "1"
+            env["MOCKTAIL_MULTITHREADED_RENDERING"] = "1"
+            env["MOCKTAIL_PHYSICS_WORKER_MODE"] = "throughput"
+
+        # Enforce native window state prior to launch (fullscreen for main, windowed 800x600 for alts)
+        window_state_json = json.dumps({
+            "fullscreen": False if is_alt else True,
+            "maximized": False,
+            "schema_version": 1,
+            "windowed": {
+                "has_position": False,
+                "height": int(target_h),
+                "width": int(target_w)
+            }
+        })
+        for ws in (
+            profile_dir / "state" / "window-state.json",
+            profile_dir / "state" / "mocktail" / "window-state.json",
+        ):
+            ws.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+            ws.write_text(window_state_json, encoding="utf-8")
+
+        # Crisp desktop FFlags overrides (strictly compliant with Roblox official safety policy)
+        fflags_dict = None
+        if hasattr(self.storage, "get_effective_fflags"):
+            try:
+                res = self.storage.get_effective_fflags(is_alt=is_alt, texture_quality=texture_quality, frm_quality=frm_quality)
+                if isinstance(res, dict):
+                    fflags_dict = res
+            except Exception:
+                pass
+
+        if fflags_dict is None:
+            if is_alt:
+                fflags_dict = {
+                    "FStringRenderTextureBudgetByRam": "",
+                    "DFFlagTextureQualityOverrideEnabled": True,
+                    "DFIntTextureQualityOverride": 1,
+                    "DFIntDebugFRMQualityLevelOverride": 1,
+                    "FFlagDebugDisableDRS": True,
+                    "FFlagAutomaticDRS": False,
+                    "FFlagAutomaticDRSDisableHighDPIFramebufferHalving": True,
+                    "DFFlagSkipHighResolutiontextureMipsOnLowMemoryDevices2": True,
+                    "DFFlagEnableRequestAsyncCompression": False,
+                    "DFIntCanHideGuiGroupId": 32380007
+                }
+            else:
+                fflags_dict = {
+                    "FStringRenderTextureBudgetByRam": "",
+                    "DFFlagTextureQualityOverrideEnabled": True,
+                    "DFIntTextureQualityOverride": texture_quality,
+                    "DFIntDebugFRMQualityLevelOverride": frm_quality,
+                    "FFlagDebugDisableDRS": True,
+                    "FFlagAutomaticDRS": False,
+                    "FFlagAutomaticDRSDisableHighDPIFramebufferHalving": True,
+                    "FFlagDebugGraphicsPreferOpenGL": True,
+                    "DFFlagSkipHighResolutiontextureMipsOnLowMemoryDevices2": False,
+                    "DFFlagEnableRequestAsyncCompression": False,
+                    "DFIntCanHideGuiGroupId": 32380007
+                }
+
+        challenge_flags = {
+            "FFlagEnableExperienceGenericChallengeRenderingOnLoadingScript": True,
+            "FFlagEnableExperienceGenericChallengeRenderingConnection": True,
+            "FFlagEnableExperienceGenericChallengeRenderingConnection2": True,
+            "FFlagEnableGenericChallengeResponseHandling": True,
+            "FFlagLuaAppChallengeDisableForceWebViewVisible": False,
+            "FFlagLuaAppChallengeTurnstileForceWebViewVisible": True,
+            "FFlagHideChallengeWebViewsUntilDisplayed": False,
+        }
+        fflags_dict.update(challenge_flags)
+
+        fflags_raw = json.dumps(fflags_dict)
+        env["MOCKTAIL_CLIENT_SETTINGS_OVERRIDES_JSON"] = fflags_raw
+        env["MOCKTAIL_FAST_FLAGS_JSON"] = fflags_raw
+
+        # Host library path for companion libraries
+        ld_paths = []
+        if mock_info.lib_dir and mock_info.lib_dir.exists():
+            ld_paths.append(str(mock_info.lib_dir))
+        bin_dir = bin_path.parent
+        if bin_dir.exists() and str(bin_dir) not in ld_paths:
+            ld_paths.append(str(bin_dir))
+        if "LD_LIBRARY_PATH" in env and env["LD_LIBRARY_PATH"]:
+            for p in env["LD_LIBRARY_PATH"].split(":"):
+                if p and p not in ld_paths:
+                    ld_paths.append(p)
+        if ld_paths:
+            env["LD_LIBRARY_PATH"] = ":".join(ld_paths)
+
+        # Manifest and metadata references
+        if mock_info.data_dir:
+            meta_dir = mock_info.data_dir / "metadata"
+            if meta_dir.exists():
+                env["MOCKTAIL_COMPATIBILITY_MANIFEST"] = str(meta_dir / "roblox_compatibility.json")
+                env["MOCKTAIL_BOOTSTRAP_SOURCES_PATH"] = str(meta_dir / "roblox_bootstrap_sources.json")
+                env["MOCKTAIL_HOST_ABI_PROFILE_FILE"] = str(meta_dir / "roblox_host_abi_reference.json")
+                env["MOCKTAIL_UPDATE_SIGNING_TRUST_PATH"] = str(meta_dir / "roblox_signing_certificates.json")
+
+        if not account.cookie:
+            log.warning(f"Account '{account.username}' has no session cookie configured; launching in guest mode.")
+
+        # If this is an alt account, force it into virtual memory via systemd cgroups MemoryHigh
+        # and regulate CPU/IO weight so foreground apps are prioritized while keeping input and network responsive.
+        # Dynamically compute CPU core sets based on host CPU count
+        total_cpus = os.cpu_count() or 1
+        custom_alt_cpus = self.storage.get_setting("custom_alt_cpus", None)
+        main_cpu_set, alt_cpu_set = compute_cpu_sets(total_cpus, custom_alt_cpus)
+        alt_cpus_arg = ",".join(str(c) for c in sorted(alt_cpu_set))
+
+        # If this is an alt account, force it into virtual memory via systemd cgroups MemoryHigh
+        # and regulate CPU/IO weight so foreground apps are prioritized while keeping input and network responsive.
+        if is_alt and shutil.which("systemd-run"):
+            try:
+                alt_mem_high = int(self.storage.get_setting("alt_memory_high_mb", "900"))
+            except (ValueError, TypeError):
+                alt_mem_high = 900
+            scope_cmd = [
+                "systemd-run",
+                "--user",
+                "--scope",
+                f"-pMemoryHigh={alt_mem_high}M",
+                "-pCPUWeight=1",       # Lowest cgroup CPU weight (foreground apps get 99% of CPU slices)
+                "-pIOWeight=1",        # Lowest disk IO weight
+                f"-pAllowedCPUs={alt_cpus_arg}", # Confine alts to designated secondary cores
+            ]
+            for env_var in (
+                "LD_LIBRARY_PATH",
+                "XDG_RUNTIME_DIR",
+                "MOCKTAIL_RUNTIME_ROOT",
+                "MOCKTAIL_DATA_ROOT",
+                "MOCKTAIL_CONFIG_ROOT",
+                "MOCKTAIL_CACHE_ROOT",
+                "MOCKTAIL_STATE_ROOT",
+                "XDG_DATA_HOME",
+                "XDG_CONFIG_HOME",
+                "XDG_CACHE_HOME",
+                "XDG_STATE_HOME",
+                "MOCKTAIL_COOKIE_FILE",
+            ):
+                if env_var in env and env[env_var]:
+                    scope_cmd.append(f"-E{env_var}={env[env_var]}")
+            scope_cmd.append("--")
+            cmd = scope_cmd + cmd
+
+        log_path = profile_dir / "instance.log"
+        log.info(f"Launching account '{account.username}' with cmd: {' '.join(cmd)}")
+
+        def _preexec_proc():
+            os.setsid()  # Detach process as independent session leader
+            if is_alt:
+                try:
+                    os.sched_setaffinity(0, alt_cpu_set)
+                except Exception:
+                    pass
+                try:
+                    # Hard-cap realtime priority to 0 so Mocktail/Roblox threads CANNOT
+                    # elevate to SCHED_FIFO 99 (which starved KWin and the desktop).
+                    resource.setrlimit(resource.RLIMIT_RTPRIO, (0, 0))
+                except Exception:
+                    pass
+                try:
+                    # Disallow negative nice values from ananicy or any process manager
+                    resource.setrlimit(resource.RLIMIT_NICE, (0, 0))
+                except Exception:
+                    pass
+                try:
+                    # Background nice 15 preserves interactive responsiveness for clicks/network
+                    # while yielding CPU to foreground applications.
+                    os.nice(15)
+                except Exception:
+                    pass
+            else:
+                try:
+                    os.sched_setaffinity(0, main_cpu_set)
+                except Exception:
+                    pass
+
+        self.auth_state_manager.set_state(account.account_id, AccountAuthState.LAUNCHING)
+        try:
+            with open(log_path, "a", encoding="utf-8") as log_fd:
+                proc = subprocess.Popen(
+                    cmd,
+                    env=env,
+                    preexec_fn=_preexec_proc,
+                    stdout=log_fd,
+                    stderr=subprocess.STDOUT,
+                    stdin=subprocess.DEVNULL,
+                )
+
+            inst = RunningInstance(
+                account_id=account.account_id,
+                username=account.username,
+                pid=proc.pid,
+                start_time=time.time(),
+                place_id=place_id,
+                job_id=job_id,
+                log_path=str(log_path),
+            )
+            self.active_instances[account.account_id] = inst
+            self.auth_state_manager.mark_running(account.account_id)
+            self.storage.update_last_played(account.account_id, time.time())
+
+            # Brief check if process crashed on immediate preflight
+            time.sleep(0.15)
+            if proc.poll() is not None:
+                self._handle_instance_exit(account.account_id, inst)
+                err = self.last_errors.get(account.account_id)
+                if err:
+                    log.warning(f"Account '{account.username}' exited immediately: {err}")
+
+            return inst
+        except Exception as e:
+            log.error(f"Failed to launch instance for '{account.username}': {e}")
+            raise RuntimeError(f"Failed to launch Mocktail for {account.username}: {e}")
+
+    def terminate_instance(self, account_id: str) -> bool:
+        """Terminates an active instance owned by this manager."""
+        if not self.is_instance_running(account_id):
+            return False
+
+        inst = self.active_instances[account_id]
+        log.info(f"Terminating instance {account_id} (PID {inst.pid})")
+
+        pgid = None
+        try:
+            pgid = os.getpgid(inst.pid)
+            os.killpg(pgid, signal.SIGTERM)
+        except Exception:
+            try:
+                os.kill(inst.pid, signal.SIGTERM)
+            except Exception:
+                pass
+
+        # Allow grace period then force kill if needed
+        time.sleep(0.3)
+        if pgid is not None:
+            try:
+                os.killpg(pgid, signal.SIGKILL)
+            except Exception:
+                pass
+        try:
+            os.kill(inst.pid, signal.SIGKILL)
+        except Exception:
+            pass
+
+        # Clean up instance runtime lock directory
+        try:
+            account = self.storage.get_account(account_id)
+            if account:
+                run_dir = self.storage.get_runtime_dir(account)
+                for lock_file in run_dir.glob("*.lock"):
+                    try:
+                        lock_file.unlink()
+                    except Exception:
+                        pass
+        except Exception as e:
+            log.debug(f"Error cleaning runtime directory for {account_id}: {e}")
+
+        if account_id in self.active_instances:
+            del self.active_instances[account_id]
+        if hasattr(self, "auth_state_manager") and self.auth_state_manager.get_state(account_id) == AccountAuthState.RUNNING:
+            self.auth_state_manager.mark_ready(account_id)
+        return True
+
+    def terminate_all_instances(self) -> int:
+        """Terminates all instances actively tracked by this manager."""
+        count = 0
+        active_ids = list(self.active_instances.keys())
+        for aid in active_ids:
+            if self.terminate_instance(aid):
+                count += 1
+        return count
+
+    @staticmethod
+    def get_available_memory_mb() -> int:
+        try:
+            with open("/proc/meminfo", "r", encoding="utf-8") as f:
+                for line in f:
+                    if line.startswith("MemAvailable:"):
+                        return int(line.split()[1]) // 1024
+        except Exception:
+            pass
+        return 4096
+
+    @staticmethod
+    def get_memory_stats() -> dict:
+        stats = {
+            "mem_avail_mb": 4096,
+            "mem_total_mb": 32768,
+            "swap_free_mb": 4096,
+            "swap_total_mb": 32768,
+        }
+
+        try:
+            with open("/proc/meminfo", "r", encoding="utf-8") as f:
+                for line in f:
+                    parts = line.split()
+                    if not parts:
+                        continue
+                    key = parts[0].rstrip(":")
+                    if key == "MemAvailable":
+                        stats["mem_avail_mb"] = int(parts[1]) // 1024
+                    elif key == "MemTotal":
+                        stats["mem_total_mb"] = int(parts[1]) // 1024
+                    elif key == "SwapFree":
+                        stats["swap_free_mb"] = int(parts[1]) // 1024
+                    elif key == "SwapTotal":
+                        stats["swap_total_mb"] = int(parts[1]) // 1024
+        except Exception:
+            pass
+        return stats
+
+    def launch_multi(
+        self,
+        accounts: List[RobloxAccount],
+        place_id: Optional[int] = None,
+        job_id: Optional[str] = None,
+        private_server_link: Optional[str] = None,
+        follow_user_id: Optional[int] = None,
+        stagger_delay: float = 8.0,
+        on_progress: Optional[Callable[..., None]] = None,
+    ) -> List[RunningInstance]:
+        """
+        Launches multiple accounts sequentially with a recommended 8-15s delay
+        to prevent overwhelming GPU resources and avoid triggering Roblox Arkose CAPTCHAs.
+        Maintains process continuity, forcing alts into virtual memory
+        and notifying the user rather than terminating or aborting.
+        """
+        import random
+        launched = []
+        for i, acc in enumerate(accounts):
+            can_launch, reason = self.auth_state_manager.can_launch(acc.account_id)
+            if not can_launch:
+                log.warning(f"Skipping {acc.username} in multi-launch: {reason}")
+                if on_progress:
+                    try:
+                        on_progress(i, len(accounts), acc, f"Skipped {acc.username}: {reason}")
+                    except Exception:
+                        pass
+                continue
+
+            stats = self.get_memory_stats()
+            avail_mb = stats["mem_avail_mb"]
+            swap_free_mb = stats["swap_free_mb"]
+
+            # If RAM is low but swap is available, give kernel a moment to page out and notify
+            if avail_mb < 1500 and swap_free_mb > 1000:
+                warn_msg = f"System RAM low ({avail_mb} MB available). Virtual memory paging active (Swap free: {swap_free_mb} MB)."
+                log.info(warn_msg)
+                if on_progress:
+                    try:
+                        on_progress(i, len(accounts), acc, warn_msg)
+                    except Exception:
+                        pass
+                time.sleep(1.0)
+            elif (avail_mb + swap_free_mb) < 500:
+                warn_msg = f"Critical memory threshold reached ({avail_mb + swap_free_mb} MB total virtual memory left). Paused launch of {acc.username} to protect stability."
+                log.warning(warn_msg)
+                if on_progress:
+                    try:
+                        on_progress(i, len(accounts), acc, warn_msg)
+                    except Exception:
+                        pass
+                break
+            elif on_progress:
+                try:
+                    on_progress(i, len(accounts), acc, None)
+                except Exception:
+                    pass
+
+
+            if i > 0 and stagger_delay > 0:
+                # Add natural jitter (+0.2s - 1.2s) when delay is > 3s to break metronomic robotic timing
+                jitter = random.uniform(0.2, 1.2) if stagger_delay >= 3.0 else 0.0
+                time.sleep(stagger_delay + jitter)
+            try:
+                inst = self.launch_instance(
+                    account=acc,
+                    place_id=place_id,
+                    job_id=job_id,
+                    private_server_link=private_server_link,
+                    follow_user_id=follow_user_id,
+                )
+                launched.append(inst)
+            except Exception as e:
+                log.error(f"Error launching {acc.username} in multi-launch: {e}")
+        return launched
+
