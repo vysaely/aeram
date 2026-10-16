@@ -1,0 +1,324 @@
+"""
+Unit tests for InstanceRunner process supervisor logic.
+"""
+
+import os
+import sys
+import unittest
+from unittest.mock import MagicMock
+
+from core.instance_runner import extract_private_server_link_code, InstanceRunner
+from core.models import RobloxAccount, RunningInstance
+
+
+class TestInstanceRunner(unittest.TestCase):
+    def test_extract_private_server_link_code(self):
+        # Direct code
+        code = "1234567890abcdef12345678"
+        self.assertEqual(extract_private_server_link_code(code), code)
+
+        # URL with privateServerLinkCode
+        url1 = "https://www.roblox.com/games/123456/game?privateServerLinkCode=abcdef1234567890"
+        self.assertEqual(extract_private_server_link_code(url1), "abcdef1234567890")
+
+        # URL with linkCode
+        url2 = "https://www.roblox.com/games/123456/game?linkCode=xyz987654321"
+        self.assertEqual(extract_private_server_link_code(url2), "xyz987654321")
+
+        # Invalid
+        self.assertIsNone(extract_private_server_link_code(""))
+        self.assertIsNone(extract_private_server_link_code("invalid"))
+
+    def test_instance_tracking_and_liveness(self):
+        mock_storage = MagicMock()
+        runner = InstanceRunner(mock_storage)
+
+        # Register self PID (always alive)
+        inst = RunningInstance(
+            account_id="acc_live",
+            username="LivePlayer",
+            pid=os.getpid(),
+            start_time=100.0,
+        )
+        runner.active_instances["acc_live"] = inst
+        self.assertTrue(runner.is_instance_running("acc_live"))
+        self.assertEqual(runner.get_running_instance("acc_live"), inst)
+
+        # Register an inactive PID (e.g. 999999999)
+        inst_dead = RunningInstance(
+            account_id="acc_dead",
+            username="DeadPlayer",
+            pid=999999999,
+            start_time=100.0,
+        )
+        runner.active_instances["acc_dead"] = inst_dead
+        self.assertFalse(runner.is_instance_running("acc_dead"))
+        # Should be removed from dict
+        self.assertNotIn("acc_dead", runner.active_instances)
+
+    def test_launch_instance_sets_isolated_xdg_runtime_dir(self):
+        from unittest.mock import patch
+        mock_storage = MagicMock()
+        import tempfile
+        from pathlib import Path
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            profile_dir = Path(tmp_dir)
+            (profile_dir / "run").mkdir(parents=True)
+            mock_bin = profile_dir / "bin" / "mocktail"
+            mock_storage.init_profile_sandbox.return_value = profile_dir
+            mock_storage.get_runtime_dir.return_value = profile_dir / "run"
+            mock_storage.get_instance_binary.return_value = mock_bin
+
+            runner = InstanceRunner(mock_storage)
+            acc = RobloxAccount(
+                account_id="acc_test_runner",
+                username="RunnerPlayer",
+                display_name="Runner Player",
+                user_id=12345,
+                cookie="tok123",
+            )
+
+            mock_proc = MagicMock()
+            mock_proc.pid = os.getpid()
+            mock_proc.poll.return_value = None
+
+            with patch("subprocess.Popen", return_value=mock_proc) as mock_popen:
+                inst = runner.launch_instance(acc)
+                self.assertEqual(inst.pid, os.getpid())
+                self.assertTrue(runner.is_instance_running("acc_test_runner"))
+
+                # Check Popen was called with appropriate Linux arguments
+                call_args = mock_popen.call_args[0][0]
+                self.assertIn(str(mock_bin), call_args)
+                self.assertIn("--windowed", call_args)
+                self.assertIn("--graphics", call_args)
+
+                call_kwargs = mock_popen.call_args.kwargs
+                env = call_kwargs["env"]
+                self.assertEqual(env["MOCKTAIL_DATA_ROOT"], str(profile_dir / "data"))
+                self.assertEqual(env["MOCKTAIL_COOKIE_FILE"], str(profile_dir / "roblox.cookie"))
+                self.assertEqual(env["MOCKTAIL_GRAPHICS_BACKEND"], "opengl")
+
+    def test_detects_http_401_on_early_exit(self):
+        import tempfile
+        from pathlib import Path
+        mock_storage = MagicMock()
+        runner = InstanceRunner(mock_storage)
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            log_path = Path(tmp_dir) / "instance.log"
+            log_path.write_text(
+                "[mocktail] started\n"
+                "[FATAL] Typed Roblox authentication preflight failed: authentication rejected (HTTP 401)\n"
+            )
+
+            inst = RunningInstance(
+                account_id="acc_401",
+                username="ExpiredPlayer",
+                pid=999999998,
+                start_time=100.0,
+                log_path=str(log_path),
+            )
+            runner.active_instances["acc_401"] = inst
+
+            self.assertFalse(runner.is_instance_running("acc_401"))
+            err = runner.get_instance_error("acc_401")
+            self.assertIsNotNone(err)
+            self.assertIn("HTTP 401", err)
+
+    def test_launch_instance_with_follow_user_id(self):
+        from unittest.mock import patch
+        mock_storage = MagicMock()
+        import tempfile
+        from pathlib import Path
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            profile_dir = Path(tmp_dir)
+            (profile_dir / "run").mkdir(parents=True)
+            mock_bin = profile_dir / "bin" / "mocktail"
+            mock_storage.init_profile_sandbox.return_value = profile_dir
+            mock_storage.get_runtime_dir.return_value = profile_dir / "run"
+            mock_storage.get_instance_binary.return_value = mock_bin
+
+            runner = InstanceRunner(mock_storage)
+            acc = RobloxAccount(
+                account_id="acc_follow",
+                username="Follower",
+                display_name="Follower",
+                user_id=11111,
+                cookie="tok123",
+            )
+
+            mock_proc = MagicMock()
+            mock_proc.pid = os.getpid()
+            mock_proc.poll.return_value = None
+
+            with patch("subprocess.Popen", return_value=mock_proc) as mock_popen:
+                runner.launch_instance(acc, follow_user_id=12345678)
+                call_args = mock_popen.call_args[0][0]
+                self.assertIn("--launch-uri", call_args)
+                idx = call_args.index("--launch-uri")
+                self.assertEqual(call_args[idx + 1], "roblox://experiences/start?userId=12345678")
+
+    def test_get_memory_stats(self):
+        stats = InstanceRunner.get_memory_stats()
+        self.assertIn("mem_avail_mb", stats)
+        self.assertIn("swap_free_mb", stats)
+        self.assertGreater(stats["mem_avail_mb"], 0)
+
+    def test_alt_instance_virtual_memory_scoping(self):
+        from unittest.mock import patch
+        import tempfile
+        from pathlib import Path
+        mock_storage = MagicMock()
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            profile_dir = Path(tmp_dir)
+            (profile_dir / "run").mkdir(parents=True)
+            mock_bin = profile_dir / "bin" / "mocktail"
+            mock_storage.init_profile_sandbox.return_value = profile_dir
+            mock_storage.get_runtime_dir.return_value = profile_dir / "run"
+            mock_storage.get_instance_binary.return_value = mock_bin
+            mock_storage.is_main_account.return_value = False
+            mock_storage.get_setting.side_effect = lambda k, d=None: "350" if k == "alt_memory_high_mb" else d
+
+            runner = InstanceRunner(mock_storage)
+            acc = RobloxAccount(
+                account_id="acc_alt_vm",
+                username="AltAccount1",
+                display_name="AltAccount1",
+                user_id=22222,
+                cookie="tok456",
+            )
+
+            mock_proc = MagicMock()
+            mock_proc.pid = os.getpid()
+            mock_proc.poll.return_value = None
+
+            with patch("subprocess.Popen", return_value=mock_proc) as mock_popen, \
+                 patch("shutil.which", return_value="/usr/bin/systemd-run"):
+                runner.launch_instance(acc)
+                call_args = mock_popen.call_args[0][0]
+                self.assertEqual(call_args[0], "systemd-run")
+                self.assertIn("-pMemoryHigh=350M", call_args)
+                self.assertIn("-pCPUWeight=1", call_args)
+                self.assertIn("-pIOWeight=1", call_args)
+
+    def test_dynamic_font_resolution_from_payload(self):
+        from unittest.mock import patch
+        import tempfile
+        from pathlib import Path
+        mock_storage = MagicMock()
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            profile_dir = Path(tmp_dir) / "profile"
+            mocktail_data = Path(tmp_dir) / "mocktail"
+            profile_dir.mkdir(parents=True)
+            mock_bin = profile_dir / "bin" / "mocktail"
+
+            # Create mock payload with font
+            font_dir = mocktail_data / "payloads" / "payload-xyz-123" / "assets" / "fonts"
+            font_dir.mkdir(parents=True)
+            mock_font = font_dir / "SourceSansPro-Regular.ttf"
+            mock_font.write_text("dummy font")
+
+            mock_storage.init_profile_sandbox.return_value = profile_dir
+            mock_storage.get_runtime_dir.return_value = profile_dir / "run"
+            mock_storage.get_instance_binary.return_value = mock_bin
+            mock_storage.is_main_account.return_value = True
+
+            runner = InstanceRunner(mock_storage)
+            acc = RobloxAccount(
+                account_id="acc_font_test",
+                username="FontPlayer",
+                display_name="Font Player",
+                user_id=33333,
+                cookie="tokfont",
+            )
+
+            mock_info = MagicMock()
+            mock_info.data_dir = mocktail_data
+            mock_info.payload_id = "payload-xyz-123"
+            mock_info.helper_path = None
+            mock_info.lib_dir = None
+
+            mock_proc = MagicMock()
+            mock_proc.pid = os.getpid()
+            mock_proc.poll.return_value = None
+
+            with patch("core.mocktail_manager.MocktailManager.detect", return_value=mock_info), \
+                 patch("subprocess.Popen", return_value=mock_proc) as mock_popen:
+                runner.launch_instance(acc)
+                env = mock_popen.call_args.kwargs["env"]
+                self.assertIn("MOCKTAIL_TEXT_FONT", env)
+                self.assertEqual(env["MOCKTAIL_TEXT_FONT"], str(mock_font))
+
+    def test_concurrent_multi_account_isolation_and_termination(self):
+        from unittest.mock import patch
+        import tempfile
+        from pathlib import Path
+        mock_storage = MagicMock()
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            dirA = Path(tmp_dir) / "profileA"
+            dirB = Path(tmp_dir) / "profileB"
+            dirA.mkdir(parents=True)
+            dirB.mkdir(parents=True)
+            binA = Path(tmp_dir) / "mocktail_accA"
+            binB = Path(tmp_dir) / "mocktail_accB"
+
+            def get_prof(acc):
+                return dirA if acc.account_id == "accA" else dirB
+            def get_run(acc):
+                return (dirA / "run") if acc.account_id == "accA" else (dirB / "run")
+            def get_bin(acc):
+                return binA if acc.account_id == "accA" else binB
+
+            mock_storage.init_profile_sandbox.side_effect = get_prof
+            mock_storage.get_runtime_dir.side_effect = get_run
+            mock_storage.get_instance_binary.side_effect = get_bin
+            mock_storage.is_main_account.return_value = False
+
+            runner = InstanceRunner(mock_storage)
+            accA = RobloxAccount(account_id="accA", username="UserA", display_name="A", user_id=111, cookie="c1")
+            accB = RobloxAccount(account_id="accB", username="UserB", display_name="B", user_id=222, cookie="c2")
+
+            procA = MagicMock(pid=1001)
+            procB = MagicMock(pid=1002)
+            procA.poll.return_value = None
+            procB.poll.return_value = None
+
+            popen_calls = []
+            def fake_popen(cmd, **kwargs):
+                popen_calls.append((cmd, kwargs))
+                return procA if len(popen_calls) == 1 else procB
+
+            # Test launching without systemd-run (clean graceful degradation)
+            with patch("subprocess.Popen", side_effect=fake_popen), \
+                 patch("shutil.which", return_value=None):
+                instA = runner.launch_instance(accA)
+                instB = runner.launch_instance(accB)
+
+                self.assertEqual(instA.pid, 1001)
+                self.assertEqual(instB.pid, 1002)
+
+                envA = popen_calls[0][1]["env"]
+                envB = popen_calls[1][1]["env"]
+
+                # Strict isolation: distinct cookie files and XDG runtime directories
+                self.assertNotEqual(envA["MOCKTAIL_COOKIE_FILE"], envB["MOCKTAIL_COOKIE_FILE"])
+                self.assertNotEqual(envA["XDG_RUNTIME_DIR"], envB["XDG_RUNTIME_DIR"])
+                self.assertIn("profileA", envA["MOCKTAIL_COOKIE_FILE"])
+                self.assertIn("profileB", envB["MOCKTAIL_COOKIE_FILE"])
+
+                # Check both are registered
+                self.assertIn("accA", runner.active_instances)
+                self.assertIn("accB", runner.active_instances)
+
+                # Terminate A, verify B remains active
+                with patch("os.kill") as mock_kill:
+                    runner.terminate_instance("accA")
+                    self.assertNotIn("accA", runner.active_instances)
+                    self.assertIn("accB", runner.active_instances)
+
+
+if __name__ == "__main__":
+    unittest.main()
+
+
