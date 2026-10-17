@@ -444,7 +444,10 @@ class DiagnosticsRunner:
             log_messages.append("Native helper library already present.")
 
         # 2. Ensure runtime directories exist
-        app_data = Path.home() / ".local" / "share" / "aeram"
+        # Use the directory the app will actually open; hardcoding aeram/ here used to create an
+        # empty directory that then took precedence over an existing ram-linux vault.
+        from core.platform import get_platform
+        app_data = get_platform().get_default_base_dir()
         config_dir = Path.home() / ".config" / "aeram"
         try:
             app_data.mkdir(parents=True, exist_ok=True)
