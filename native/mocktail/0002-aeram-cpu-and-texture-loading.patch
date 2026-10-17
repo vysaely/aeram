@@ -1,0 +1,673 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index a3019d7..ccc7e12 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -268,6 +268,7 @@ add_library(mocktail_runtime STATIC
+   src/runtime/crash_report_policy.cc
+   src/runtime/discord_rpc.cc
+   src/runtime/device_memory_profile.cc
++  src/runtime/engine_poll_rest.cc
+   src/runtime/device_profile.cc
+   src/runtime/environment.cc
+   src/runtime/external_launch_broker.cc
+diff --git a/include/mocktail/graphics/etc2_decoder.h b/include/mocktail/graphics/etc2_decoder.h
+index 6a4fccf..ece8911 100644
+--- a/include/mocktail/graphics/etc2_decoder.h
++++ b/include/mocktail/graphics/etc2_decoder.h
+@@ -3,6 +3,7 @@
+ 
+ #include <cstddef>
+ #include <cstdint>
++#include <functional>
+ 
+ namespace mocktail::graphics {
+ 
+@@ -48,6 +49,12 @@ struct EtcDecodeJob {
+ void DecodeEtcJobs(EtcDecodeJob* jobs, std::size_t count,
+                    unsigned worker_count);
+ 
++// Runs task(0) .. task(count - 1) on the calling thread and up to
++// worker_count - 1 helpers of the decode worker pool, and returns when every
++// task has finished. Tasks must be independent of each other.
++void RunEtcTasks(std::size_t count, unsigned worker_count,
++                 const std::function<void(std::size_t)>& task);
++
+ }  // namespace mocktail::graphics
+ 
+ #endif  // MOCKTAIL_GRAPHICS_ETC2_DECODER_H_
+diff --git a/include/runtime/engine_poll_rest.h b/include/runtime/engine_poll_rest.h
+new file mode 100644
+index 0000000..b36116f
+--- /dev/null
++++ b/include/runtime/engine_poll_rest.h
+@@ -0,0 +1,38 @@
++#ifndef MOCKTAIL_RUNTIME_ENGINE_POLL_REST_H_
++#define MOCKTAIL_RUNTIME_ENGINE_POLL_REST_H_
++
++#include <cstdint>
++
++namespace mocktail {
++namespace runtime {
++
++// With unthrottled presentation the host main thread polls the engine's
++// main-thread message queue back to back. Most polls find nothing and return
++// in a few microseconds, so the loop burns a whole core per instance. Between
++// empty polls the thread may rest briefly instead; a message posted during the
++// rest waits at most kEngineEmptyPollRestNs plus wake-up latency.
++inline constexpr uint64_t kEngineEmptyPollRestNs = 100'000;
++// A poll shorter than this did no engine work.
++inline constexpr uint64_t kEngineEmptyPollMaxNs = 20'000;
++
++enum class EnginePollRest { kSleep, kSpin };
++
++// MOCKTAIL_ENGINE_PUMP_REST: "sleep", "spin" or "auto" (default). Auto sleeps
++// only under the performance governor (as GameMode sets it): under a
++// power-saving governor a core that keeps sleeping is clocked down, which also
++// slows the render thread sharing its frequency domain.
++EnginePollRest ChooseEnginePollRest(const char* setting,
++                                    bool performance_governor);
++const char* EnginePollRestName(EnginePollRest rest);
++
++// The policy for this process, read once.
++EnginePollRest ActiveEnginePollRest();
++
++// Rests after a poll that took poll_ns and returns the time slept. Polls that
++// did work, and the spin policy, never rest.
++uint64_t RestAfterEnginePoll(uint64_t poll_ns);
++
++}  // namespace runtime
++}  // namespace mocktail
++
++#endif  // MOCKTAIL_RUNTIME_ENGINE_POLL_REST_H_
+diff --git a/src/graphics/etc2_decoder.cc b/src/graphics/etc2_decoder.cc
+index bccfcad..f4e5adc 100644
+--- a/src/graphics/etc2_decoder.cc
++++ b/src/graphics/etc2_decoder.cc
+@@ -6,6 +6,7 @@
+ 
+ #include <atomic>
+ #include <condition_variable>
++#include <functional>
+ #include <deque>
+ #include <limits>
+ #include <mutex>
+@@ -255,8 +256,11 @@ struct DecodeBand {
+   std::uint32_t block_row_count;
+ };
+ 
+-struct DecodeBandQueue {
+-  std::vector<DecodeBand> bands;
++// Independent tasks shared by the calling thread and the pool's helpers; each
++// index runs exactly once.
++struct TaskQueue {
++  std::size_t count = 0;
++  const std::function<void(std::size_t)>* task = nullptr;
+   std::atomic<std::size_t> next{0};
+   std::mutex mutex;
+   std::condition_variable completed;
+@@ -265,15 +269,10 @@ struct DecodeBandQueue {
+   void Run() {
+     for (;;) {
+       const std::size_t index = next.fetch_add(1, std::memory_order_relaxed);
+-      if (index >= bands.size()) {
++      if (index >= count) {
+         return;
+       }
+-      const DecodeBand& band = bands[index];
+-      const EtcDecodeJob& job = *band.job;
+-      DecodeEtcImageBlockRows(job.format, job.source, job.source_bytes,
+-                              job.width, job.height, band.first_block_row,
+-                              band.block_row_count, job.destination,
+-                              job.destination_bytes);
++      (*task)(index);
+     }
+   }
+ };
+@@ -302,7 +301,7 @@ class DecodeWorkerPool {
+     }
+   }
+ 
+-  void Run(DecodeBandQueue* queue, unsigned workers) {
++  void Run(TaskQueue* queue, unsigned workers) {
+     const unsigned helpers = std::min(workers, worker_count_);
+     if (helpers == 0) {
+       queue->Run();
+@@ -329,7 +328,7 @@ class DecodeWorkerPool {
+ 
+   void RunWorker() {
+     for (;;) {
+-      DecodeBandQueue* queue;
++      TaskQueue* queue;
+       {
+         std::unique_lock<std::mutex> lock(mutex_);
+         ready_.wait(lock, [this] { return stopping_ || !pending_.empty(); });
+@@ -349,21 +348,46 @@ class DecodeWorkerPool {
+ 
+   std::mutex mutex_;
+   std::condition_variable ready_;
+-  std::deque<DecodeBandQueue*> pending_;
++  std::deque<TaskQueue*> pending_;
+   std::array<pthread_t, 7> workers_{};
+   unsigned worker_count_ = 0;
+   bool stopping_ = false;
+ };
+ 
++DecodeWorkerPool& SharedDecodeWorkerPool() {
++  static DecodeWorkerPool pool;
++  return pool;
++}
++
++void RunTasks(std::size_t count, std::size_t threads,
++              const std::function<void(std::size_t)>& task) {
++  TaskQueue queue;
++  queue.count = count;
++  queue.task = &task;
++  if (threads <= 1) {
++    queue.Run();
++  } else {
++    SharedDecodeWorkerPool().Run(&queue, static_cast<unsigned>(threads - 1));
++  }
++}
++
+ }  // namespace
+ 
++void RunEtcTasks(std::size_t count, unsigned worker_count,
++                 const std::function<void(std::size_t)>& task) {
++  if (count == 0) {
++    return;
++  }
++  RunTasks(count,
++           std::min<std::size_t>(std::max(worker_count, 1U), count), task);
++}
++
+ void DecodeEtcJobs(EtcDecodeJob* jobs, std::size_t count,
+                    unsigned worker_count) {
+   if (jobs == nullptr) {
+     return;
+   }
+-  DecodeBandQueue queue;
+-  std::vector<DecodeBand>& bands = queue.bands;
++  std::vector<DecodeBand> bands;
+   std::uint64_t total_blocks = 0;
+   for (std::size_t index = 0; index < count; ++index) {
+     EtcDecodeJob& job = jobs[index];
+@@ -389,12 +413,16 @@ void DecodeEtcJobs(EtcDecodeJob* jobs, std::size_t count,
+       total_blocks < kParallelMinimumBlocks
+           ? 1
+           : std::min<std::size_t>(std::max(worker_count, 1U), bands.size());
+-  if (threads <= 1) {
+-    queue.Run();
+-  } else {
+-    static DecodeWorkerPool pool;
+-    pool.Run(&queue, static_cast<unsigned>(threads - 1));
+-  }
++  const std::function<void(std::size_t)> decode_band =
++      [&bands](std::size_t index) {
++        const DecodeBand& band = bands[index];
++        const EtcDecodeJob& job = *band.job;
++        DecodeEtcImageBlockRows(job.format, job.source, job.source_bytes,
++                                job.width, job.height, band.first_block_row,
++                                band.block_row_count, job.destination,
++                                job.destination_bytes);
++      };
++  RunTasks(bands.size(), threads, decode_band);
+ }
+ 
+ bool DecodeEtcImageBlockRows(EtcFormat format, const std::uint8_t* source,
+diff --git a/src/graphics/vulkan_etc2_emulation.cc b/src/graphics/vulkan_etc2_emulation.cc
+index 0959d9d..889eae3 100644
+--- a/src/graphics/vulkan_etc2_emulation.cc
++++ b/src/graphics/vulkan_etc2_emulation.cc
+@@ -2,11 +2,17 @@
+ 
+ #include "mocktail/graphics/texture_override.h"
+ 
++#if defined(__x86_64__)
++#include <immintrin.h>
++#endif
++
+ #include <algorithm>
+ #include <atomic>
++#include <cstdint>
+ #include <cstdio>
+ #include <cstdlib>
+ #include <cstring>
++#include <functional>
+ #include <memory>
+ #include <mutex>
+ #include <shared_mutex>
+@@ -125,6 +131,55 @@ bool ShouldLog(std::atomic<unsigned>* counter, unsigned limit) {
+   return counter->fetch_add(1, std::memory_order_relaxed) < limit;
+ }
+ 
++// Roblox's upload buffers usually live in host-visible memory that is not
++// CPU-cached (write-combined). Ordinary loads from it run uncached: measured
++// on RADV at 0.4 GB/s from system memory and 0.03 GB/s from the VRAM BAR,
++// versus 10 GB/s and 0.9 GB/s with SSE4.1 streaming loads, which cost
++// nothing extra on cached memory.
++#if defined(__x86_64__)
++__attribute__((target("sse4.1"))) void StreamingCopy(std::uint8_t* destination,
++                                                     const std::uint8_t* source,
++                                                     std::size_t bytes) {
++  const std::size_t misalignment =
++      reinterpret_cast<std::uintptr_t>(source) & 15U;
++  if (misalignment != 0) {
++    const std::size_t head = std::min(bytes, 16 - misalignment);
++    std::memcpy(destination, source, head);
++    destination += head;
++    source += head;
++    bytes -= head;
++  }
++  auto* from = reinterpret_cast<__m128i*>(const_cast<std::uint8_t*>(source));
++  auto* to = reinterpret_cast<__m128i*>(destination);
++  for (; bytes >= 64; bytes -= 64, from += 4, to += 4) {
++    const __m128i a = _mm_stream_load_si128(from);
++    const __m128i b = _mm_stream_load_si128(from + 1);
++    const __m128i c = _mm_stream_load_si128(from + 2);
++    const __m128i d = _mm_stream_load_si128(from + 3);
++    _mm_storeu_si128(to, a);
++    _mm_storeu_si128(to + 1, b);
++    _mm_storeu_si128(to + 2, c);
++    _mm_storeu_si128(to + 3, d);
++  }
++  for (; bytes >= 16; bytes -= 16, ++from, ++to) {
++    _mm_storeu_si128(to, _mm_stream_load_si128(from));
++  }
++  std::memcpy(to, from, bytes);
++}
++#endif
++
++void CopyFromMappedMemory(std::uint8_t* destination, const std::uint8_t* source,
++                          std::size_t bytes) {
++#if defined(__x86_64__)
++  static const bool streaming = __builtin_cpu_supports("sse4.1");
++  if (streaming) {
++    StreamingCopy(destination, source, bytes);
++    return;
++  }
++#endif
++  std::memcpy(destination, source, bytes);
++}
++
+ unsigned DecodeWorkerCount() {
+   static const unsigned count =
+       std::min(8U, std::max(1U, std::thread::hardware_concurrency() / 2));
+@@ -1274,17 +1329,18 @@ void VulkanEtc2Emulation::PrepareSubmit(const VkCommandBuffer* command_buffers,
+     const VkDeviceSize compressed_layer = upload.compressed / upload.layers;
+     const VkDeviceSize decoded_layer = upload.decoded / upload.layers;
+     if (upload.source_span == copy.compressed) {
+-      std::memcpy(source, copy.source, copy.compressed);
++      CopyFromMappedMemory(source, copy.source, copy.compressed);
+     } else {
+       const VkDeviceSize block_rows =
+           (static_cast<VkDeviceSize>(upload.height) + 3) / 4;
+       const VkDeviceSize packed_row = compressed_layer / block_rows;
+       for (std::uint32_t layer = 0; layer < upload.layers; ++layer) {
+         for (VkDeviceSize row = 0; row < block_rows; ++row) {
+-          std::memcpy(source + layer * compressed_layer + row * packed_row,
+-                      copy.source + layer * upload.source_layer_stride +
+-                          row * upload.source_row_stride,
+-                      packed_row);
++          CopyFromMappedMemory(
++              source + layer * compressed_layer + row * packed_row,
++              copy.source + layer * upload.source_layer_stride +
++                  row * upload.source_row_stride,
++              packed_row);
+         }
+       }
+     }
+@@ -1319,17 +1375,47 @@ void VulkanEtc2Emulation::PrepareSubmit(const VkCommandBuffer* command_buffers,
+       LogFailure("could not decode an upload layer");
+     }
+   }
++  // Writing decoded texels into staging (with the small-texture upscale,
++  // 16x the texels at the default 4x) used to run upload by upload on the
++  // submitting thread after the parallel decode. Emit on the worker pool too:
++  // mip 0 first, since an upscaled image's later mips reuse its mip 0 base.
++  struct Emit {
++    const PendingUpload* upload;
++    const std::uint8_t* compressed;
++    const std::uint8_t* decoded;
++  };
++  std::vector<Emit> base_emits;
++  std::vector<Emit> mip_emits;
++  VkDeviceSize emitted_bytes = 0;
+   compressed_offset = 0;
+   decoded_offset = 0;
+   for (std::size_t index = 0; index < copied_uploads.size(); ++index) {
+     if (copies[index].decoded != 0) {
+-      state_->EmitUpload(*copied_uploads[index],
+-                         scratch_source.data() + compressed_offset,
+-                         scratch_decoded.data() + decoded_offset);
++      const PendingUpload* upload = copied_uploads[index];
++      const Emit emit{upload, scratch_source.data() + compressed_offset,
++                      scratch_decoded.data() + decoded_offset};
++      (upload->mip_level == 0 ? base_emits : mip_emits).push_back(emit);
++      emitted_bytes += static_cast<VkDeviceSize>(upload->target_width) *
++                       upload->target_height * 4;
+     }
+     compressed_offset += copies[index].compressed;
+     decoded_offset += copies[index].decoded;
+   }
++  // Overrides keep per-image state that later uploads of a batch read, and
++  // small batches are cheaper inline than waking helpers.
++  constexpr VkDeviceSize kParallelEmitMinimumBytes = 1u << 20;
++  const unsigned emit_workers =
++      state_->overrides.enabled() || emitted_bytes < kParallelEmitMinimumBytes
++          ? 1
++          : DecodeWorkerCount();
++  for (const std::vector<Emit>* wave : {&base_emits, &mip_emits}) {
++    const std::function<void(std::size_t)> emit_one =
++        [this, wave](std::size_t index) {
++          const Emit& emit = (*wave)[index];
++          state_->EmitUpload(*emit.upload, emit.compressed, emit.decoded);
++        };
++    RunEtcTasks(wave->size(), emit_workers, emit_one);
++  }
+ }
+ 
+ void VulkanEtc2Emulation::ReleaseCommandBuffer(VkCommandBuffer command_buffer) {
+diff --git a/src/legacy/legacy_runtime.cc b/src/legacy/legacy_runtime.cc
+index 9b3a8a2..c82d144 100644
+--- a/src/legacy/legacy_runtime.cc
++++ b/src/legacy/legacy_runtime.cc
+@@ -61,6 +61,7 @@
+ #include "mocktail/graphics/bionic_egl_bridge.h"
+ #include "runtime/device_memory_profile.h"
+ #include "runtime/display_size.h"
++#include "runtime/engine_poll_rest.h"
+ #include "runtime/environment.h"
+ #include "runtime/discord_rpc.h"
+ #include "runtime/jnivm_platform_web_callbacks.h"
+@@ -7007,6 +7008,10 @@ int mocktail::legacy::Run(const runtime::CommandLineOptions& options,
+   bool input_shutdown_completed = window_input_runtime == nullptr;
+   bool resize_readiness_completed = true;
+   if (mocktail::window::IsInitialised()) {
++    std::cout << "  [main] engine poll rest: "
++              << mocktail::runtime::EnginePollRestName(
++                     mocktail::runtime::ActiveEnginePollRest())
++              << " (MOCKTAIL_ENGINE_PUMP_REST=auto|sleep|spin)\n";
+     std::cout << "  [main] entering SDL event loop (close the window to quit)\n"
+               << std::flush;
+     std::unique_ptr<mocktail::window::WindowGameSurfaceBridge> surface_bridge;
+@@ -7108,7 +7113,9 @@ int mocktail::legacy::Run(const runtime::CommandLineOptions& options,
+       }
+       const uint64_t fps_after_platform_ns =
+           fps_trace ? MonotonicNanos() : 0;
++      const uint64_t engine_poll_start_ns = MonotonicNanos();
+       PumpRobloxMainThreadMessagesOnce();
++      const uint64_t engine_poll_ns = MonotonicNanos() - engine_poll_start_ns;
+       const uint64_t fps_after_engine_ns = fps_trace ? MonotonicNanos() : 0;
+       if (experience_composition != nullptr &&
+           experience_composition->subscribed()) {
+@@ -7122,7 +7129,13 @@ int mocktail::legacy::Run(const runtime::CommandLineOptions& options,
+         }
+       }
+       const uint64_t fps_after_launch_ns = fps_trace ? MonotonicNanos() : 0;
+-      const uint64_t fps_pace_ns = mocktail::window::PaceInputPump();
++      // The pacer sleeps only under throttled presentation. Unthrottled, the
++      // engine poll above runs back to back, so rest after empty polls.
++      uint64_t fps_pace_ns = mocktail::window::PaceInputPump();
++      if (fps_pace_ns == 0 &&
++          mocktail::window::UnthrottledPresentationRequested()) {
++        fps_pace_ns = mocktail::runtime::RestAfterEnginePoll(engine_poll_ns);
++      }
+       if (fps_trace) {
+         const uint64_t fps_tick_end_ns = MonotonicNanos();
+         ++fps_samples;
+diff --git a/src/runtime/engine_poll_rest.cc b/src/runtime/engine_poll_rest.cc
+new file mode 100644
+index 0000000..5b9bbc6
+--- /dev/null
++++ b/src/runtime/engine_poll_rest.cc
+@@ -0,0 +1,63 @@
++#include "runtime/engine_poll_rest.h"
++
++#include <sys/prctl.h>
++#include <time.h>
++
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++
++namespace mocktail {
++namespace runtime {
++namespace {
++
++bool CpuGovernorIsPerformance() {
++  std::FILE* file =
++      std::fopen("/sys/devices/system/cpu/cpu0/cpufreq/scaling_governor", "r");
++  if (file == nullptr) {
++    return false;
++  }
++  char governor[32] = {};
++  const bool read = std::fgets(governor, sizeof(governor), file) != nullptr;
++  std::fclose(file);
++  return read && std::strncmp(governor, "performance", 11) == 0;
++}
++
++}  // namespace
++
++EnginePollRest ChooseEnginePollRest(const char* setting,
++                                    bool performance_governor) {
++  if (setting != nullptr && std::strcmp(setting, "sleep") == 0) {
++    return EnginePollRest::kSleep;
++  }
++  if (setting != nullptr && std::strcmp(setting, "spin") == 0) {
++    return EnginePollRest::kSpin;
++  }
++  return performance_governor ? EnginePollRest::kSleep : EnginePollRest::kSpin;
++}
++
++const char* EnginePollRestName(EnginePollRest rest) {
++  return rest == EnginePollRest::kSleep ? "sleep" : "spin";
++}
++
++EnginePollRest ActiveEnginePollRest() {
++  static const EnginePollRest rest = ChooseEnginePollRest(
++      std::getenv("MOCKTAIL_ENGINE_PUMP_REST"), CpuGovernorIsPerformance());
++  return rest;
++}
++
++uint64_t RestAfterEnginePoll(uint64_t poll_ns) {
++  if (poll_ns > kEngineEmptyPollMaxNs ||
++      ActiveEnginePollRest() == EnginePollRest::kSpin) {
++    return 0;
++  }
++  // The default 50 us timer slack would stretch every 100 us rest by half.
++  static const bool slack_lowered = prctl(PR_SET_TIMERSLACK, 1000UL) == 0;
++  (void)slack_lowered;
++  timespec rest{0, static_cast<long>(kEngineEmptyPollRestNs)};
++  clock_nanosleep(CLOCK_MONOTONIC, 0, &rest, nullptr);
++  return kEngineEmptyPollRestNs;
++}
++
++}  // namespace runtime
++}  // namespace mocktail
+diff --git a/src/runtime/roblox_experience_composition.cc b/src/runtime/roblox_experience_composition.cc
+index c6f7746..f94a34a 100644
+--- a/src/runtime/roblox_experience_composition.cc
++++ b/src/runtime/roblox_experience_composition.cc
+@@ -21,7 +21,9 @@ namespace {
+ constexpr size_t kMaxPendingLaunchRequests = 8;
+ // libroblox's static TLS requires the proven 16 MiB guest-thread stack floor.
+ constexpr size_t kLaunchWorkerStackSize = 64ULL * 1024 * 1024;
+-constexpr std::chrono::milliseconds kWebSurfaceReadyTimeout{3000};
++// WebKit's first start can exceed 3 s while other instances are loading; a
++// window closed at the deadline drops the login check it was opened for.
++constexpr std::chrono::milliseconds kWebSurfaceReadyTimeout{5000};
+ constexpr char kRobloxBaseUrl[] = "https://www.roblox.com/";
+ 
+ Status Invalid(std::string message) {
+@@ -163,24 +165,32 @@ Status LaunchRobloxWebSurface(
+   }
+   std::fprintf(stderr, "  [%s] opening validated Roblox web surface\n",
+                transport);
++  const auto started = std::chrono::steady_clock::now();
+   const WebViewHelperLaunchResult launched =
+       LaunchWebViewHelper(helper, url, std::move(exit_observer));
+   if (!launched) {
+     return Unavailable("could not display Roblox web surface: " +
+                        launched.error);
+   }
+-  if (launched.process == nullptr ||
+-      !launched.process->WaitUntilReady(kWebSurfaceReadyTimeout)) {
++  const bool ready = launched.process != nullptr &&
++                     launched.process->WaitUntilReady(kWebSurfaceReadyTimeout);
++  const long long waited_ms =
++      std::chrono::duration_cast<std::chrono::milliseconds>(
++          std::chrono::steady_clock::now() - started)
++          .count();
++  if (!ready) {
+     if (launched.process != nullptr) {
+       (void)launched.process->RequestClose();
+     }
+     return Unavailable(
+-        "Roblox web surface did not become ready before the deadline");
++        "Roblox web surface did not become ready before the deadline (" +
++        std::to_string(waited_ms) + " ms)");
+   }
+   if (process != nullptr) {
+     *process = launched.process;
+   }
+-  std::fprintf(stderr, "  [%s] Roblox web surface launched\n", transport);
++  std::fprintf(stderr, "  [%s] Roblox web surface launched after %lld ms\n",
++               transport, waited_ms);
+   return Status::Ok();
+ }
+ 
+diff --git a/src/webview/webview_helper_policy.cc b/src/webview/webview_helper_policy.cc
+index 00220db..1507a87 100644
+--- a/src/webview/webview_helper_policy.cc
++++ b/src/webview/webview_helper_policy.cc
+@@ -306,7 +306,9 @@ bool ParseCaptchaEvent(std::string_view command, CaptchaEvent* event) {
+     event->type = CaptchaEventType::kShown;
+     return true;
+   }
+-  if (feature == "CaptchaSuccess") {
++  // The captcha page reports CaptchaSuccess; Roblox's generic challenge page
++  // reports challengeCompleted (its failure twin is challengeInvalidated).
++  if (feature == "CaptchaSuccess" || feature == "challengeCompleted") {
+     event->type = CaptchaEventType::kSuccess;
+     return true;
+   }
+diff --git a/tests/CMakeLists.txt b/tests/CMakeLists.txt
+index 794998b..1309c8c 100644
+--- a/tests/CMakeLists.txt
++++ b/tests/CMakeLists.txt
+@@ -477,6 +477,13 @@ target_link_libraries(vulkan_present_observer_test PRIVATE
+ )
+ mocktail_apply_compile_options(vulkan_present_observer_test)
+ 
++add_executable(engine_poll_rest_test engine_poll_rest_test.cc)
++target_link_libraries(engine_poll_rest_test PRIVATE
++  Mocktail::Runtime
++  GTest::gtest_main
++)
++mocktail_apply_compile_options(engine_poll_rest_test)
++
+ add_executable(input_pump_pacer_test
+   input_pump_pacer_test.cc
+ )
+@@ -983,6 +990,7 @@ gtest_discover_tests(jnivm_experience_lifecycle_test)
+ gtest_discover_tests(jnivm_native_text_box_info_test)
+ gtest_discover_tests(jnivm_webrtc_audio_manager_test)
+ gtest_discover_tests(vulkan_present_observer_test)
++gtest_discover_tests(engine_poll_rest_test)
+ gtest_discover_tests(input_pump_pacer_test)
+ gtest_discover_tests(vulkan_surface_recovery_gate_test)
+ gtest_discover_tests(vulkan_present_progress_gate_test)
+diff --git a/tests/engine_poll_rest_test.cc b/tests/engine_poll_rest_test.cc
+new file mode 100644
+index 0000000..d48d345
+--- /dev/null
++++ b/tests/engine_poll_rest_test.cc
+@@ -0,0 +1,27 @@
++#include "runtime/engine_poll_rest.h"
++
++#include <gtest/gtest.h>
++
++namespace mocktail {
++namespace runtime {
++namespace {
++
++TEST(EnginePollRestTest, ExplicitSettingWins) {
++  EXPECT_EQ(ChooseEnginePollRest("sleep", false), EnginePollRest::kSleep);
++  EXPECT_EQ(ChooseEnginePollRest("spin", true), EnginePollRest::kSpin);
++}
++
++TEST(EnginePollRestTest, AutoSleepsOnlyUnderPerformanceGovernor) {
++  EXPECT_EQ(ChooseEnginePollRest(nullptr, true), EnginePollRest::kSleep);
++  EXPECT_EQ(ChooseEnginePollRest(nullptr, false), EnginePollRest::kSpin);
++  EXPECT_EQ(ChooseEnginePollRest("auto", true), EnginePollRest::kSleep);
++  EXPECT_EQ(ChooseEnginePollRest("bogus", false), EnginePollRest::kSpin);
++}
++
++TEST(EnginePollRestTest, PollsThatDidWorkNeverRest) {
++  EXPECT_EQ(RestAfterEnginePoll(kEngineEmptyPollMaxNs + 1), 0u);
++}
++
++}  // namespace
++}  // namespace runtime
++}  // namespace mocktail
+diff --git a/tests/vulkan_etc2_emulation_test.cc b/tests/vulkan_etc2_emulation_test.cc
+index 34fa398..aa4a5df 100644
+--- a/tests/vulkan_etc2_emulation_test.cc
++++ b/tests/vulkan_etc2_emulation_test.cc
+@@ -330,6 +330,37 @@ TEST_P(VulkanEtc2Test, UpscalingStillProducesTheSamePixels) {
+   EXPECT_EQ(Output(command), expected);
+ }
+ 
++// Enough upscaled texels in one submit to emit on the worker pool; every
++// image must still match the single-threaded decode and resample.
++TEST_P(VulkanEtc2Test, ParallelEmitMatchesSequentialOutput) {
++  Start(true, "4");
++  constexpr std::uint32_t kSize = 64;  // kSmallTextureMaxExtent: upscaled 4x
++  constexpr std::size_t kBytes = (kSize / 4) * (kSize / 4) * 16;
++  constexpr int kImages = 6;
++  std::vector<VkCommandBuffer> commands;
++  std::vector<std::vector<std::uint8_t>> expected;
++  for (int index = 0; index < kImages; ++index) {
++    auto source = CreateSource(kBytes);
++    for (std::size_t byte = 0; byte < kBytes; ++byte) {
++      source.data[byte] = static_cast<std::uint8_t>(byte * 31 + index * 7);
++    }
++    const auto image = CreateImage(kSize, kSize);
++    const auto command = Handle<VkCommandBuffer>(200 + index);
++    Record(command, source, image, kSize, kSize);
++    const auto decoded = Decode(source.data, kSize, kSize);
++    std::vector<std::uint8_t> scaled(kSize * 4 * kSize * 4 * 4);
++    ResampleRgba(decoded.data(), kSize, kSize, kSize * 4, kSize * 4,
++                 scaled.data());
++    expected.push_back(std::move(scaled));
++    commands.push_back(command);
++  }
++  emulation->PrepareSubmit(commands.data(),
++                           static_cast<std::uint32_t>(commands.size()));
++  for (int index = 0; index < kImages; ++index) {
++    EXPECT_EQ(Output(commands[index]), expected[index]) << "image " << index;
++  }
++}
++
+ TEST_P(VulkanEtc2Test, NativeSupportPassesThroughWithoutCpuUploads) {
+   Start(false, "4");
+   const auto source = CreateSource(16);
+diff --git a/tests/webview_helper_policy_test.cc b/tests/webview_helper_policy_test.cc
+index 31a2d92..3eb6285 100644
+--- a/tests/webview_helper_policy_test.cc
++++ b/tests/webview_helper_policy_test.cc
+@@ -188,6 +188,14 @@ TEST(WebViewHelperPolicyTest, ParsesOnlyTypedCaptchaNavigationEvents) {
+   EXPECT_EQ(event.type, CaptchaEventType::kSuccess);
+   EXPECT_TRUE(event.callback_id.empty());
+ 
++  EXPECT_TRUE(ParseCaptchaEvent(
++      R"({"moduleID":"Navigation","functionName":"navigateToFeature","params":{"params":{"feature":"challengeCompleted"}},"callbackID":"done-1"})",
++      &event));
++  EXPECT_EQ(event.type, CaptchaEventType::kSuccess);
++  EXPECT_FALSE(ParseCaptchaEvent(
++      R"({"moduleID":"Navigation","functionName":"navigateToFeature","params":{"params":{"feature":"challengeInvalidated"}}})",
++      &event));
++
+   for (
+       std::string_view rejected : {
+           R"({"moduleID":"Browser","functionName":"navigateToFeature","params":{"params":{"feature":"CaptchaSuccess"}}})",

@@ -12,9 +12,10 @@
 #     frame-rendered arrow (AERAM sets it for main accounts)
 #   - 1 ms input polling instead of 4 ms when presentation is unthrottled
 #   - removal of the Android client's 240 FPS clamp
-#   - from Nightcap (github.com/CoderDayton/nightcap, Apache-2.0): a 100 us rest
-#     between engine polls instead of a spinning core, and login challenge
-#     fixes (device-integrity answer, solved challenges close, 5 s web start)
+#   - a 100 us rest after empty engine polls instead of a spinning core
+#   - login checks: solved generic challenges close, web windows get 5 s
+#   - faster CPU texture conversion (used where the GPU driver lacks ETC2,
+#     e.g. NVIDIA): streaming reads from GPU-mapped memory, parallel writes
 # ==============================================================================
 
 set -euo pipefail
