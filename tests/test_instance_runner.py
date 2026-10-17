@@ -318,6 +318,79 @@ class TestInstanceRunner(unittest.TestCase):
                     self.assertIn("accB", runner.active_instances)
 
 
+class TestTerminateSafety(unittest.TestCase):
+    """terminate_instance must never signal a process that is not the tracked Mocktail client."""
+
+    def _spawn(self, argv0):
+        import subprocess
+        proc = subprocess.Popen(
+            ["bash", "-c", f'exec -a "{argv0}" sleep 30'],
+            start_new_session=True,
+        )
+        self.addCleanup(lambda: (proc.kill(), proc.wait()))
+        # Wait for exec so /proc/<pid>/cmdline reflects argv0
+        for _ in range(100):
+            try:
+                with open(f"/proc/{proc.pid}/cmdline", "rb") as f:
+                    if f.read().startswith(argv0.encode()):
+                        break
+            except OSError:
+                pass
+            import time
+            time.sleep(0.01)
+        return proc
+
+    def _runner_tracking(self, pid):
+        runner = InstanceRunner(MagicMock())
+        runner.active_instances["acc_safe"] = RunningInstance(
+            account_id="acc_safe", username="Safe", pid=pid, start_time=0.0
+        )
+        return runner
+
+    def test_recycled_pid_is_not_signalled(self):
+        from unittest.mock import patch
+        unrelated = self._spawn("unrelated-editor")
+        runner = self._runner_tracking(unrelated.pid)
+
+        with patch("os.kill", wraps=os.kill) as kill, patch("os.killpg") as killpg:
+            self.assertTrue(runner.terminate_instance("acc_safe"))
+            sent = [c.args[1] for c in kill.call_args_list if c.args[0] == unrelated.pid]
+            self.assertFalse([s for s in sent if s != 0], "unrelated PID must not receive a signal")
+            killpg.assert_not_called()
+
+        self.assertIsNone(unrelated.poll(), "unrelated process must still be running")
+        self.assertNotIn("acc_safe", runner.active_instances)
+
+    def test_mocktail_instance_is_terminated(self):
+        client = self._spawn("/opt/mocktail/mocktail_acc_safe")
+        runner = self._runner_tracking(client.pid)
+
+        self.assertTrue(runner.terminate_instance("acc_safe"))
+        self.assertIsNotNone(client.wait(timeout=5))
+
+    def test_scan_attributes_process_to_exact_account(self):
+        client = self._spawn("/opt/mocktail/mocktail_acc_10")
+        storage = MagicMock()
+        storage.list_accounts.return_value = [
+            RobloxAccount(account_id="acc_1", username="One", display_name="One", user_id=1, cookie=""),
+            RobloxAccount(account_id="acc_10", username="Ten", display_name="Ten", user_id=10, cookie=""),
+        ]
+        runner = InstanceRunner(storage)
+        runner.scan_running_instances()
+
+        self.assertNotIn("acc_1", runner.active_instances)
+        self.assertEqual(runner.active_instances["acc_10"].pid, client.pid)
+
+    def test_own_process_group_is_never_killed(self):
+        from unittest.mock import patch
+        client = self._spawn("/opt/mocktail/mocktail_acc_safe")
+        runner = self._runner_tracking(client.pid)
+
+        with patch("os.getpgid", return_value=os.getpgrp()), patch("os.killpg") as killpg:
+            runner.terminate_instance("acc_safe")
+            killpg.assert_not_called()
+
+
 if __name__ == "__main__":
     unittest.main()
 

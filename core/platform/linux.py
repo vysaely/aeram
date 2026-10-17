@@ -100,7 +100,7 @@ class LinuxPlatformProvider(AbstractPlatformProvider):
                         fname = Path(exe).name
 
                         for acc in accounts:
-                            if acc.account_id in fname or fname == f"mocktail_{acc.account_id}":
+                            if fname == f"mocktail_{acc.account_id}":
                                 results[acc.account_id] = pid
                                 break
                     except Exception:

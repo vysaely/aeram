@@ -841,8 +841,10 @@ class StorageManager:
 
         inst_bin = target_dir / f"mocktail_{account.account_id}"
 
-        # If inst_bin already exists but is an outdated shell script or non-ELF while source_bin is ELF,
-        # replace it with the real ELF binary to ensure /proc/self/exe derives unique FNV locks.
+        # Re-provision when inst_bin is an outdated non-ELF wrapper while source_bin is ELF, or when
+        # it no longer mirrors source_bin. A Mocktail upgrade that replaces the binary (new inode)
+        # leaves earlier hardlinks pointing at the old client, so every account would keep
+        # launching the stale version.
         needs_provision = not inst_bin.exists()
         if not needs_provision and source_bin.exists():
             try:
@@ -850,22 +852,27 @@ class StorageManager:
                     source_is_elf = sf.read(4) == b"\x7fELF"
                 with open(inst_bin, "rb") as df:
                     inst_is_elf = df.read(4) == b"\x7fELF"
-                if source_is_elf and not inst_is_elf:
-                    inst_bin.unlink(missing_ok=True)
+                if source_is_elf and not (inst_is_elf and self._binary_is_current(source_bin, inst_bin)):
                     needs_provision = True
             except Exception:
                 pass
 
         if needs_provision and source_bin.exists():
+            # Stage beside the target and rename over it so a running instance keeps its inode
+            # and a concurrent launch never observes a missing or partially copied binary.
+            staging = inst_bin.with_name(inst_bin.name + ".provision")
             try:
-                os.link(source_bin, inst_bin)
-            except Exception:
+                staging.unlink(missing_ok=True)
                 try:
-                    self._copy_or_reflink(source_bin, inst_bin)
-                    os.chmod(inst_bin, 0o755)
-                except Exception as e:
-                    log.warning(f"Could not provision isolated mocktail binary: {e}")
-                    return source_bin
+                    os.link(source_bin, staging)
+                except OSError:
+                    self._copy_or_reflink(source_bin, staging)
+                    os.chmod(staging, 0o755)
+                os.replace(staging, inst_bin)
+            except Exception as e:
+                staging.unlink(missing_ok=True)
+                log.warning(f"Could not provision isolated mocktail binary: {e}")
+                return source_bin
 
         if inst_bin.exists():
             try:
@@ -875,6 +882,17 @@ class StorageManager:
             return inst_bin
 
         return source_bin
+
+    @staticmethod
+    def _binary_is_current(source: Path, dest: Path) -> bool:
+        """True when dest is a hardlink of source, or a copy with identical size and mtime."""
+        try:
+            if os.path.samefile(source, dest):
+                return True
+            src_st, dst_st = source.stat(), dest.stat()
+            return src_st.st_size == dst_st.st_size and int(src_st.st_mtime) == int(dst_st.st_mtime)
+        except OSError:
+            return False
 
     def get_effective_fflags(self, is_alt: bool, texture_quality: int = 1, frm_quality: int = 1) -> dict:
         """Constructs effective FastFlags dictionary combining safety baselines and user overrides."""

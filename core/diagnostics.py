@@ -295,11 +295,12 @@ class DiagnosticsRunner:
             ))
 
         # Shared memory /dev/shm
-        shm_pulse = Path("/dev/shm/aeram_afk_pulse")
         can_shm = False
         try:
-            shm_pulse.touch(exist_ok=True)
-            can_shm = os.access(shm_pulse, os.W_OK)
+            from core.anti_afk import AFK_PULSE_PATH
+            can_shm = os.access(AFK_PULSE_PATH.parent, os.W_OK) and (
+                not AFK_PULSE_PATH.exists() or AFK_PULSE_PATH.stat().st_uid == os.getuid()
+            )
         except Exception:
             can_shm = False
 
@@ -452,12 +453,11 @@ class DiagnosticsRunner:
         except Exception as e:
             log_messages.append(f"Directory creation note: {e}")
 
-        # 3. Touch pulse file with broad write permissions
+        # 3. Create the pulse file owner-only (the native helper ignores pulse files it does not own)
         try:
-            shm_pulse = Path("/dev/shm/aeram_afk_pulse")
-            shm_pulse.touch(exist_ok=True)
-            os.chmod(shm_pulse, 0o666)
-            log_messages.append("Configured /dev/shm/aeram_afk_pulse with rw permissions.")
+            from core.anti_afk import AFK_PULSE_PATH, write_pulse_file
+            write_pulse_file(0.0)
+            log_messages.append(f"Configured {AFK_PULSE_PATH} as owner-only (0600).")
         except Exception as e:
             log_messages.append(f"Pulse file setup note: {e}")
 

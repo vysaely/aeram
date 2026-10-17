@@ -4,7 +4,7 @@ import time
 from pathlib import Path
 from unittest.mock import patch, MagicMock
 
-from core.anti_afk import AntiAfkEngine, PhysicalIdleMonitor
+from core.anti_afk import AntiAfkEngine, PhysicalIdleMonitor, write_pulse_file
 
 
 class TestAntiAfkEngine(unittest.TestCase):
@@ -75,6 +75,35 @@ class TestAntiAfkEngine(unittest.TestCase):
         with patch.object(self.engine, "get_mocktail_pids", return_value=[]):
             pulsed = self.engine.pulse_all_instances(force=False)
             self.assertEqual(pulsed, 0)
+
+
+class TestPulseFile(unittest.TestCase):
+    def setUp(self):
+        import tempfile
+        self.tmp = tempfile.TemporaryDirectory()
+        self.path = Path(self.tmp.name) / "aeram_afk_pulse"
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_pulse_file_is_owner_only(self):
+        write_pulse_file(123.0, self.path)
+        self.assertEqual(self.path.stat().st_mode & 0o777, 0o600)
+        self.assertEqual(self.path.read_text(), "123.0")
+
+    def test_world_writable_legacy_file_is_tightened(self):
+        self.path.write_text("old")
+        os.chmod(self.path, 0o666)
+        write_pulse_file(5.0, self.path)
+        self.assertEqual(self.path.stat().st_mode & 0o777, 0o600)
+
+    def test_planted_symlink_is_not_followed(self):
+        victim = Path(self.tmp.name) / "victim"
+        victim.write_text("keep")
+        self.path.symlink_to(victim)
+        with self.assertRaises(OSError):
+            write_pulse_file(1.0, self.path)
+        self.assertEqual(victim.read_text(), "keep")
 
 
 if __name__ == "__main__":

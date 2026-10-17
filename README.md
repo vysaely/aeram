@@ -40,6 +40,15 @@ aeram         # Launch GUI
 aeram --help  # CLI commands
 ```
 
+## Development
+
+```bash
+python3 -m venv --system-site-packages .venv && .venv/bin/pip install -r requirements-dev.txt
+.venv/bin/python -m pytest tests
+```
+
+`tests/conftest.py` redirects HOME, XDG directories and PATH to a throwaway sandbox, so the suite never touches a real vault or Mocktail install.
+
 ## License
 
 [GNU General Public License v3.0](LICENSE)

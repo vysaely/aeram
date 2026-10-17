@@ -50,6 +50,19 @@ except ImportError:
 
 log = logging.getLogger("AntiAFK")
 
+# Polled by native/libmocktail_mouse_helper.c (mtime change => pulse)
+AFK_PULSE_PATH = Path("/dev/shm/aeram_afk_pulse")
+
+
+def write_pulse_file(timestamp: float, path: Path = AFK_PULSE_PATH) -> None:
+    """Writes the pulse file as owner-only (0600), never following a planted symlink."""
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, "O_NOFOLLOW", 0), 0o600)
+    try:
+        os.fchmod(fd, 0o600)  # tighten files left 0666 by earlier versions
+        os.write(fd, str(timestamp).encode("utf-8"))
+    finally:
+        os.close(fd)
+
 
 class PhysicalIdleMonitor:
     """Monitors physical hardware mouse and keyboard events to prevent disrupting active work."""
@@ -204,16 +217,12 @@ class AntiAfkEngine:
         - ZERO effect on non-Roblox windows (Discord, Firefox, IDE, terminal)
         - Preserves camera grab and Shift Lock
         """
-        # 1. Update shared memory trigger file
+        # 1. Update shared memory trigger file (owner-only: /dev/shm is shared by all local users,
+        #    and the native helper ignores a pulse file it does not own)
         try:
-            pulse_file = Path("/dev/shm/aeram_afk_pulse")
-            pulse_file.write_text(str(time.time()), encoding="utf-8")
-            try:
-                os.chmod(str(pulse_file), 0o666)
-            except Exception:
-                pass
+            write_pulse_file(time.time())
         except Exception as e:
-            log.debug(f"Could not touch /dev/shm/aeram_afk_pulse: {e}")
+            log.debug(f"Could not touch {AFK_PULSE_PATH}: {e}")
 
         # 2. Notify processes via SIGUSR1 for immediate next-frame execution
         signaled = 0

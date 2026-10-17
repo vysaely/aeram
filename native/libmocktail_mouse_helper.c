@@ -93,9 +93,10 @@ static void update_typing_shm(bool active) {
     static int shm_fd = -1;
     static volatile uint8_t *shm_ptr = NULL;
     if (shm_fd < 0) {
-        shm_fd = open("/dev/shm/roblox_typing_active", O_RDWR | O_CREAT, 0666);
+        // Owner-only: /dev/shm is shared by every local user. O_NOFOLLOW refuses planted symlinks.
+        shm_fd = open("/dev/shm/roblox_typing_active", O_RDWR | O_CREAT | O_NOFOLLOW | O_CLOEXEC, 0600);
         if (shm_fd >= 0) {
-            fchmod(shm_fd, 0666);
+            fchmod(shm_fd, 0600);
             if (ftruncate(shm_fd, 4) == 0) {
                 shm_ptr = (volatile uint8_t *)mmap(NULL, 4, PROT_READ | PROT_WRITE, MAP_SHARED, shm_fd, 0);
                 if (shm_ptr == MAP_FAILED) shm_ptr = NULL;
@@ -709,7 +710,8 @@ bool SDL_GL_SwapWindow(SDL_Window *window) {
     if (!do_pulse && (now_ms - last_shm_poll >= 1500)) {
         last_shm_poll = now_ms;
         struct stat st;
-        if (stat("/dev/shm/aeram_afk_pulse", &st) == 0) {
+        // Ignore pulse files created by other users (anyone can create files in /dev/shm)
+        if (lstat("/dev/shm/aeram_afk_pulse", &st) == 0 && S_ISREG(st.st_mode) && st.st_uid == getuid()) {
             if (st.st_mtime > last_shm_pulse_time) {
                 last_shm_pulse_time = st.st_mtime;
                 do_pulse = true;

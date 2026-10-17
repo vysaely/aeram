@@ -84,5 +84,24 @@ class TestVaultCrypto(unittest.TestCase):
             self.assertEqual(key_path.read_bytes(), b"1234567890")
 
 
+    def test_concurrent_key_creation_keeps_first_key(self):
+        """If another process publishes vault.key first, adopt it instead of overwriting it."""
+        from unittest.mock import patch
+        with tempfile.TemporaryDirectory() as tmp:
+            key_path = Path(tmp) / "vault.key"
+            winner_key = os.urandom(32)
+            real_link = os.link
+
+            def competitor_wins(src, dst):
+                Path(dst).write_bytes(winner_key)  # other process got there first
+                return real_link(src, dst)
+
+            with patch("core.vault.os.link", side_effect=competitor_wins):
+                vault = Vault(key_path)
+
+            self.assertEqual(key_path.read_bytes(), winner_key)
+            self.assertEqual(vault._key, winner_key)
+            self.assertEqual(sorted(p.name for p in Path(tmp).iterdir()), ["vault.key"])
+
 if __name__ == "__main__":
     unittest.main()

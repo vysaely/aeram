@@ -207,5 +207,18 @@ class TestDesktopIntegration(unittest.TestCase):
         self.assertIn("Actions=StopAll;ListAccounts;Diagnostics;", content)
 
 
+class TestAnnotationsResolve(unittest.TestCase):
+    """Python < 3.14 evaluates annotations at import time; an undefined name there breaks startup."""
+
+    def test_core_annotations_resolve(self):
+        import inspect
+        import typing
+        import core.instance_runner as runner_mod
+        for name, obj in vars(runner_mod).items():
+            if inspect.isfunction(obj) and obj.__module__ == runner_mod.__name__:
+                with self.subTest(function=name):
+                    typing.get_type_hints(obj)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -118,11 +118,14 @@ class TestCLI(unittest.TestCase):
         ]
         for argv in test_cases:
             with self.subTest(argv=argv):
-                with patch("sys.argv", argv), patch("sys.stderr", new=StringIO()) as fake_err:
+                with patch("sys.argv", argv), patch("sys.stderr", new=StringIO()) as fake_err, \
+                        patch("core.entrypoint.StorageManager") as storage_cls:
                     with self.assertRaises(SystemExit) as cm:
                         main()
                     self.assertEqual(cm.exception.code, 2)
                     self.assertIn("aeram: error:", fake_err.getvalue())
+                    # Invalid arguments must be rejected before the vault is opened
+                    storage_cls.assert_not_called()
 
     def test_cli_add_via_stdin(self):
         self.api.enrich_account.return_value = {
