@@ -84,33 +84,12 @@ static uint64_t get_time_ms(void) {
 }
 
 // =============================================================================
-// Shared Memory Typing Flag for Macro (/dev/shm/roblox_typing_active)
+// Typing State (suppresses Anti-AFK input while a Roblox textbox is focused)
 // =============================================================================
 static bool this_instance_typing = false;
 
-static void update_typing_shm(bool active) {
+static void set_typing_active(bool active) {
     this_instance_typing = active;
-    static int shm_fd = -1;
-    static volatile uint8_t *shm_ptr = NULL;
-    if (shm_fd < 0) {
-        // Owner-only: /dev/shm is shared by every local user. O_NOFOLLOW refuses planted symlinks.
-        shm_fd = open("/dev/shm/roblox_typing_active", O_RDWR | O_CREAT | O_NOFOLLOW | O_CLOEXEC, 0600);
-        if (shm_fd >= 0) {
-            fchmod(shm_fd, 0600);
-            if (ftruncate(shm_fd, 4) == 0) {
-                shm_ptr = (volatile uint8_t *)mmap(NULL, 4, PROT_READ | PROT_WRITE, MAP_SHARED, shm_fd, 0);
-                if (shm_ptr == MAP_FAILED) shm_ptr = NULL;
-            }
-        }
-    }
-    if (shm_ptr) {
-        *shm_ptr = active ? 1 : 0;
-    }
-}
-
-__attribute__((destructor))
-static void cleanup_helper(void) {
-    update_typing_shm(false);
 }
 
 // =============================================================================
@@ -484,7 +463,7 @@ static void render_text_overlay(SDL_Window *window) {
         DBG("[swap] count=%lu query=%p copy=%p tid=%ld\n", dbg_swaps,
             (void *)real_mocktail_text_overlay_query, (void *)real_mocktail_text_overlay_copy, (long)gettid());
     if (!real_mocktail_text_overlay_query || !real_mocktail_text_overlay_copy) {
-        update_typing_shm(false);
+        set_typing_active(false);
         return;
     }
 
@@ -501,12 +480,11 @@ static void render_text_overlay(SDL_Window *window) {
         dbg_last_res = res; dbg_last_active = (int)info.active; dbg_last_gen = info.generation;
     }
     if (res != 1 || info.active != 1 || info.bitmap_w <= 0 || info.bitmap_h <= 0 || info.data_size == 0) {
-        update_typing_shm(false);
+        set_typing_active(false);
         return;
     }
 
-    // Inform macro tool that textbox is active
-    update_typing_shm(true);
+    set_typing_active(true);
 
     int win_w = 0, win_h = 0;
     if (real_SDL_GetWindowSizeInPixels) {
