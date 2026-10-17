@@ -230,6 +230,21 @@ class DiagnosticsRunner:
                 message="Mocktail executable detected and ready",
                 details=details_str,
             ))
+            if mocktail_info.latency_patched:
+                checks.append(DiagnosticCheck(
+                    name="Mocktail Input Latency Patch",
+                    category="Mocktail",
+                    status="OK",
+                    message="Hardware cursor, 1 ms input polling and uncapped FPS are available",
+                ))
+            else:
+                checks.append(DiagnosticCheck(
+                    name="Mocktail Input Latency Patch",
+                    category="Mocktail",
+                    status="INFO",
+                    message="Stock Mocktail: the in-game cursor is drawn by Roblox and trails the mouse, FPS is capped at 240",
+                    fix_suggestion=f"Run {self.project_root / 'scripts' / 'build_mocktail.sh'} (or ./install.sh --with-mocktail)",
+                ))
         else:
             checks.append(DiagnosticCheck(
                 name="Mocktail Roblox Client",

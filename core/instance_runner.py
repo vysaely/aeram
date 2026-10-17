@@ -509,6 +509,9 @@ class InstanceRunner:
             env["MOCKTAIL_FULLSCREEN_READINESS"] = "1"
             env["MOCKTAIL_MULTITHREADED_RENDERING"] = "1"
             env["MOCKTAIL_PHYSICS_WORKER_MODE"] = "throughput"
+            # Desktop hardware cursor instead of Roblox's frame-rendered arrow (AERAM's Mocktail build)
+            if (self.storage.get_setting("main_host_cursor", "true") or "true").lower() != "false":
+                env["MOCKTAIL_HOST_CURSOR"] = "1"
 
         # Enforce native window state prior to launch (fullscreen for main, windowed 800x600 for alts)
         window_state_json = json.dumps({

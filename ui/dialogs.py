@@ -821,6 +821,19 @@ class FastFlagsDialog(BorderlessDialog):
         self.combo_telemetry.currentIndexChanged.connect(self._on_control_changed)
         grid_eng.addWidget(self.combo_telemetry, 2, 1)
 
+        # Main account cursor
+        grid_eng.addWidget(QtWidgets.QLabel("Main Cursor:"), 3, 0)
+        self.combo_cursor = QtWidgets.QComboBox()
+        self.combo_cursor.addItems(["Hardware (Lowest Latency)", "Roblox Drawn"])
+        self.combo_cursor.setFixedWidth(240)
+        self.combo_cursor.setFixedHeight(26)
+        self.combo_cursor.setToolTip(
+            "Hardware shows the desktop cursor, which moves at the display's refresh instead of "
+            "waiting for the next rendered game frame. Needs AERAM's Mocktail build; games with a "
+            "custom mouse icon may show both cursors. Applies on next launch."
+        )
+        grid_eng.addWidget(self.combo_cursor, 3, 1)
+
         layout.addWidget(grp_engine)
 
         # ── 4. Action Buttons ──
@@ -896,6 +909,8 @@ class FastFlagsDialog(BorderlessDialog):
             self.combo_drs.setCurrentIndex(1)
         if self.storage.get_setting("fflag_disable_telemetry", "true").lower() == "false":
             self.combo_telemetry.setCurrentIndex(1)
+        if self.storage.get_setting("main_host_cursor", "true").lower() == "false":
+            self.combo_cursor.setCurrentIndex(1)
 
     def _on_preset_changed(self, index: int):
         if self._updating_preset or index == 3:  # Custom
@@ -942,6 +957,7 @@ class FastFlagsDialog(BorderlessDialog):
         self.combo_api.setCurrentIndex(0)
         self.combo_drs.setCurrentIndex(0)
         self.combo_telemetry.setCurrentIndex(0)
+        self.combo_cursor.setCurrentIndex(0)
 
     def _save(self):
         preset_idx = self.combo_preset.currentIndex()
@@ -975,6 +991,7 @@ class FastFlagsDialog(BorderlessDialog):
 
         self.storage.set_setting("fflag_disable_drs", "true" if self.combo_drs.currentIndex() == 0 else "false")
         self.storage.set_setting("fflag_disable_telemetry", "true" if self.combo_telemetry.currentIndex() == 0 else "false")
+        self.storage.set_setting("main_host_cursor", "true" if self.combo_cursor.currentIndex() == 0 else "false")
         self.accept()
 
 
