@@ -71,10 +71,12 @@ any are missing. AERAM uses this build automatically, even when a system Mocktai
   the mouse. Toggle under Settings → Client Engine & FastFlags → Main Cursor.
 - **1 ms input polling** instead of 4 ms.
 - **No 240 FPS cap:** the main account's FPS setting above 240 actually applies.
-- **Less CPU per instance:** Mocktail's main thread rests between engine polls instead of spinning a core
-  (ported from [Nightcap](https://github.com/CoderDayton/nightcap)); alts always rest.
-- **Login checks that finish:** "Verifying you're not a bot" answers right away and solved challenges close their
-  window (also from Nightcap).
+- **Less CPU per instance:** Mocktail's main thread rests after empty engine polls instead of spinning a core;
+  alts always rest.
+- **Login checks that finish:** solved verification challenges close their window, and login windows get 5 s to
+  open instead of 3 (several instances starting at once often missed the old limit).
+- **Smoother texture loading on NVIDIA:** where the driver cannot read Android's ETC2 textures, Mocktail converts
+  them on the CPU; it now reads them from GPU memory about 25x faster and writes them out in parallel.
 
 ## Usage
 
