@@ -156,6 +156,20 @@ def secretbox_decrypt(key: bytes, blob: bytes) -> bytes:
             raise WrongPasswordError("Decryption failed / authentication tag mismatch")
 
 
+def _fsync_dir(path: Path) -> None:
+    """Persists a directory entry change (best effort; unsupported on some platforms)."""
+    try:
+        fd = os.open(path, os.O_RDONLY)
+    except OSError:
+        return
+    try:
+        os.fsync(fd)
+    except OSError:
+        pass
+    finally:
+        os.close(fd)
+
+
 class Vault:
     """
     Manages encrypted credential persistence using libsodium SecretBox (XSalsa20-Poly1305).
@@ -193,13 +207,27 @@ class Vault:
             except Exception as e:
                 raise VaultError(f"Failed to read vault key: {e}")
 
-        # Generate new random 256-bit key with strict 0600 permissions
+        # Generate new random 256-bit key with strict 0600 permissions. It is published with
+        # link(), which fails if another process (e.g. GUI and CLI starting together) created the
+        # key first; replacing it would orphan everything already encrypted under that key.
         new_key = os.urandom(crypto_secretbox_KEYBYTES)
-        tmp_path = self.key_file_path.with_suffix(".tmp")
+        tmp_path = self.key_file_path.with_name(f"{self.key_file_path.name}.{os.getpid()}.tmp")
         fd = os.open(tmp_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-        with os.fdopen(fd, "wb") as f:
-            f.write(new_key)
-        os.replace(tmp_path, self.key_file_path)
+        try:
+            with os.fdopen(fd, "wb") as f:
+                f.write(new_key)
+                f.flush()
+                os.fsync(f.fileno())
+            try:
+                os.link(tmp_path, self.key_file_path)
+            except FileExistsError:
+                return self._init_or_load_key()
+            except OSError:
+                # Filesystem without hard links: fall back to an atomic rename
+                os.replace(tmp_path, self.key_file_path)
+        finally:
+            tmp_path.unlink(missing_ok=True)
+        _fsync_dir(self.key_file_path.parent)
         self._key = new_key
 
     def encrypt_string(self, text: str) -> bytes:

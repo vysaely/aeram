@@ -116,6 +116,20 @@ def main():
 
     args = parser.parse_args(raw_args)
 
+    # Reject incomplete modifier combinations before touching the vault or any instance state
+    orphan_errors = []
+    if (args.place or args.job or args.server) and not (args.launch or args.multi):
+        orphan_errors.append("Options --place, --job, and --server require --launch <USER> or --multi <USERS>.")
+    if args.group and not args.add:
+        orphan_errors.append("Option --group requires --add <COOKIE>.")
+    if args.password and not (args.import_file or args.export_file):
+        orphan_errors.append("Option --password requires --import <FILE> or --export <FILE>.")
+
+    if orphan_errors:
+        for err in orphan_errors:
+            print(f"aeram: error: {err}", file=sys.stderr)
+        sys.exit(2)
+
     if args.diagnostics:
         from core.diagnostics import DiagnosticsRunner
         report = DiagnosticsRunner().run_all_checks()
@@ -150,20 +164,6 @@ def main():
     storage = StorageManager()
     api = RobloxAPI()
     runner = InstanceRunner(storage, api=api)
-
-    # Check for incomplete / orphaned CLI modifier arguments
-    orphan_errors = []
-    if (args.place or args.job or args.server) and not (args.launch or args.multi):
-        orphan_errors.append("Options --place, --job, and --server require --launch <USER> or --multi <USERS>.")
-    if args.group and not args.add:
-        orphan_errors.append("Option --group requires --add <COOKIE>.")
-    if args.password and not (args.import_file or args.export_file):
-        orphan_errors.append("Option --password requires --import <FILE> or --export <FILE>.")
-
-    if orphan_errors:
-        for err in orphan_errors:
-            print(f"aeram: error: {err}", file=sys.stderr)
-        sys.exit(2)
 
     # Check if any CLI command flags are active
     cli_flags = [

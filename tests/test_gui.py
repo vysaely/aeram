@@ -1439,6 +1439,39 @@ class TestGUI(unittest.TestCase):
             window.close()
 
 
+class TestTwoFactorStopRace(unittest.TestCase):
+    def test_stop_between_check_and_clear_does_not_hang(self):
+        """A stop() landing just before the worker clears its 2FA event must not be lost."""
+        import threading
+        from ui.dialogs import BatchSignOutWorker
+
+        acc = RobloxAccount(account_id="acc_race", username="Racer", display_name="Racer",
+                            user_id=1, cookie="tok")
+        api = MagicMock()
+        worker = BatchSignOutWorker([acc], api)
+        callback_result = []
+
+        real_clear = worker._2fa_event.clear
+
+        def clear_after_stop():
+            worker.stop()   # sets the event...
+            real_clear()    # ...which the worker then erases
+
+        worker._2fa_event.clear = clear_after_stop
+
+        def sign_out(cookie, two_fa_callback):
+            callback_result.append(two_fa_callback({"attempt": 2}))
+            return False, None, "cancelled"
+
+        api.sign_out_of_all_sessions.side_effect = sign_out
+
+        runner = threading.Thread(target=worker.run, daemon=True)
+        runner.start()
+        runner.join(timeout=5)
+        self.assertFalse(runner.is_alive(), "worker blocked forever on a lost stop() wake-up")
+        self.assertEqual(callback_result, [None])
+
+
 if __name__ == "__main__":
     unittest.main()
 

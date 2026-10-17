@@ -374,6 +374,38 @@ class TestStorageManager(unittest.TestCase):
         storage_ro.delete_account(acc.account_id)
         self.assertFalse((fallback_bin_dir / f"mocktail_{acc.account_id}").exists())
 
+    def test_get_instance_binary_follows_replaced_mocktail_binary(self):
+        lib_dir = Path(self.tmp_dir.name) / "mocktail_lib"
+        lib_dir.mkdir()
+        (lib_dir / "libmocktail_audio_sdl.so").write_bytes(b"\x7fELFaudio")
+        source = lib_dir / "mocktail"
+        source.write_bytes(b"\x7fELF-client-v1")
+        source.chmod(0o755)
+
+        storage = StorageManager(
+            base_dir=self.base_dir / "upgrade",
+            mocktail_data=self.mocktail_data,
+            mocktail_bin=source,
+        )
+        acc = RobloxAccount(account_id="acc_upgrade_1", username="Upgrader", display_name="Upgrader", user_id=1, cookie="dummy")
+
+        first = storage.get_instance_binary(acc)
+        self.assertEqual(first, lib_dir / "mocktail_acc_upgrade_1")
+        self.assertTrue(os.path.samefile(first, source))
+
+        # A Mocktail upgrade writes the new client to a temp file and renames it into place,
+        # giving it a new inode; the old hardlink would otherwise keep the v1 client alive.
+        staged = lib_dir / "mocktail.new"
+        staged.write_bytes(b"\x7fELF-client-v2-larger")
+        staged.chmod(0o755)
+        os.replace(staged, source)
+
+        second = storage.get_instance_binary(acc)
+        self.assertEqual(second, first)
+        self.assertTrue(os.path.samefile(second, source))
+        self.assertEqual(second.read_bytes(), b"\x7fELF-client-v2-larger")
+        self.assertFalse((lib_dir / "mocktail_acc_upgrade_1.provision").exists())
+
     def test_clear_password_and_purge_all_passwords(self):
         acc1 = RobloxAccount(
             account_id="acc_pwd_1",

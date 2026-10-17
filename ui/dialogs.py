@@ -1993,6 +1993,9 @@ class BatchSignOutWorker(QtCore.QThread):
 
                 self._2fa_event.clear()
                 self._2fa_code = None
+                # stop() may have fired between the check above and clear(); its wake-up is lost
+                if self._is_stopped:
+                    return None
                 self.request_2fa.emit({
                     "account": acc,
                     "index": idx + 1,
@@ -2972,6 +2975,9 @@ class ChangePasswordWorker(QtCore.QThread):
             # 2. Otherwise request 2FA code from GUI thread
             self._2fa_event.clear()
             self._2fa_code = None
+            # stop() may have fired between the check above and clear(); its wake-up is lost
+            if self._is_stopped:
+                return None
             self.request_2fa.emit(info)
             self._2fa_event.wait()
             return self._2fa_code
@@ -3398,6 +3404,9 @@ class BatchPasswordChangeWorker(QtCore.QThread):
                 # 2. Otherwise request 2FA code from GUI thread
                 self._2fa_event.clear()
                 self._2fa_code = None
+                # stop() may have fired between the check above and clear(); its wake-up is lost
+                if self._is_stopped:
+                    return None
                 self.request_2fa.emit(acc, info)
                 self._2fa_event.wait()
                 return self._2fa_code

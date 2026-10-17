@@ -19,7 +19,7 @@ try:
 except ImportError:
     resource = None
 
-from typing import Dict, Optional, List, Callable, Any
+from typing import Dict, Optional, List, Callable, Any, Tuple
 from pathlib import Path
 from urllib.parse import urlparse, parse_qs
 import urllib.request
@@ -150,7 +150,7 @@ class InstanceRunner:
                         fname = Path(exe).name
 
                         for acc in accounts:
-                            if acc.account_id in fname or fname == f"mocktail_{acc.account_id}":
+                            if fname == f"mocktail_{acc.account_id}":
                                 if acc.account_id not in self.active_instances:
                                     profile_dir = self.storage.get_profile_dir(acc)
                                     self.active_instances[acc.account_id] = RunningInstance(
@@ -697,27 +697,25 @@ class InstanceRunner:
         inst = self.active_instances[account_id]
         log.info(f"Terminating instance {account_id} (PID {inst.pid})")
 
-        pgid = None
-        try:
-            pgid = os.getpgid(inst.pid)
-            os.killpg(pgid, signal.SIGTERM)
-        except Exception:
+        if not self._is_mocktail_process(inst.pid):
+            # The tracked PID exited and was recycled, or never was Mocktail: signalling it
+            # (or its process group) could kill an unrelated program, so only drop the record.
+            log.warning(f"PID {inst.pid} tracked for {account_id} is no longer a Mocktail process; not signalling it")
+        else:
+            # Only signal the whole group when the instance leads its own (setsid launch). An
+            # adopted instance started elsewhere may share a group with a shell or with AERAM.
+            pgid = None
             try:
-                os.kill(inst.pid, signal.SIGTERM)
+                candidate = os.getpgid(inst.pid)
+                if candidate == inst.pid and candidate != os.getpgrp():
+                    pgid = candidate
             except Exception:
                 pass
 
-        # Allow grace period then force kill if needed
-        time.sleep(0.3)
-        if pgid is not None:
-            try:
-                os.killpg(pgid, signal.SIGKILL)
-            except Exception:
-                pass
-        try:
-            os.kill(inst.pid, signal.SIGKILL)
-        except Exception:
-            pass
+            self._signal_instance(inst.pid, pgid, signal.SIGTERM)
+            # Allow grace period then force kill if needed
+            time.sleep(0.3)
+            self._signal_instance(inst.pid, pgid, signal.SIGKILL)
 
         # Clean up instance runtime lock directory
         try:
@@ -743,6 +741,27 @@ class InstanceRunner:
         if hasattr(self, "auth_state_manager") and self.auth_state_manager.get_state(account_id) == AccountAuthState.RUNNING:
             self.auth_state_manager.mark_ready(account_id)
         return True
+
+    @staticmethod
+    def _is_mocktail_process(pid: int) -> bool:
+        """True when /proc/<pid> is a live process of this user whose command line runs Mocktail."""
+        try:
+            if os.stat(f"/proc/{pid}").st_uid != os.getuid():
+                return False
+            with open(f"/proc/{pid}/cmdline", "rb") as f:
+                return b"mocktail" in f.read()
+        except OSError:
+            return False
+
+    @staticmethod
+    def _signal_instance(pid: int, pgid: Optional[int], sig: int) -> None:
+        try:
+            if pgid is not None:
+                os.killpg(pgid, sig)
+            else:
+                os.kill(pid, sig)
+        except Exception:
+            pass
 
     def terminate_all_instances(self) -> int:
         """Terminates all instances actively tracked by this manager."""
