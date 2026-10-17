@@ -11,7 +11,7 @@ import shutil
 import subprocess
 import logging
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple, Any
+from typing import Any, Callable, Dict, List, Optional, Tuple
 from datetime import datetime, timezone
 from PyQt6 import QtWidgets, QtCore, QtGui
 
@@ -467,8 +467,13 @@ class AuthValidatorWorker(QtCore.QThread):
 
 
 class MainWindow(QtWidgets.QMainWindow):
+    # Delivers callables from worker threads to the GUI thread. PyQt6's
+    # QMetaObject.invokeMethod does not accept Python callables (it raises TypeError).
+    _ui_call = QtCore.pyqtSignal(object)
+
     def __init__(self, storage: StorageManager, api: RobloxAPI, runner: InstanceRunner):
         super().__init__()
+        self._ui_call.connect(lambda fn: fn())
         self.storage = storage
         self.api = api
         self.runner = runner
@@ -1467,6 +1472,24 @@ class MainWindow(QtWidgets.QMainWindow):
                     daemon=True,
                 ).start()
 
+    def _run_on_ui(self, fn: Callable[[], None]) -> None:
+        """Runs fn on the GUI thread; safe to call from any thread."""
+        self._ui_call.emit(fn)
+
+    def _run_in_background(self, work: Callable[[], Any], on_done: Callable[[Any], None]) -> None:
+        """Runs work() on a daemon thread, then on_done(result) on the GUI thread."""
+        import threading
+
+        def _worker():
+            try:
+                result = work()
+            except Exception as e:
+                log.warning(f"Background task failed: {e}")
+                result = e
+            self._run_on_ui(lambda: on_done(result))
+
+        threading.Thread(target=_worker, daemon=True).start()
+
     def _cycle_status_metric(self):
         self._status_metric_index = (getattr(self, "_status_metric_index", 0) + 1) % 3
         self._update_status_bar()
@@ -1761,13 +1784,26 @@ class MainWindow(QtWidgets.QMainWindow):
                 QMessageBox.information(self, "Follow", "Select an account to launch from first.")
                 return
 
-        user_id = self.api.resolve_username_to_user_id(target_name)
+        caller_cookie = targets[0].cookie if targets else None
+        self.statusBar().showMessage(f"Looking up @{target_name}...", 0)
+
+        def _lookup():
+            user_id = self.api.resolve_username_to_user_id(target_name)
+            presence = self.api.get_user_presence(user_id, cookie=caller_cookie) if user_id else None
+            return user_id, presence
+
+        def _done(result):
+            self.statusBar().clearMessage()
+            user_id, presence = result if isinstance(result, tuple) else (None, None)
+            self._follow_resolved(target_name, targets, user_id, presence)
+
+        self._run_in_background(_lookup, _done)
+
+    def _follow_resolved(self, target_name: str, targets: List[RobloxAccount],
+                         user_id: Optional[int], presence: Optional[Dict[str, Any]]):
         if not user_id:
             QMessageBox.warning(self, "Follow Failed", f"Could not find user '{target_name}' on Roblox.")
             return
-
-        caller_cookie = targets[0].cookie if targets else None
-        presence = self.api.get_user_presence(user_id, cookie=caller_cookie)
 
         target_place_id = None
         in_game = False
@@ -2587,12 +2623,21 @@ class MainWindow(QtWidgets.QMainWindow):
             self.storage.save_account(acc)
 
         self.statusBar().showMessage(f"Auto logging in @{acc.username} (API)...", 4000)
-        QtWidgets.QApplication.processEvents()
+        username, password, totp_secret = acc.username, acc.password, acc.totp_secret
 
-        ok, cookie, user_data, msg = self.api.login_with_credentials(
-            acc.username, acc.password, acc.totp_secret
-        )
+        def _login():
+            return self.api.login_with_credentials(username, password, totp_secret)
 
+        def _done(result):
+            if isinstance(result, Exception):
+                result = (False, None, None, str(result))
+            self._auto_login_finished(acc, *result)
+
+        self._run_in_background(_login, _done)
+
+    def _auto_login_finished(self, acc: RobloxAccount, ok: bool, cookie: Optional[str],
+                             user_data: Optional[Dict[str, Any]], msg: str):
+        msg = msg or ""
         if ok and cookie:
             acc.cookie = cookie
             if user_data:
@@ -2648,30 +2693,50 @@ class MainWindow(QtWidgets.QMainWindow):
         if not targets:
             return
 
+        if getattr(self, "_session_validation_running", False):
+            self.statusBar().showMessage("Session validation already in progress", 3000)
+            return
+        self._session_validation_running = True
         count = len(targets)
-        valid_count = 0
-        expired_count = 0
-        error_count = 0
+        cookies = [(acc, acc.cookie) for acc in targets]
 
-        for idx, acc in enumerate(targets, 1):
+        def _progress(idx: int, acc: RobloxAccount):
             if count > 1:
                 self.statusBar().showMessage(f"Validating [{idx}/{count}]: @{acc.username}", 0)
             else:
                 self.statusBar().showMessage(f"Validating @{acc.username}...", 3000)
-            QtWidgets.QApplication.processEvents()
 
-            is_valid, user_data, status_reason = self.api.validate_cookie(acc.cookie)
-            if is_valid and user_data:
-                valid_count += 1
-                if hasattr(self.runner, "auth_state_manager"):
+        def _record(acc: RobloxAccount, outcome: str):
+            if hasattr(self.runner, "auth_state_manager"):
+                if outcome == "valid":
                     self.runner.auth_state_manager.mark_ready(acc.account_id)
-            elif status_reason == "EXPIRED":
-                expired_count += 1
-                if hasattr(self.runner, "auth_state_manager"):
+                elif outcome == "expired":
                     self.runner.auth_state_manager.mark_session_expired(acc.account_id)
-            else:
-                error_count += 1
 
+        def _validate_all():
+            counts = {"valid": 0, "expired": 0, "error": 0}
+            for idx, (acc, cookie) in enumerate(cookies, 1):
+                self._run_on_ui(lambda idx=idx, acc=acc: _progress(idx, acc))
+                try:
+                    is_valid, user_data, status_reason = self.api.validate_cookie(cookie)
+                except Exception:
+                    is_valid, user_data, status_reason = False, None, "ERROR"
+                outcome = "valid" if is_valid and user_data else ("expired" if status_reason == "EXPIRED" else "error")
+                counts[outcome] += 1
+                self._run_on_ui(lambda acc=acc, outcome=outcome: _record(acc, outcome))
+            return counts
+
+        def _done(counts):
+            self._session_validation_running = False
+            if isinstance(counts, Exception):
+                counts = {"valid": 0, "expired": 0, "error": count}
+            self._session_validation_finished(targets, counts["valid"], counts["expired"], counts["error"])
+
+        self._run_in_background(_validate_all, _done)
+
+    def _session_validation_finished(self, targets: List[RobloxAccount], valid_count: int,
+                                     expired_count: int, error_count: int):
+        count = len(targets)
         self._populate_table()
 
         if count == 1:
@@ -2917,7 +2982,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 if self.current_account:
                     self._select_account(self.current_account)
                 self.statusBar().showMessage(f"Synced Robux for {updated_count} account(s)", 4000)
-            QtCore.QMetaObject.invokeMethod(self, _on_done, QtCore.Qt.ConnectionType.QueuedConnection)
+            self._run_on_ui(_on_done)
 
         threading.Thread(target=_worker, daemon=True).start()
 
@@ -3334,11 +3399,7 @@ class MainWindow(QtWidgets.QMainWindow):
             try:
                 proc = subprocess.run(cmd, capture_output=True, text=True)
                 if proc.returncode == 0:
-                    QtCore.QMetaObject.invokeMethod(
-                        self,
-                        lambda: self.statusBar().showMessage("Anti-AFK pulse complete", 5000),
-                        QtCore.Qt.ConnectionType.QueuedConnection,
-                    )
+                    self._run_on_ui(lambda: self.statusBar().showMessage("Anti-AFK pulse complete", 5000))
             except Exception:
                 pass
 

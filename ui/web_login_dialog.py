@@ -127,6 +127,18 @@ CHROME_USER_AGENT = (
 )
 
 ROBLOX_LOGIN_URL = "https://www.roblox.com/login"
+
+
+def is_roblox_url(url: QUrl) -> bool:
+    """True for https pages on roblox.com or one of its subdomains (not look-alike hosts)."""
+    host = url.host().lower()
+    return url.scheme().lower() == "https" and (host == "roblox.com" or host.endswith(".roblox.com"))
+
+
+def is_roblox_login_url(url: QUrl) -> bool:
+    """True only for Roblox's own sign-in page, where saved credentials may be typed."""
+    return (is_roblox_url(url) and url.host().lower() in ("roblox.com", "www.roblox.com")
+            and url.path().lower().rstrip("/").startswith("/login"))
 ROBLOX_HOME_URL = "https://www.roblox.com/home"
 
 ROBLOX_2FA_DOM_FIX_JS = """
@@ -884,8 +896,7 @@ class WebLoginDialog(BorderlessDialog):
 
         # Trigger auto-login if requested or account credentials are present
         if getattr(self, "auto_login", False) and self.target_account and self.target_account.username and self.target_account.password:
-            current_url = self.view.url().toString() if hasattr(self, "view") else ""
-            if "roblox.com/login" in current_url or self.mode == "login":
+            if hasattr(self, "view") and is_roblox_login_url(self.view.url()):
                 QTimer.singleShot(700, self._perform_auto_login)
 
     def _perform_auto_login(self):
@@ -896,6 +907,12 @@ class WebLoginDialog(BorderlessDialog):
         if not self.target_account or not self.target_account.username or not self.target_account.password:
             if hasattr(self, "status_label"):
                 self.status_label.setText("Account lacks username or password for auto-login.")
+            return
+
+        # The page may have redirected during the delay; never type credentials into another site
+        if not (hasattr(self, "view") and is_roblox_login_url(self.view.url())):
+            if hasattr(self, "status_label"):
+                self.status_label.setText("Auto Log In skipped: this is not Roblox's sign-in page.")
             return
 
         username = self.target_account.username
@@ -983,6 +1000,8 @@ class WebLoginDialog(BorderlessDialog):
         self._2fa_watcher_timer.start()
 
     def _check_and_inject_2fa(self):
+        if hasattr(self, "view") and not is_roblox_url(self.view.url()):
+            return
         if not self.target_account or not self.target_account.totp_secret:
             if hasattr(self, "_2fa_watcher_timer") and self._2fa_watcher_timer:
                 self._2fa_watcher_timer.stop()
@@ -1395,7 +1414,7 @@ class WebLoginDialog(BorderlessDialog):
             return tryInject(document);
         }})({code_json});
         """
-        if hasattr(self, "view") and self.view and hasattr(self.view, "page"):
+        if hasattr(self, "view") and self.view and hasattr(self.view, "page") and is_roblox_url(self.view.url()):
             self.view.page().runJavaScript(js, self._on_2fa_submit_result)
 
     def _on_2fa_submit_result(self, result):
@@ -1503,6 +1522,9 @@ class WebLoginDialog(BorderlessDialog):
         if not hasattr(self, "page") or not self.page or self._is_saved:
             if self._pw_timer and self._pw_timer.isActive():
                 self._pw_timer.stop()
+            return
+        # Only Roblox's own pages: a password typed on any other site must never be saved
+        if not (hasattr(self, "view") and is_roblox_url(self.view.url())):
             return
         js_code = """
         (function() {

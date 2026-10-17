@@ -179,6 +179,32 @@ class TestInstanceRunner(unittest.TestCase):
         finally:
             shutil.rmtree(helper.parent, ignore_errors=True)
 
+    def test_recovery_adopts_game_not_its_session_log_writer(self):
+        import shutil
+        import subprocess
+        tmp = Path(tempfile.mkdtemp())
+        fake = tmp / "mocktail_acc_test"
+        shutil.copy("/usr/bin/sleep", fake)
+        # The writer is forked first in reality, but /proc order is not guaranteed: start the
+        # stand-in for it first so it has the lower PID and would win a first-match scan.
+        writer = subprocess.Popen([str(fake), "30"])
+        game = subprocess.Popen([str(fake), "30"], start_new_session=True)
+        try:
+            storage = MagicMock()
+            storage.list_accounts.return_value = [RobloxAccount(
+                account_id="acc_test", username="Rec", display_name="Rec", user_id=1, cookie="c")]
+            storage.get_profile_dir.return_value = tmp
+            runner = InstanceRunner.__new__(InstanceRunner)
+            runner.storage = storage
+            runner.active_instances = {}
+            runner.scan_running_instances()
+            self.assertEqual(runner.active_instances["acc_test"].pid, game.pid)
+        finally:
+            for proc in (writer, game):
+                proc.kill()
+                proc.wait()
+            shutil.rmtree(tmp, ignore_errors=True)
+
     def test_main_account_uses_vulkan_when_selected(self):
         self.assertEqual(self._launch_with_backend_setting("Vulkan", is_main=True), ("direct-vulkan", "direct-vulkan"))
 

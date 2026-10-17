@@ -282,6 +282,19 @@ class AppUpdater:
                             except Exception:
                                 pass
 
+                # The Mocktail patch set is applied as a whole (native/mocktail/*.patch), so a patch
+                # removed upstream must not linger: mirror that directory exactly.
+                src_patches = src_root / "native" / "mocktail"
+                dest_patches = self.app_root / "native" / "mocktail"
+                if src_patches.is_dir() and dest_patches.is_dir():
+                    keep = {p.name for p in src_patches.iterdir()}
+                    for stale in dest_patches.iterdir():
+                        if stale.name not in keep and stale.is_file():
+                            try:
+                                stale.unlink()
+                            except OSError as e:
+                                log.warning(f"Could not remove stale {stale}: {e}")
+
                 # Rebuild native helper if available
                 native_dir = self.app_root / "native"
                 if (native_dir / "Makefile").exists() and shutil.which("make"):
