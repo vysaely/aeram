@@ -279,5 +279,28 @@ class TestDefaultBaseDirSelection(unittest.TestCase):
             self.assertEqual(self._base_dir(home), home / ".local" / "share" / "aeram")
 
 
+class TestMocktailInstallGuidance(unittest.TestCase):
+    def _family(self, text):
+        from core.mocktail_manager import _distro_family
+        with tempfile.TemporaryDirectory() as tmp:
+            f = Path(tmp) / "os-release"
+            f.write_text(text)
+            return _distro_family(f)
+
+    def test_distro_family_detection(self):
+        self.assertEqual(self._family('ID=cachyos\nID_LIKE=arch\n'), "arch")
+        self.assertEqual(self._family('ID=linuxmint\nID_LIKE="ubuntu debian"\n'), "debian")
+        self.assertEqual(self._family('ID=fedora\n'), "fedora")
+        self.assertEqual(self._family('ID=nixos\n'), "other")
+
+    def test_flatpak_only_install_gets_explained(self):
+        with patch.object(MocktailManager, "sandboxed_install_present", return_value=True), \
+                patch("core.mocktail_manager._distro_family", return_value="debian"):
+            text = MocktailManager().get_installation_instructions()
+        self.assertIn("Flatpak", text)
+        self.assertIn("apt install ./mocktail_", text)
+        self.assertNotIn("vinegarhq/mocktail", text)
+
+
 if __name__ == "__main__":
     unittest.main()

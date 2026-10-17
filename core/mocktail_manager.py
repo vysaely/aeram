@@ -16,6 +16,31 @@ from typing import Optional, List, Dict, Any, Tuple
 log = logging.getLogger("MocktailManager")
 
 
+
+FLATPAK_APP_ID = "space.bigrat.mocktail"
+RELEASES_URL = "https://github.com/komaruworld/mocktail/releases"
+
+
+def _distro_family(os_release: Path = Path("/etc/os-release")) -> str:
+    """Returns 'arch', 'debian', 'fedora' or 'other' from /etc/os-release."""
+    try:
+        fields = {}
+        for line in os_release.read_text(encoding="utf-8").splitlines():
+            key, sep, value = line.partition("=")
+            if sep:
+                fields[key] = value.strip().strip('"').lower()
+        ids = {fields.get("ID", "")} | set(fields.get("ID_LIKE", "").split())
+    except OSError:
+        return "other"
+    for family, members in (
+        ("arch", {"arch", "archlinux"}),
+        ("debian", {"debian", "ubuntu"}),
+        ("fedora", {"fedora", "rhel"}),
+    ):
+        if ids & members:
+            return family
+    return "other"
+
 @dataclass
 class MocktailInstallationInfo:
     """Represents detected Mocktail runtime state and capabilities."""
@@ -308,18 +333,41 @@ class MocktailManager:
             log.error(f"Failed to create config backup: {e}")
             return None
 
+    @staticmethod
+    def sandboxed_install_present() -> bool:
+        """True when Mocktail is installed only in a form AERAM cannot multi-instance (Flatpak)."""
+        for root in (Path("/var/lib/flatpak/app"), Path.home() / ".local" / "share" / "flatpak" / "app"):
+            if (root / FLATPAK_APP_ID).exists():
+                return True
+        return False
+
     def get_installation_instructions(self) -> str:
-        """Provides user-facing guidance to install or repair Mocktail."""
-        is_arch = Path("/etc/arch-release").exists() or Path("/etc/cachyos-release").exists()
-        if is_arch:
-            return (
-                "Mocktail is available on Arch Linux via the AUR:\n\n"
+        """Provides user-facing, distro-specific guidance to install Mocktail natively."""
+        distro = _distro_family()
+        if distro == "arch":
+            how = (
+                "Install the prebuilt package from the AUR:\n\n"
                 "  paru -S mocktail-bin\n"
-                "  # or: yay -S mocktail-bin\n\n"
-                "Upstream project: https://github.com/komaruworld/mocktail"
+                "  # or: yay -S mocktail-bin"
             )
-        return (
-            "Please install Mocktail from upstream releases:\n\n"
-            "  https://github.com/komaruworld/mocktail/releases\n"
-            "Extract to ~/.local/lib/mocktail/ or place the binary in your PATH."
-        )
+        elif distro == "debian":
+            how = (
+                f"Download the .deb from {RELEASES_URL} and install it:\n\n"
+                "  sudo apt install ./mocktail_*_amd64.deb"
+            )
+        elif distro == "fedora":
+            how = (
+                f"Download the .rpm from {RELEASES_URL} and install it:\n\n"
+                "  sudo dnf install ./mocktail-*.x86_64.rpm"
+            )
+        else:
+            how = f"Install the .deb, .rpm or Arch package from {RELEASES_URL}."
+
+        note = ""
+        if self.sandboxed_install_present():
+            note = (
+                "Mocktail is installed as a Flatpak. AERAM cannot use it: running several accounts at once "
+                "needs a separate copy of the Mocktail program per account, which the Flatpak sandbox "
+                "does not allow. The AppImage has the same limitation. Install the native package too:\n\n"
+            )
+        return f"{note}{how}\n\nUpstream project: https://github.com/komaruworld/mocktail"

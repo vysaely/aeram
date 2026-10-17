@@ -38,6 +38,13 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
+print_helper_build_deps() {
+    echo "      Install the build packages, then re-run ./install.sh:"
+    echo "        Arch / CachyOS:  sudo pacman -S --needed base-devel sdl3 mesa"
+    echo "        Debian / Ubuntu: sudo apt install build-essential libsdl3-dev libgles-dev"
+    echo "        Fedora:          sudo dnf install gcc make SDL3-devel mesa-libGLES-devel"
+}
+
 BIN_DIR="${PREFIX}/bin"
 DESKTOP_DIR="${PREFIX}/share/applications"
 ICON_DIR="${PREFIX}/share/icons/hicolor/scalable/apps"
@@ -154,8 +161,12 @@ if [[ "${MOCKTAIL_INFO}" == INSTALLED* ]]; then
 else
     echo "  [!] Mocktail binary not found on PATH or standard locations."
     echo "      AERAM will manage accounts, but launching requires Mocktail."
-    echo "      Install Mocktail on Arch Linux via AUR:"
-    echo "        paru -S --needed mocktail-bin   # or yay -S mocktail-bin"
+    python3 -c "
+import sys
+sys.path.insert(0, '${SCRIPT_DIR}')
+from core.mocktail_manager import MocktailManager
+print(MocktailManager().get_installation_instructions())
+" 2>/dev/null | sed 's/^/      /'
 fi
 
 # 4. Native companion helper compilation
@@ -168,11 +179,13 @@ if [ -f "${SCRIPT_DIR}/native/Makefile" ]; then
             mkdir -p "${HOME}/.local/lib/mocktail"
             cp "${SCRIPT_DIR}/native/libmocktail_mouse_helper.so" "${HOME}/.local/lib/mocktail/" 2>/dev/null || true
         else
-            echo "  [!] Native helper compilation failed. In-process signal IPC fallback will be used."
+            echo "  [!] Native helper compilation failed (needs SDL3 and OpenGL ES development headers)."
+            echo "      AERAM still works; the chat overlay fix and in-game Anti-AFK pulse are disabled."
+            print_helper_build_deps
         fi
     else
         echo "  [i] make or gcc not found. Skipping helper compilation."
-        echo "      To enable low-level SDL3 event injection: sudo pacman -S base-devel && make -C native"
+        print_helper_build_deps
     fi
 fi
 
