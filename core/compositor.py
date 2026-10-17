@@ -11,7 +11,7 @@ import logging
 import subprocess
 from enum import Enum
 from pathlib import Path
-from typing import Optional, List, Dict, Any
+from typing import Optional, List
 
 log = logging.getLogger("Compositor")
 
@@ -37,15 +37,6 @@ class CompositorCapabilities:
         self.can_keep_below = can_keep_below
         self.compositor_name = compositor_name
 
-    def to_dict(self) -> Dict[str, Any]:
-        return {
-            "compositor": self.compositor_name,
-            "can_query_windows": self.can_query_windows,
-            "can_focus_windows": self.can_focus_windows,
-            "can_keep_below": self.can_keep_below,
-        }
-
-
 class BaseCompositor:
     """Base class for desktop compositor integrations."""
 
@@ -60,11 +51,6 @@ class BaseCompositor:
     def cycle_mocktail_windows(self, pids: List[int]) -> int:
         """Cycles focus across Mocktail instances if safe and supported, then restores active window."""
         return 0
-
-    def get_active_window_pid(self) -> Optional[int]:
-        """Returns the PID owning the currently active window, if discoverable."""
-        return None
-
 
 class HyprlandCompositor(BaseCompositor):
     """Hyprland Wayland compositor integration via hyprctl JSON IPC."""
@@ -95,16 +81,6 @@ class HyprlandCompositor(BaseCompositor):
                 return res.stdout
         except Exception as e:
             log.debug(f"hyprctl error: {e}")
-        return None
-
-    def get_active_window_pid(self) -> Optional[int]:
-        out = self._run_hyprctl(["activewindow", "-j"])
-        if out:
-            try:
-                data = json.loads(out)
-                return data.get("pid")
-            except Exception:
-                pass
         return None
 
     def cycle_mocktail_windows(self, pids: List[int]) -> int:

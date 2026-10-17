@@ -20,7 +20,6 @@ class TestAntiAfkEngine(unittest.TestCase):
             mock_scandir.return_value.__enter__.return_value = []
             pids = self.engine.get_mocktail_pids()
             self.assertEqual(pids, [])
-            self.assertEqual(self.engine.get_roblox_windows_count(), 0)
 
     def test_get_mocktail_pids_detection(self):
         """Detects mocktail processes by cmdline and filters out unrelated processes."""

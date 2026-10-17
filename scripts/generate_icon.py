@@ -3,12 +3,9 @@
 Generates minimal achromatic 'ae' icon for AERAM.
 Produces:
 - assets/aeram.svg (pure standalone vector SVG)
-- assets/roblox-account-manager.svg (drop-in compatibility)
 - assets/aeram.png (high-resolution PNG)
-- assets/aeram.ico (multi-resolution Windows ICO: 16, 24, 32, 48, 64, 128, 256)
 """
 
-import struct
 from pathlib import Path
 from PyQt6 import QtGui, QtCore, QtSvg
 
@@ -95,48 +92,13 @@ def build_icon_assets():
 
     # Save SVG vector files
     (assets_dir / "aeram.svg").write_text(svg_content, encoding="utf-8")
-    (assets_dir / "roblox-account-manager.svg").write_text(svg_content, encoding="utf-8")
 
     # Render multi-resolution images from SVG renderer
     renderer = QtSvg.QSvgRenderer(str(assets_dir / "aeram.svg"))
     if not renderer.isValid():
         raise RuntimeError("Failed to load generated SVG")
 
-    sizes = [16, 24, 32, 48, 64, 128, 256]
-    images_data = []
-
-    for s in sizes:
-        img = QtGui.QImage(s, s, QtGui.QImage.Format.Format_ARGB32_Premultiplied)
-        img.fill(QtCore.Qt.GlobalColor.transparent)
-        painter = QtGui.QPainter(img)
-        renderer.render(painter)
-        painter.end()
-
-        ba = QtCore.QByteArray()
-        buf = QtCore.QBuffer(ba)
-        buf.open(QtCore.QIODevice.OpenModeFlag.WriteOnly)
-        img.save(buf, "PNG")
-        images_data.append((s, bytes(ba)))
-
-    # Assemble Windows ICO
-    header = struct.pack("<HHH", 0, 1, len(images_data))
-    offset = 6 + 16 * len(images_data)
-    entries = []
-    for s, data in images_data:
-        w = 0 if s == 256 else s
-        h = 0 if s == 256 else s
-        entries.append(struct.pack("<BBBBHHII", w, h, 0, 0, 1, 32, len(data), offset))
-        offset += len(data)
-
-    ico_path = assets_dir / "aeram.ico"
-    with open(ico_path, "wb") as f:
-        f.write(header)
-        for e in entries:
-            f.write(e)
-        for _, data in images_data:
-            f.write(data)
-
-    # Save 512x512 and 256x256 PNGs
+    # Save 512x512 PNG
     img_512 = QtGui.QImage(512, 512, QtGui.QImage.Format.Format_ARGB32_Premultiplied)
     img_512.fill(QtCore.Qt.GlobalColor.transparent)
     p = QtGui.QPainter(img_512)
@@ -146,7 +108,6 @@ def build_icon_assets():
 
     print("[OK] Successfully generated minimal achromatic 'ae' icon assets:")
     print(f"  • {assets_dir / 'aeram.svg'}")
-    print(f"  • {assets_dir / 'aeram.ico'}")
     print(f"  • {assets_dir / 'aeram.png'}")
 
 

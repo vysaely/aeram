@@ -1,5 +1,5 @@
 """
-Tests for browser helper profile registration, stale profile sweeping, and cleanup watchers.
+Tests for syncing the selected account into Mocktail's default auth cookie.
 """
 
 import os
@@ -10,14 +10,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
-from core.browser_helper import (
-    _register_temp_profile,
-    _unregister_temp_profile,
-    _cleanup_all_temp_profiles,
-    _ACTIVE_TEMP_PROFILES,
-    cleanup_stale_browser_profiles,
-    sync_mocktail_auth_cookie,
-)
+from core.browser_helper import sync_mocktail_auth_cookie
 
 
 class TestBrowserHelper(unittest.TestCase):
@@ -26,34 +19,6 @@ class TestBrowserHelper(unittest.TestCase):
 
     def tearDown(self):
         shutil.rmtree(self.test_dir, ignore_errors=True)
-
-    def test_temp_profile_registry_and_cleanup(self):
-        profile_path = os.path.join(self.test_dir, "test_profile_1")
-        os.makedirs(profile_path, exist_ok=True)
-        (Path(profile_path) / "dummy.txt").write_text("data")
-
-        _register_temp_profile(profile_path)
-        self.assertIn(profile_path, _ACTIVE_TEMP_PROFILES)
-
-        _cleanup_all_temp_profiles()
-        self.assertFalse(os.path.exists(profile_path))
-        self.assertNotIn(profile_path, _ACTIVE_TEMP_PROFILES)
-
-    def test_cleanup_stale_browser_profiles(self):
-        tmp_base = tempfile.gettempdir()
-        stale_ff = os.path.join(tmp_base, "aeram_firefox_test_stale_123")
-        stale_ch = os.path.join(tmp_base, "aeram_chrome_test_stale_456")
-
-        os.makedirs(stale_ff, exist_ok=True)
-        os.makedirs(stale_ch, exist_ok=True)
-
-        self.assertTrue(os.path.exists(stale_ff))
-        self.assertTrue(os.path.exists(stale_ch))
-
-        cleaned = cleanup_stale_browser_profiles()
-        self.assertGreaterEqual(cleaned, 2)
-        self.assertFalse(os.path.exists(stale_ff))
-        self.assertFalse(os.path.exists(stale_ch))
 
     def test_sync_mocktail_auth_cookie_atomic_permissions(self):
         # We test with a simulated target directory

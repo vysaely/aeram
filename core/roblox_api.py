@@ -12,26 +12,10 @@ import base64
 import urllib.request
 import urllib.error
 import urllib.parse
-from dataclasses import dataclass
 from typing import Optional, Dict, Any, Tuple, List, Callable
 
 
 log = logging.getLogger("RobloxAPI")
-
-
-@dataclass
-class AuthTicketResult:
-    """Detailed result of an auth ticket request including challenge diagnostics."""
-    ticket: Optional[str] = None
-    success: bool = False
-    status_code: Optional[int] = None
-    is_challenge: bool = False
-    challenge_type: Optional[str] = None       # e.g. "captcha", "2stepverification"
-    challenge_id: Optional[str] = None
-    challenge_metadata: Optional[str] = None
-    is_expired: bool = False
-    is_rate_limited: bool = False
-    error_message: str = ""
 
 
 USER_AGENT = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36"
@@ -134,10 +118,6 @@ class RobloxAPI:
         is_valid, user_data, _ = self.validate_cookie(cookie)
         return user_data if is_valid else None
 
-    def get_authenticated_user(self, cookie: str) -> Optional[Dict[str, Any]]:
-        """Validates the .ROBLOSECURITY cookie and returns authenticated user metadata."""
-        return self.validate_cookie_and_get_user(cookie)
-
     def get_avatar_headshot(self, user_id: int) -> Optional[str]:
         """Fetches the 150x150 avatar headshot thumbnail URL."""
         if not user_id:
@@ -184,14 +164,6 @@ class RobloxAPI:
             "robux_balance": robux,
         }
 
-    def get_game_details(self, place_id: int, cookie: Optional[str] = None) -> Optional[Dict[str, Any]]:
-        """Fetches public experience details and universe ID for a Place ID."""
-        url = f"https://games.roblox.com/v1/games/multiget-place-details?placeIds={place_id}"
-        data = self._get(url, cookie=cookie)
-        if data and isinstance(data, list) and len(data) > 0:
-            return data[0]
-        return None
-
     def resolve_username_to_user_id(self, username: str) -> Optional[int]:
         """Resolves a Roblox username to its 64-bit numerical user ID."""
         if not username:
@@ -231,207 +203,6 @@ class RobloxAPI:
             if res and "userPresences" in res:
                 results.extend(res["userPresences"])
         return results
-
-    def check_user_joinable(self, user_id: int, cookie: Optional[str] = None) -> Dict[str, Any]:
-        """
-        Checks whether a user is currently in-game and has joins enabled.
-        Returns dict with:
-        - in_game: bool (userPresenceType == 2)
-        - joinable: bool (gameId is present and non-empty)
-        - place_id: Optional[int]
-        - root_place_id: Optional[int]
-        - game_id: Optional[str]
-        - last_location: str
-        """
-        pres = self.get_user_presence(user_id, cookie=cookie)
-        if not pres:
-            return {"in_game": False, "joinable": False, "place_id": None, "root_place_id": None, "game_id": None, "last_location": ""}
-
-        pres_type = pres.get("userPresenceType", 0)
-        in_game = (pres_type == 2)
-        game_id = pres.get("gameId")
-        place_id = pres.get("placeId")
-        root_place_id = pres.get("rootPlaceId")
-        last_loc = pres.get("lastLocation", "")
-
-        return {
-            "in_game": in_game,
-            "joinable": bool(in_game and game_id),
-            "place_id": place_id,
-            "root_place_id": root_place_id,
-            "game_id": game_id,
-            "last_location": last_loc,
-            "presence_type": pres_type,
-        }
-
-    def get_player_token_thumbnails(
-        self,
-        player_tokens: List[str],
-        cookie: Optional[str] = None,
-        size: str = "150x150",
-    ) -> List[Dict[str, Any]]:
-        """
-        Fetches AvatarHeadShot thumbnails for playerTokens returned by public server queries.
-        Returns list of dicts with targetId, state, and imageUrl.
-        """
-        if not player_tokens:
-            return []
-
-        url = "https://thumbnails.roblox.com/v1/batch"
-        results = []
-        for i in range(0, len(player_tokens), 100):
-            chunk = player_tokens[i:i+100]
-            payload = [
-                {
-                    "requestId": f"tok_{idx}",
-                    "token": tok,
-                    "type": "AvatarHeadShot",
-                    "size": size,
-                    "format": "Png",
-                    "isCircular": False,
-                }
-                for idx, tok in enumerate(chunk)
-            ]
-            res = self._post(url, payload, cookie=cookie)
-            if res and isinstance(res, dict) and "data" in res:
-                results.extend(res["data"])
-        return results
-
-
-
-    def request_auth_ticket(self, cookie: str) -> AuthTicketResult:
-        """
-        Acquires a single-use authentication ticket from auth.roblox.com
-        for native Windows client launching.
-        Returns AuthTicketResult containing ticket or detailed challenge/expiry diagnostics.
-        """
-        if not cookie:
-            return AuthTicketResult(success=False, error_message="No session cookie provided")
-
-        url = "https://auth.roblox.com/v1/authentication-ticket"
-        headers = {
-            "User-Agent": USER_AGENT,
-            "Referer": "https://www.roblox.com/",
-            "Origin": "https://www.roblox.com/",
-            "Cookie": f".ROBLOSECURITY={cookie}",
-            "Content-Type": "application/json",
-        }
-
-        csrf_token = None
-        req = urllib.request.Request(url, data=b"{}", headers=headers, method="POST")
-        try:
-            with urllib.request.urlopen(req, timeout=self.timeout) as resp:
-                ticket = resp.headers.get("rbx-authentication-ticket")
-                if not ticket:
-                    try:
-                        data = json.loads(resp.read().decode("utf-8"))
-                        ticket = data.get("authenticationTicket")
-                    except Exception:
-                        pass
-                if ticket:
-                    return AuthTicketResult(ticket=ticket, success=True, status_code=200)
-        except urllib.error.HTTPError as e:
-            if e.code == 403 and "x-csrf-token" in e.headers:
-                csrf_token = e.headers["x-csrf-token"]
-            elif e.code == 401:
-                return AuthTicketResult(
-                    success=False,
-                    status_code=401,
-                    is_expired=True,
-                    error_message="Roblox session cookie expired or invalid (HTTP 401)",
-                )
-            elif e.code == 429:
-                return AuthTicketResult(
-                    success=False,
-                    status_code=429,
-                    is_rate_limited=True,
-                    error_message="Rate limited by Roblox auth endpoint (HTTP 429)",
-                )
-            else:
-                ch_type = e.headers.get("rblx-challenge-type")
-                ch_id = e.headers.get("rblx-challenge-id")
-                ch_meta = e.headers.get("rblx-challenge-metadata")
-                body = e.read().decode("utf-8", errors="ignore") if hasattr(e, "read") else ""
-                if ch_type or any(k in body.lower() for k in ("challenge", "captcha", "verification")):
-                    return AuthTicketResult(
-                        success=False,
-                        status_code=e.code,
-                        is_challenge=True,
-                        challenge_type=ch_type or "captcha",
-                        challenge_id=ch_id,
-                        challenge_metadata=ch_meta,
-                        error_message="Roblox security challenge triggered (Arkose CAPTCHA)",
-                    )
-                return AuthTicketResult(
-                    success=False,
-                    status_code=e.code,
-                    error_message=f"Auth ticket request failed: HTTP {e.code}",
-                )
-        except Exception as e:
-            return AuthTicketResult(
-                success=False,
-                error_message=f"Network error requesting auth ticket: {e}",
-            )
-
-        if csrf_token:
-            headers["x-csrf-token"] = csrf_token
-            req2 = urllib.request.Request(url, data=b"{}", headers=headers, method="POST")
-            try:
-                with urllib.request.urlopen(req2, timeout=self.timeout) as resp:
-                    ticket = resp.headers.get("rbx-authentication-ticket")
-                    if not ticket:
-                        try:
-                            data = json.loads(resp.read().decode("utf-8"))
-                            ticket = data.get("authenticationTicket")
-                        except Exception:
-                            pass
-                    if ticket:
-                        return AuthTicketResult(ticket=ticket, success=True, status_code=200)
-            except urllib.error.HTTPError as e:
-                ch_type = e.headers.get("rblx-challenge-type")
-                ch_id = e.headers.get("rblx-challenge-id")
-                ch_meta = e.headers.get("rblx-challenge-metadata")
-                body = e.read().decode("utf-8", errors="ignore") if hasattr(e, "read") else ""
-
-                if e.code == 401:
-                    return AuthTicketResult(
-                        success=False,
-                        status_code=401,
-                        is_expired=True,
-                        error_message="Roblox session cookie expired or invalid (HTTP 401)",
-                    )
-                if e.code == 429:
-                    return AuthTicketResult(
-                        success=False,
-                        status_code=429,
-                        is_rate_limited=True,
-                        error_message="Rate limited by Roblox auth endpoint (HTTP 429)",
-                    )
-                if ch_type or any(k in body.lower() for k in ("challenge", "captcha", "verification")):
-                    return AuthTicketResult(
-                        success=False,
-                        status_code=e.code,
-                        is_challenge=True,
-                        challenge_type=ch_type or "captcha",
-                        challenge_id=ch_id,
-                        challenge_metadata=ch_meta,
-                        error_message=f"Roblox verification required ({ch_type or 'Arkose CAPTCHA'})",
-                    )
-                return AuthTicketResult(
-                    success=False,
-                    status_code=e.code,
-                    error_message=f"Auth ticket CSRF retry failed: HTTP {e.code}",
-                )
-            except Exception as e:
-                return AuthTicketResult(
-                    success=False,
-                    error_message=f"Auth ticket CSRF retry failed: {e}",
-                )
-
-        return AuthTicketResult(
-            success=False,
-            error_message="No auth ticket received from server",
-        )
 
     def get_csrf_token(self, cookie: str) -> Optional[str]:
         """
@@ -1071,63 +842,6 @@ class RobloxAPI:
                         return val
         return None
 
-    def get_auth_ticket(self, cookie: str) -> Optional[str]:
-        """
-        Acquires a single-use authentication ticket from auth.roblox.com
-        for native Windows client launching, with automatic x-csrf-token handling.
-        Returns ticket string if successful, None otherwise.
-        """
-        res = self.request_auth_ticket(cookie)
-        return res.ticket if res.success else None
-
-    def check_game_join_challenge(self, cookie: str, place_id: int = 3016661674, game_instance_id: Optional[str] = None) -> Dict[str, Any]:
-        """
-        Probes Roblox gamejoin to verify if the session is currently flagged with
-        a security challenge (Arkose CAPTCHA, 2FA, or bot-mitigation).
-        """
-        if not cookie:
-            return {"challenged": False, "status_code": 0, "error": "No session cookie"}
-
-        endpoint = "join-game-instance" if game_instance_id else "join-game"
-        url = f"https://gamejoin.roblox.com/v1/{endpoint}"
-        payload: Dict[str, Any] = {"placeId": place_id, "isTeleport": False}
-        if game_instance_id:
-            payload["gameInstanceId"] = game_instance_id
-
-        data = json.dumps(payload).encode("utf-8")
-        req = urllib.request.Request(
-            url,
-            data=data,
-            headers={
-                "Cookie": f".ROBLOSECURITY={cookie}",
-                "Content-Type": "application/json",
-                "User-Agent": "Roblox/Linux",
-                "Origin": "https://www.roblox.com",
-                "Referer": "https://www.roblox.com/",
-            },
-            method="POST",
-        )
-        try:
-            with urllib.request.urlopen(req, timeout=self.timeout) as resp:
-                return {"challenged": False, "status_code": resp.status}
-        except urllib.error.HTTPError as e:
-            if e.code == 403:
-                ch_type = e.headers.get("rblx-challenge-type")
-                ch_id = e.headers.get("rblx-challenge-id")
-                ch_meta = e.headers.get("rblx-challenge-metadata")
-                body = e.read().decode("utf-8", errors="ignore") if hasattr(e, "read") else ""
-                if ch_type or "challenge" in body.lower():
-                    return {
-                        "challenged": True,
-                        "status_code": 403,
-                        "challenge_type": ch_type or "captcha",
-                        "challenge_id": ch_id,
-                        "challenge_metadata": ch_meta,
-                    }
-            return {"challenged": False, "status_code": e.code}
-        except Exception as e:
-            return {"challenged": False, "error": str(e)}
-
     def get_place_details(self, place_id: int, cookie: Optional[str] = None) -> Optional[Dict[str, Any]]:
         """Fetches place and universe details from games.roblox.com/v1/games/multiget-place-details."""
         url = f"https://games.roblox.com/v1/games/multiget-place-details?placeIds={place_id}"
@@ -1505,39 +1219,6 @@ class RobloxAPI:
         except Exception:
             return False, csrf_token
 
-    def get_join_privacy(self, cookie: str) -> str:
-        """
-        Fetches the current game join privacy setting for the account.
-        Returns 'NoOne', 'Friends', 'AllUsers', or 'Unknown'.
-        """
-        if not cookie:
-            return "Unknown"
-        clean_cookie = cookie.strip()
-        if clean_cookie.startswith(".ROBLOSECURITY="):
-            clean_cookie = clean_cookie[len(".ROBLOSECURITY="):]
-
-        url = "https://apis.roblox.com/user-settings-api/v1/user-settings"
-        headers = {
-            "User-Agent": USER_AGENT,
-            "Accept": "application/json",
-            "Cookie": f".ROBLOSECURITY={clean_cookie}",
-        }
-        req = urllib.request.Request(url, headers=headers, method="GET")
-        try:
-            with urllib.request.urlopen(req, timeout=self.timeout) as resp:
-                data = json.loads(resp.read().decode("utf-8"))
-                return data.get("whoCanJoinMeInExperiences", data.get("gameJoinPrivacy", "Unknown"))
-        except Exception:
-            # Fallback to accountsettings
-            try:
-                url_fb = "https://accountsettings.roblox.com/v1/privacy/settings"
-                req_fb = urllib.request.Request(url_fb, headers=headers, method="GET")
-                with urllib.request.urlopen(req_fb, timeout=self.timeout) as resp_fb:
-                    data_fb = json.loads(resp_fb.read().decode("utf-8"))
-                    return data_fb.get("whoCanJoinMeInExperiences", data_fb.get("gameJoinPrivacy", "Unknown"))
-            except Exception:
-                return "Unknown"
-
     def set_join_privacy(self, setting: str, cookie: str) -> Tuple[bool, str]:
         """
         Sets the game join privacy setting ('NoOne', 'Friends', 'AllUsers', etc.)
@@ -1646,56 +1327,6 @@ class RobloxAPI:
             return True, msg
 
         return False, msg
-
-    def get_currency_summary(self, user_id: int, cookie: str) -> Dict[str, int]:
-        """
-        Retrieves current Robux balance and pending Robux summary.
-        Returns dict: {'robux': int, 'pending_robux': int}
-        """
-        result = {"robux": 0, "pending_robux": 0, "success": True}
-        if not user_id or not cookie:
-            return result
-
-        clean_cookie = cookie.strip()
-        if clean_cookie.startswith(".ROBLOSECURITY="):
-            clean_cookie = clean_cookie[len(".ROBLOSECURITY="):]
-
-        headers = {
-            "User-Agent": USER_AGENT,
-            "Accept": "application/json",
-            "Cookie": f".ROBLOSECURITY={clean_cookie}",
-            "Referer": "https://www.roblox.com/transactions",
-        }
-
-        # 1. Fetch current Robux
-        try:
-            cur_url = f"https://economy.roblox.com/v1/users/{user_id}/currency"
-            cur_req = urllib.request.Request(cur_url, headers=headers, method="GET")
-            with urllib.request.urlopen(cur_req, timeout=self.timeout) as resp:
-                data = json.loads(resp.read().decode("utf-8"))
-                result["robux"] = int(data.get("robux", 0))
-        except Exception as e:
-            log.warning(f"Failed to fetch currency for user {user_id}: {e}")
-
-        # 2. Fetch pending Robux from summary or transaction-totals
-        try:
-            sum_url = f"https://economy.roblox.com/v1/users/{user_id}/transaction-totals?timeFrame=Year&transactionType=summary"
-            sum_req = urllib.request.Request(sum_url, headers=headers, method="GET")
-            with urllib.request.urlopen(sum_req, timeout=self.timeout) as resp:
-                data = json.loads(resp.read().decode("utf-8"))
-                result["pending_robux"] = int(data.get("pendingRobuxTotal", 0))
-        except Exception:
-            try:
-                # Fallback summary endpoint
-                sum_url_fb = f"https://economy.roblox.com/v1/users/{user_id}/summary"
-                sum_req_fb = urllib.request.Request(sum_url_fb, headers=headers, method="GET")
-                with urllib.request.urlopen(sum_req_fb, timeout=self.timeout) as resp_fb:
-                    data_fb = json.loads(resp_fb.read().decode("utf-8"))
-                    result["pending_robux"] = int(data_fb.get("pendingRobuxTotal", data_fb.get("pendingRobux", 0)))
-            except Exception:
-                pass
-
-        return result
 
     def login_with_credentials(
         self,

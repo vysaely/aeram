@@ -12,7 +12,7 @@ import logging
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
-from typing import List, Dict, Any, Optional
+from typing import List, Optional
 
 from core.mocktail_manager import MocktailManager
 from core.compositor import detect_compositor_type, get_compositor, CompositorType
@@ -28,17 +28,6 @@ class DiagnosticCheck:
     message: str
     details: Optional[str] = None
     fix_suggestion: Optional[str] = None
-
-    def to_dict(self) -> Dict[str, Any]:
-        return {
-            "name": self.name,
-            "category": self.category,
-            "status": self.status,
-            "message": self.message,
-            "details": self.details,
-            "fix_suggestion": self.fix_suggestion,
-        }
-
 
 @dataclass
 class DiagnosticReport:
@@ -460,8 +449,8 @@ class DiagnosticsRunner:
         # 2. Ensure runtime directories exist
         # Use the directory the app will actually open; hardcoding aeram/ here used to create an
         # empty directory that then took precedence over an existing ram-linux vault.
-        from core.platform import get_platform
-        app_data = get_platform().get_default_base_dir()
+        from core.paths import default_base_dir
+        app_data = default_base_dir()
         config_dir = Path.home() / ".config" / "aeram"
         try:
             app_data.mkdir(parents=True, exist_ok=True)

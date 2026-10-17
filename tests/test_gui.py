@@ -19,7 +19,7 @@ from ui.main_window import MainWindow
 QtCore.QCoreApplication.setAttribute(QtCore.Qt.ApplicationAttribute.AA_ShareOpenGLContexts, True)
 _app = QtWidgets.QApplication.instance()
 if _app is None:
-    _app = QtWidgets.QApplication(["ram-linux-test", "-platform", "offscreen"])
+    _app = QtWidgets.QApplication(["aeram-test", "-platform", "offscreen"])
 
 
 class TestGUI(unittest.TestCase):
@@ -152,11 +152,6 @@ class TestGUI(unittest.TestCase):
         self.assertTrue(window.group_combo.itemText(1).startswith("G2"))
         self.assertTrue(window.group_combo.itemText(2).startswith("G1"))
 
-        # Test sort table by group order
-        window._sort_table_by_group_order()
-        # Group G2 has UserBeta, Group G1 has UserGamma and UserAlpha
-        self.assertEqual(window.table.item(0, 0).text(), "UserBeta")
-
         # Test clicking Group header (column 2) directly toggles ascending / descending
         window._on_header_section_clicked(2)  # Ascending: G2 first (priority 0) -> UserBeta first
         self.assertEqual(window.table.item(0, 0).text(), "UserBeta")
@@ -281,7 +276,7 @@ class TestGUI(unittest.TestCase):
         self.assertEqual(state2, AccountAuthState.SESSION_EXPIRED)
 
         # Test killing account unregisters from self_heal_engine
-        window.self_heal_engine.register_account("acc_val_1")
+        window.self_heal_engine.monitored_account_ids.add("acc_val_1")
         self.assertIn("acc_val_1", window.self_heal_engine.monitored_account_ids)
         window.table.selectAll()
         window._kill_selected()
@@ -577,8 +572,6 @@ class TestGUI(unittest.TestCase):
         from ui.dialogs import (
             AddAccountDialog,
             ImportRAMDialog,
-            JoinGameDialog,
-            MultiLaunchDialog,
             EditAccountDialog,
             SettingsDialog,
             DiagnosticsDialog,
@@ -591,8 +584,6 @@ class TestGUI(unittest.TestCase):
         dialog_classes = [
             AddAccountDialog,
             ImportRAMDialog,
-            JoinGameDialog,
-            MultiLaunchDialog,
             EditAccountDialog,
             SettingsDialog,
             DiagnosticsDialog,
@@ -846,11 +837,6 @@ class TestGUI(unittest.TestCase):
             self.assertEqual(self.storage.get_account("acc_custom_1").display_name, "VysMain")
             self.assertEqual(self.storage.get_account("acc_custom_2").display_name, "VysAltFarmer")
 
-            # 6. Test clearing alias
-            window._select_account(window_acc1)
-            window._clear_alias_for_current()
-            self.assertEqual(self.storage.get_account("acc_custom_1").display_name, "")
-            self.assertEqual(window.alias_input.text(), "")
         finally:
             window.close()
 

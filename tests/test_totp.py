@@ -176,7 +176,7 @@ class TestTOTPStorageAndGUI(unittest.TestCase):
             dlg.close()
 
     def test_two_factor_import_dialog_multi_png_accumulation(self):
-        """Verify TwoFactorImportDialog accumulates multiple QR screenshots without losing matches."""
+        """Verify GoogleAuthImportDialog accumulates multiple QR screenshots without losing matches."""
         from PyQt6 import QtWidgets
         app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
 

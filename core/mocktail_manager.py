@@ -353,22 +353,6 @@ class MocktailManager:
         """Determines if a functional Vulkan driver is available."""
         return shutil.which("vulkaninfo") is not None or Path("/usr/share/vulkan/icd.d").exists()
 
-    def backup_config(self) -> Optional[Path]:
-        """Creates a timestamped backup of ~/.config/mocktail/config.yaml."""
-        config_dir = self._resolve_config_dir()
-        config_file = config_dir / "config.yaml"
-        if not config_file.exists():
-            return None
-        import time
-        backup_file = config_dir / f"config.yaml.bak_{int(time.time())}"
-        try:
-            shutil.copy2(config_file, backup_file)
-            log.info(f"Created config backup at {backup_file}")
-            return backup_file
-        except Exception as e:
-            log.error(f"Failed to create config backup: {e}")
-            return None
-
     @staticmethod
     def sandboxed_install_present() -> bool:
         """True when Mocktail is installed only in a form AERAM cannot multi-instance (Flatpak)."""

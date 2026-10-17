@@ -1,5 +1,5 @@
 """
-Command-line interface (CLI) for Linux Roblox Account Manager.
+Command-line interface (CLI) for AERAM.
 Uses the identical underlying core logic as the GUI. Never exposes or logs secrets.
 """
 
@@ -35,8 +35,6 @@ def install_desktop_launcher(project_root: Path):
 
     # 1. Install Icons (Scalable SVG + 512x512 PNG)
     src_svg = project_root / "assets" / "aeram.svg"
-    if not src_svg.exists():
-        src_svg = project_root / "assets" / "roblox-account-manager.svg"
     if src_svg.exists():
         shutil.copy2(src_svg, icons_dir / "aeram.svg")
         print(f"[OK] Installed scalable icon: {icons_dir / 'aeram.svg'}")
@@ -48,7 +46,7 @@ def install_desktop_launcher(project_root: Path):
 
     # 2. Install executable links to ~/.local/bin
     executable_src = project_root / "aeram"
-    for name in ("aeram", "aem", "ram-linux"):
+    for name in ("aeram", "aem"):
         symlink_dest = bin_dir / name
         try:
             if symlink_dest.exists() or symlink_dest.is_symlink():
@@ -93,8 +91,8 @@ Exec={exec_path} --diagnostics
     print(f"[OK] Installed desktop entry: {desktop_file}")
 
     # Remove legacy desktop entries if present
-    for old_file in (apps_dir / "ram-linux.desktop", apps_dir / "roblox-account-manager.desktop"):
-        if old_file.exists():
+    for old_file in (apps_dir / "ram-linux.desktop", apps_dir / "roblox-account-manager.desktop", bin_dir / "ram-linux"):
+        if old_file.exists() or old_file.is_symlink():
             try:
                 old_file.unlink()
             except Exception:

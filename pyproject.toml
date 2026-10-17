@@ -10,7 +10,7 @@ readme = "README.md"
 requires-python = ">=3.10"
 license = { text = "GPL-3.0-or-later" }
 authors = [
-    { name = "RAM-Linux Contributors" }
+    { name = "AERAM Contributors" }
 ]
 keywords = ["roblox", "account-manager", "ram", "linux", "multi-instance"]
 classifiers = [
@@ -38,7 +38,6 @@ dev = [
 
 [project.scripts]
 aeram = "core.entrypoint:main"
-ram-linux = "core.entrypoint:main"
 
 [tool.setuptools.packages.find]
 where = ["."]

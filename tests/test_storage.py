@@ -16,7 +16,7 @@ from core.storage import StorageManager, clean_cookie
 class TestStorageManager(unittest.TestCase):
     def setUp(self):
         self.tmp_dir = tempfile.TemporaryDirectory()
-        self.base_dir = Path(self.tmp_dir.name) / "ram-linux"
+        self.base_dir = Path(self.tmp_dir.name) / "aeram"
         self.mocktail_data = Path(self.tmp_dir.name) / "mocktail_data"
         self.mocktail_bin = Path(self.tmp_dir.name) / "mocktail_bin"
 

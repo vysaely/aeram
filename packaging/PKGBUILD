@@ -49,11 +49,7 @@ package() {
     install -Dm755 native/libmocktail_mouse_helper.so "$pkgdir/usr/lib/aeram/libmocktail_mouse_helper.so"
 
     # Install application icons (scalable vector and 512x512 raster)
-    if [ -f assets/aeram.svg ]; then
-        install -Dm644 assets/aeram.svg "$pkgdir/usr/share/icons/hicolor/scalable/apps/aeram.svg"
-    else
-        install -Dm644 assets/roblox-account-manager.svg "$pkgdir/usr/share/icons/hicolor/scalable/apps/aeram.svg"
-    fi
+    install -Dm644 assets/aeram.svg "$pkgdir/usr/share/icons/hicolor/scalable/apps/aeram.svg"
     if [ -f assets/aeram.png ]; then
         install -Dm644 assets/aeram.png "$pkgdir/usr/share/icons/hicolor/512x512/apps/aeram.png"
     fi

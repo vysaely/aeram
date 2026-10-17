@@ -207,12 +207,12 @@ fi
 
 # 5. Install CLI launchers and Desktop Entry
 echo "[5/5] Installing desktop integration..."
-chmod +x "${SCRIPT_DIR}/aeram" "${SCRIPT_DIR}/ram-linux"
+chmod +x "${SCRIPT_DIR}/aeram"
 
 mkdir -p "${BIN_DIR}"
 ln -sf "${SCRIPT_DIR}/aeram" "${BIN_DIR}/aeram"
 ln -sf "${SCRIPT_DIR}/aeram" "${BIN_DIR}/aem"
-ln -sf "${SCRIPT_DIR}/aeram" "${BIN_DIR}/ram-linux"
+rm -f "${BIN_DIR}/ram-linux"  # pre-rename alias
 echo "  * Symlinked ${BIN_DIR}/aeram -> ${SCRIPT_DIR}/aeram"
 
 mkdir -p "${DESKTOP_DIR}"
@@ -222,8 +222,6 @@ mkdir -p "${ICON_512_DIR}"
 # Install Scalable Vector Icon
 if [ -f "${SCRIPT_DIR}/assets/aeram.svg" ]; then
     cp "${SCRIPT_DIR}/assets/aeram.svg" "${ICON_DIR}/aeram.svg"
-elif [ -f "${SCRIPT_DIR}/assets/roblox-account-manager.svg" ]; then
-    cp "${SCRIPT_DIR}/assets/roblox-account-manager.svg" "${ICON_DIR}/aeram.svg"
 fi
 
 # Install High-Resolution 512x512 Raster Icon

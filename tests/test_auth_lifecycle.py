@@ -17,7 +17,7 @@ from pathlib import Path
 
 from core.models import RobloxAccount
 from core.auth_state import AccountAuthState, AccountAuthStateManager, AuthStateInfo
-from core.roblox_api import RobloxAPI, AuthTicketResult
+from core.roblox_api import RobloxAPI
 from core.storage import StorageManager
 from core.instance_runner import InstanceRunner
 
@@ -106,100 +106,6 @@ class TestAuthStateManager(unittest.TestCase):
         mgr.release_launch_lock(aid)
 
 
-class TestRobloxAPIAuthTickets(unittest.TestCase):
-    """Tests for RobloxAPI auth ticket request handling and challenge detection."""
-
-    def test_request_auth_ticket_empty_cookie(self):
-        api = RobloxAPI()
-        res = api.request_auth_ticket("")
-        self.assertFalse(res.success)
-        self.assertIn("No session cookie", res.error_message)
-
-    def test_request_auth_ticket_success_with_header(self):
-        api = RobloxAPI()
-        mock_resp = MagicMock()
-        mock_enter = MagicMock()
-        mock_enter.headers.get.side_effect = lambda k: "ticket_xyz123" if k == "rbx-authentication-ticket" else None
-        mock_enter.read.return_value = b"{}"
-        mock_resp.__enter__.return_value = mock_enter
-
-        err_403 = urllib.error.HTTPError(
-            url="https://auth.roblox.com/v1/authentication-ticket",
-            code=403,
-            msg="Forbidden",
-            hdrs={"x-csrf-token": "csrf_token_abc"},
-            fp=io.BytesIO(b'{"errors":[{"code":0,"message":"Token Validation Failed"}]}'),
-        )
-
-        with patch("urllib.request.urlopen", side_effect=[err_403, mock_resp]):
-            res = api.request_auth_ticket("cookie_val")
-            self.assertTrue(res.success)
-            self.assertEqual(res.ticket, "ticket_xyz123")
-            self.assertEqual(res.status_code, 200)
-
-    def test_request_auth_ticket_challenge_detected(self):
-        api = RobloxAPI()
-        err_403_csrf = urllib.error.HTTPError(
-            url="https://auth.roblox.com/v1/authentication-ticket",
-            code=403,
-            msg="Forbidden",
-            hdrs={"x-csrf-token": "csrf_token_abc"},
-            fp=io.BytesIO(b'{"errors":[{"code":0,"message":"Token Validation Failed"}]}'),
-        )
-
-        err_403_challenge = urllib.error.HTTPError(
-            url="https://auth.roblox.com/v1/authentication-ticket",
-            code=403,
-            msg="Forbidden",
-            hdrs={
-                "rblx-challenge-type": "captcha",
-                "rblx-challenge-id": "challenge_uuid_999",
-                "rblx-challenge-metadata": "eyJkYXRhIjoiYXJrb3NlIn0=",
-            },
-            fp=io.BytesIO(b'{"errors":[{"code":0,"message":"Challenge is required to authorize the request"}]}'),
-        )
-
-        with patch("urllib.request.urlopen", side_effect=[err_403_csrf, err_403_challenge]):
-            res = api.request_auth_ticket("cookie_val")
-            self.assertFalse(res.success)
-            self.assertTrue(res.is_challenge)
-            self.assertEqual(res.challenge_type, "captcha")
-            self.assertEqual(res.challenge_id, "challenge_uuid_999")
-            self.assertEqual(res.challenge_metadata, "eyJkYXRhIjoiYXJrb3NlIn0=")
-
-    def test_request_auth_ticket_expired_cookie(self):
-        api = RobloxAPI()
-        err_401 = urllib.error.HTTPError(
-            url="https://auth.roblox.com/v1/authentication-ticket",
-            code=401,
-            msg="Unauthorized",
-            hdrs={},
-            fp=io.BytesIO(b'{"errors":[{"code":0,"message":"Unauthorized"}]}'),
-        )
-
-        with patch("urllib.request.urlopen", side_effect=err_401):
-            res = api.request_auth_ticket("expired_cookie")
-            self.assertFalse(res.success)
-            self.assertTrue(res.is_expired)
-            self.assertEqual(res.status_code, 401)
-
-    def test_request_auth_ticket_rate_limited(self):
-        api = RobloxAPI()
-        err_429 = urllib.error.HTTPError(
-            url="https://auth.roblox.com/v1/authentication-ticket",
-            code=429,
-            msg="Too Many Requests",
-            hdrs={},
-            fp=io.BytesIO(b'{"errors":[{"code":0,"message":"Too Many Requests"}]}'),
-        )
-
-        with patch("urllib.request.urlopen", side_effect=err_429):
-            res = api.request_auth_ticket("cookie_val")
-            self.assertFalse(res.success)
-            self.assertTrue(res.is_rate_limited)
-            self.assertEqual(res.status_code, 429)
-
-
 class TestInstanceRunnerLifecycleIntegration(unittest.TestCase):
     """Integration tests verifying InstanceRunner lifecycle safety."""
 
@@ -223,14 +129,6 @@ class TestInstanceRunnerLifecycleIntegration(unittest.TestCase):
         storage.save_account(self.sample_account)
 
         api = MagicMock()
-        api.request_auth_ticket.return_value = AuthTicketResult(
-            success=False,
-            is_challenge=True,
-            challenge_type="captcha",
-            challenge_id="ch-id-123",
-            challenge_metadata="blob",
-            error_message="Roblox verification required (Arkose CAPTCHA)",
-        )
 
         runner = InstanceRunner(storage, api=api)
 
@@ -248,13 +146,11 @@ class TestInstanceRunnerLifecycleIntegration(unittest.TestCase):
         self.assertIn("verification required", str(ctx.exception).lower())
         self.assertEqual(runner.auth_state_manager.get_state(self.sample_account.account_id), AccountAuthState.VERIFICATION_REQUIRED)
 
-        # Second launch attempt must be rejected immediately without calling api.request_auth_ticket
-        api.request_auth_ticket.reset_mock()
+        # Second launch attempt must be rejected immediately
         with self.assertRaises(RuntimeError) as ctx2:
             runner.launch_instance(self.sample_account)
 
         self.assertIn("verification required", str(ctx2.exception).lower())
-        api.request_auth_ticket.assert_not_called()
 
         # Stored cookie must NOT be deleted or modified
         saved_acc = storage.get_account(self.sample_account.account_id)
@@ -280,45 +176,6 @@ class TestInstanceRunnerLifecycleIntegration(unittest.TestCase):
         self.assertEqual(len(launched), 0)
         self.assertEqual(len(progress_calls), 1)
         self.assertIn("Skipped", progress_calls[0][1])
-        api.request_auth_ticket.assert_not_called()
-
-    def test_check_game_join_challenge_detected(self):
-        api = RobloxAPI()
-        headers = {
-            "rblx-challenge-type": "captcha",
-            "rblx-challenge-id": "us-central-test-uuid",
-            "rblx-challenge-metadata": "eyJ0ZXN0IjoxfQ==",
-        }
-        http_error = urllib.error.HTTPError(
-            url="https://gamejoin.roblox.com/v1/join-game",
-            code=403,
-            msg="Forbidden",
-            hdrs=headers,
-            fp=io.BytesIO(b'{"errors":[{"code":0,"message":"Challenge is required"}]}'),
-        )
-        with patch("urllib.request.urlopen", side_effect=http_error):
-            res = api.check_game_join_challenge("mock_cookie", place_id=3016661674)
-            self.assertTrue(res.get("challenged"))
-            self.assertEqual(res.get("challenge_type"), "captcha")
-            self.assertEqual(res.get("challenge_id"), "us-central-test-uuid")
-
-    def test_resolve_active_server_id(self):
-        storage = StorageManager(base_dir=self.base_dir)
-        runner = InstanceRunner(storage)
-        mock_resp_data = json.dumps({
-            "data": [
-                {"id": "full-srv-1", "playing": 10, "maxPlayers": 10},
-                {"id": "good-srv-2", "playing": 4, "maxPlayers": 10},
-            ]
-        }).encode("utf-8")
-
-        mock_resp = MagicMock()
-        mock_resp.read.return_value = mock_resp_data
-        mock_resp.__enter__.return_value = mock_resp
-
-        with patch("urllib.request.urlopen", return_value=mock_resp):
-            resolved = runner.resolve_active_server_id(3016661674)
-            self.assertEqual(resolved, "good-srv-2")
 
     def test_sign_out_of_all_sessions_no_challenge(self):
         """Verify standard logout from all sessions returns the freshly rotated session cookie."""
@@ -535,20 +392,10 @@ class TestInstanceRunnerLifecycleIntegration(unittest.TestCase):
             self.assertTrue(ok)
 
     def test_join_privacy_api(self):
-        """Test get_join_privacy and set_join_privacy endpoints."""
+        """Test the set_join_privacy endpoint."""
         api = RobloxAPI()
         with patch.object(api, "get_csrf_token", return_value="test_csrf_token"), \
              patch("urllib.request.urlopen") as mock_url:
-            # Get join privacy
-            mock_resp = MagicMock()
-            mock_resp.status = 200
-            mock_resp.read.return_value = b'{"gameJoinPrivacy": "Friends"}'
-            mock_url.return_value.__enter__.return_value = mock_resp
-
-            setting = api.get_join_privacy("fake_cookie")
-            self.assertEqual(setting, "Friends")
-
-            # Set join privacy
             mock_resp_set = MagicMock()
             mock_resp_set.status = 200
             mock_resp_set.read.return_value = b'{"gameJoinPrivacy": "NoOne"}'
@@ -556,28 +403,6 @@ class TestInstanceRunnerLifecycleIntegration(unittest.TestCase):
 
             ok, err = api.set_join_privacy("NoOne", "fake_cookie")
             self.assertTrue(ok)
-
-    def test_currency_summary_api(self):
-        """Test get_currency_summary fetching robux and pending robux."""
-        api = RobloxAPI()
-        # Mock Robux balance call and transaction totals call
-        def mock_urlopen_side_effect(req, *args, **kwargs):
-            url = req.full_url if hasattr(req, "full_url") else str(req)
-            mock_resp = MagicMock()
-            if "currency" in url:
-                mock_resp.read.return_value = b'{"robux": 1500}'
-            elif "transaction-totals" in url:
-                mock_resp.read.return_value = b'{"pendingRobuxTotal": 350}'
-            else:
-                mock_resp.read.return_value = b'{}'
-            mock_resp.__enter__.return_value = mock_resp
-            return mock_resp
-
-        with patch("urllib.request.urlopen", side_effect=mock_urlopen_side_effect):
-            res = api.get_currency_summary(user_id=12345, cookie="fake_cookie")
-            self.assertTrue(res.get("success"))
-            self.assertEqual(res.get("robux"), 1500)
-            self.assertEqual(res.get("pending_robux"), 350)
 
     def test_storage_currency_and_privacy_updates(self):
         """Test SQLite persistence for pending_robux and join_privacy."""
@@ -607,15 +432,6 @@ class TestInstanceRunnerLifecycleIntegration(unittest.TestCase):
             self.assertEqual(loaded.robux_balance, 500)
             self.assertEqual(loaded.pending_robux, 50)
             self.assertEqual(loaded.join_privacy, "Friends")
-
-            # Update currency
-            storage.update_currency("acc_curr_test", 1200, 300)
-            storage.update_join_privacy("acc_curr_test", "NoOne")
-
-            updated = storage.get_account("acc_curr_test")
-            self.assertEqual(updated.robux_balance, 1200)
-            self.assertEqual(updated.pending_robux, 300)
-            self.assertEqual(updated.join_privacy, "NoOne")
 
     def test_login_with_credentials_direct_success(self):
         """Test login_with_credentials direct success when cookie is received."""
@@ -788,36 +604,6 @@ class TestInstanceRunnerLifecycleIntegration(unittest.TestCase):
         self.assertEqual(finished_events[0], ("UserOne", True, "Success"))
         self.assertEqual(finished_events[1], ("UserTwo", False, "Verification required (Click 'Verify Selected in Browser')"))
         self.assertEqual(finished_events[2], ("UserThree", False, "Missing password in vault"))
-
-
-class TestCookieSyncBridge(unittest.TestCase):
-    """Tests for thread-safe CookieSyncBridge communication."""
-
-    def test_cookie_sync_bridge_dispatch(self):
-        from PyQt6 import QtWidgets, QtCore
-        from ui.cookie_bridge import CookieSyncBridge
-        import threading
-
-        app = QtWidgets.QApplication.instance()
-        if not app:
-            app = QtWidgets.QApplication([])
-
-        received = []
-
-        def on_cookie(c: str):
-            received.append(c)
-
-        bridge = CookieSyncBridge(on_cookie)
-
-        # Emit from a background thread
-        t = threading.Thread(target=lambda: bridge.emit_cookie("TEST_COOKIE_VAL_123"))
-        t.start()
-        t.join()
-
-        # Process Qt event loop
-        app.processEvents()
-
-        self.assertEqual(received, ["TEST_COOKIE_VAL_123"])
 
 
 if __name__ == "__main__":

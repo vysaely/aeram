@@ -1,5 +1,5 @@
 """
-Linux-Native Roblox Account Manager Core Subsystems.
+AERAM core subsystems.
 """
 from .models import RobloxAccount, RunningInstance, FavoriteGame
 from .vault import Vault, VaultError, WrongPasswordError
