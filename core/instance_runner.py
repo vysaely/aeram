@@ -568,6 +568,17 @@ class InstanceRunner:
                     "DFIntCanHideGuiGroupId": 32380007
                 }
 
+        if graphics_backend == "direct-vulkan":
+            # Clean slate on Vulkan: the quality/lighting overrides above were tuned for the OpenGL
+            # path, and with them the Vulkan renderer showed near-black scenes. Quality follows
+            # Roblox's own in-game graphics slider instead.
+            fflags_dict = {
+                "FFlagDebugGraphicsPreferVulkan": True,
+                "DFIntCanHideGuiGroupId": 32380007,
+                "FFlagDebugDisableCrashReporting": True,
+                "FStringRobloxAnalyticsURL": "",
+            }
+
         challenge_flags = {
             "FFlagEnableExperienceGenericChallengeRenderingOnLoadingScript": True,
             "FFlagEnableExperienceGenericChallengeRenderingConnection": True,
