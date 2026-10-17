@@ -724,10 +724,15 @@ class FastFlagsDialog(BorderlessDialog):
         grid.addWidget(QtWidgets.QLabel("Shadows & Lighting:"), 2, 0)
         self.combo_shadows = QtWidgets.QComboBox()
         self.combo_shadows.addItems([
-            "Disabled (Maximum FPS / No Shadows)",
-            "Simple (Low Shadow Overhead)",
-            "Full (Voxel / Volumetric Shadows)",
+            "Disabled (No Shadows, Frozen Lighting)",
+            "Simple (Frozen Lighting)",
+            "Full (Live Lighting & Shadows)",
         ])
+        self.combo_shadows.setToolTip(
+            "Disabled and Simple pause Roblox's voxel lighting (DFFlagDebugPauseVoxelizer) for more FPS, "
+            "so torches, lamps and spells stop lighting their surroundings and dark areas can turn pitch black. "
+            "Use Full for dark games."
+        )
         self.combo_shadows.setFixedWidth(240)
         self.combo_shadows.setFixedHeight(26)
         self.combo_shadows.currentIndexChanged.connect(self._on_control_changed)
@@ -740,6 +745,9 @@ class FastFlagsDialog(BorderlessDialog):
             "Disabled (Sharp / Maximum Clarity)",
             "Enabled",
         ])
+        self.combo_postfx.setToolTip(
+            "Disabling removes bloom and the color correction many games use to brighten dark scenes."
+        )
         self.combo_postfx.setFixedWidth(240)
         self.combo_postfx.setFixedHeight(26)
         self.combo_postfx.currentIndexChanged.connect(self._on_control_changed)
