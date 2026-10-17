@@ -21,8 +21,8 @@ from core.roblox_api import RobloxAPI
 from core.instance_runner import InstanceRunner
 from core.auth_state import AccountAuthState
 from ui.dialogs import (
-    AddAccountDialog, ImportRAMDialog, MultiLaunchDialog, EditAccountDialog,
-    SettingsDialog, GroupManagerDialog, WebLoginDialog, FastFlagsDialog, BatchSignOutDialog, GoogleAuthImportDialog,
+    AddAccountDialog, ImportRAMDialog, EditAccountDialog,
+    SettingsDialog, GroupManagerDialog, WebLoginDialog, BatchSignOutDialog, GoogleAuthImportDialog,
     DiagnosticsDialog, UpdateDialog, BatchLogoutDialog, BatchFriendsDialog, BatchPrivacyDialog,
     Live2FAHubDialog, BatchAutoLoginDialog
 )
@@ -1622,26 +1622,6 @@ class MainWindow(QtWidgets.QMainWindow):
         self._load_accounts()
         self.statusBar().showMessage(f"Replicated username to alias for {len(targets)} account(s)", 4000)
 
-    def _clear_alias_for_current(self):
-        if not self.current_account:
-            return
-        self.alias_input.clear()
-        self.current_account.display_name = ""
-        self.storage.update_alias(self.current_account.account_id, "")
-        self._load_accounts()
-        self.statusBar().showMessage(f"Cleared alias for @{self.current_account.username}", 3000)
-
-    def _prompt_custom_alias(self):
-        if not self.current_account:
-            return
-        curr = self.current_account.display_name or ""
-        new_val, ok = BorderlessInputDialog.getText(
-            self, "Set Custom Alias", f"Enter custom alias for @{self.current_account.username}:",
-            text=curr
-        )
-        if ok:
-            self._apply_replicate_alias(new_val.strip())
-
     def _set_description_clicked(self):
         if not self.current_account:
             return
@@ -2015,25 +1995,6 @@ class MainWindow(QtWidgets.QMainWindow):
             self._poll_instances()
 
 
-    def _open_multi_launch(self):
-        if not self._check_mocktail_readiness():
-            return
-
-        targets = self._selected_accounts()
-        if not targets:
-            QMessageBox.information(self, "Multi-Launch", "Select the accounts to launch in the list first.")
-            return
-        default_stagger = float(self.storage.get_setting("stagger_delay", "3.0"))
-        dlg = MultiLaunchDialog(targets, self.storage.list_favorites(), self, default_delay=default_stagger)
-        if dlg.exec():
-            # Runs on the queue worker: launching inline froze the window for the whole stagger.
-            self._start_staggered_queue(
-                targets=targets,
-                place_id=dlg.place_id,
-                job_id=dlg.job_id,
-                stagger_delay=dlg.stagger_delay,
-            )
-
     def _kill_selected(self):
         for acc in self._selected_accounts():
             if getattr(self, "self_heal_engine", None):
@@ -2294,31 +2255,6 @@ class MainWindow(QtWidgets.QMainWindow):
         target_row = selected_rows[-1] + 2
         self._on_table_rows_reordered(selected_rows, target_row)
 
-    def _move_selected_rows_to_top(self):
-        selected_rows = sorted(set(idx.row() for idx in self.table.selectedIndexes()))
-        if not selected_rows or 0 in selected_rows:
-            return
-        self._on_table_rows_reordered(selected_rows, 0)
-
-    def _move_selected_rows_to_bottom(self):
-        selected_rows = sorted(set(idx.row() for idx in self.table.selectedIndexes()))
-        if not selected_rows or (len(self.visible_accounts) - 1) in selected_rows:
-            return
-        self._on_table_rows_reordered(selected_rows, len(self.visible_accounts))
-
-    def _sort_table_by_group_order(self):
-        groups = self.storage.list_groups()
-        group_priority = {g: i for i, g in enumerate(groups)}
-
-        # Stable sort preserving relative order within the same group
-        self.accounts.sort(key=lambda a: group_priority.get(a.group, 9999))
-        self.storage.reorder_accounts([a.account_id for a in self.accounts])
-        self._sort_column = None
-        self._sort_order = None
-        self.table.setHorizontalHeaderLabels(self.base_headers)
-        self._populate_table()
-        self.statusBar().showMessage("Sorted by group order", 3000)
-
     def _open_group_manager(self):
         self._open_modeless_window(
             "group_manager",
@@ -2497,28 +2433,6 @@ class MainWindow(QtWidgets.QMainWindow):
             self.statusBar().showMessage(f"Exported {len(accounts)} account(s) to {Path(file_path).name}", 5000)
         except Exception as e:
             QMessageBox.critical(self, "Export Error", f"Failed to export accounts:\n{e}")
-
-    def _edit_current_account(self):
-        acc = self.current_account
-        if not acc:
-            targets = self._selected_accounts()
-            if targets:
-                acc = targets[0]
-        if not acc:
-            QMessageBox.information(self, "Edit Account", "Please select an account from the table first.")
-            return
-
-        def _make_dlg():
-            dlg = EditAccountDialog(acc, self)
-            def _on_edited():
-                self.storage.save_account(acc)
-                if hasattr(dlg, "new_cookie") and dlg.new_cookie and hasattr(self.runner, "auth_state_manager"):
-                    self.runner.auth_state_manager.mark_ready(acc.account_id)
-                self._load_accounts()
-            dlg.accepted.connect(_on_edited)
-            return dlg
-
-        self._open_modeless_window(f"edit_account_{acc.account_id}", _make_dlg)
 
     def _open_account_in_browser(
         self,
@@ -2944,54 +2858,6 @@ class MainWindow(QtWidgets.QMainWindow):
             on_accepted=_on_privacy_updated,
         )
 
-    def _apply_join_privacy_for_current(self):
-        self._open_batch_privacy()
-
-    def _sync_selected_account_robux(self):
-        if not self.current_account:
-            self.statusBar().showMessage("No account selected to sync Robux", 3000)
-            return
-        self._sync_robux_for_targets([self.current_account])
-
-    def _sync_robux_for_targets(self, targets=None):
-        if targets is None:
-            targets = self._selected_accounts()
-            if not targets:
-                targets = list(self.accounts)
-
-        valid_targets = [a for a in targets if a.cookie and a.user_id]
-        if not valid_targets:
-            self.statusBar().showMessage("No accounts with active session cookies to sync Robux", 4000)
-            return
-
-        self.statusBar().showMessage(f"Syncing Robux for {len(valid_targets)} account(s)...", 5000)
-
-        import threading
-        def _worker():
-            updated_count = 0
-            for acc in valid_targets:
-                try:
-                    res = self.api.get_currency_summary(acc.user_id, acc.cookie)
-                    if res.get("success"):
-                        robux = res.get("robux", 0)
-                        pending = res.get("pending_robux", 0)
-                        acc.robux_balance = robux
-                        acc.pending_robux = pending
-                        self.storage.update_currency(acc.account_id, robux, pending)
-                        updated_count += 1
-                except Exception as e:
-                    log.debug(f"Failed to sync currency for {acc.username}: {e}")
-                time.sleep(0.35)
-
-            def _on_done():
-                self._load_accounts()
-                if self.current_account:
-                    self._select_account(self.current_account)
-                self.statusBar().showMessage(f"Synced Robux for {updated_count} account(s)", 4000)
-            self._run_on_ui(_on_done)
-
-        threading.Thread(target=_worker, daemon=True).start()
-
     def _start_cookie_check(self, show_prompt: bool = False):
         """
         Validates session cookies for all accounts in the background.
@@ -3167,14 +3033,6 @@ class MainWindow(QtWidgets.QMainWindow):
             self.statusBar().showMessage(f"Copied {len(targets)} password(s) ({empty_count} blank)", 4000)
         else:
             self.statusBar().showMessage(f"Copied {len(targets)} password(s)", 3000)
-
-    def _copy_selected_user_pass(self):
-        targets = self._selected_accounts()
-        if not targets:
-            return
-        lines = [f"{acc.username}:{acc.password}" for acc in targets]
-        QtWidgets.QApplication.clipboard().setText("\n".join(lines))
-        self.statusBar().showMessage(f"Copied {len(targets)} combo(s)", 3000)
 
     def _copy_selected_user_id(self):
         targets = self._selected_accounts()
@@ -3357,9 +3215,6 @@ class MainWindow(QtWidgets.QMainWindow):
 
         # ── 6. Vault Backup ──
         menu.addAction("Export Encrypted Archive (.aeram)...", self._export_encrypted_archive)
-
-    def _open_fastflags_dialog(self):
-        self._open_modeless_window("fastflags", lambda: FastFlagsDialog(self.storage, self))
 
     def _test_self_heal_simulation(self):
         running = getattr(self.runner, "active_instances", {})

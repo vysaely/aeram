@@ -509,6 +509,3 @@ class ServerFinderDialog(BorderlessDialog):
         self.server_selected.emit(target_place, target_job, auto_join)
         self.accept()
 
-
-# Alias for backward compatibility
-ServerMonitorDialog = ServerFinderDialog

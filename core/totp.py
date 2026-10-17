@@ -316,11 +316,3 @@ def decode_qr_image_files(image_paths: List[Union[str, Path]]) -> List[str]:
             log.debug(f"zbarimg execution error for {path}: {e}")
     return all_payloads
 
-
-def decode_qr_image_file(image_path: Union[str, Path]) -> Optional[str]:
-    """
-    Decodes QR code from a single image file using zbarimg.
-    Returns the first decoded string payload or None if not found.
-    """
-    payloads = decode_qr_image_files([image_path])
-    return payloads[0] if payloads else None

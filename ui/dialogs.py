@@ -13,7 +13,7 @@ import random
 from typing import Optional, List, Dict, Any
 from PyQt6 import QtWidgets, QtCore, QtGui
 
-from core.models import RobloxAccount, FavoriteGame
+from core.models import RobloxAccount
 from core.storage import StorageManager, clean_cookie, DEFAULT_ALT_FPS
 from core.roblox_api import RobloxAPI
 from core.ram_importer import import_from_file_or_text
@@ -317,178 +317,6 @@ class ImportRAMDialog(BorderlessDialog):
         QMessageBox.information(
             self, "Import Complete", f"Successfully imported {imported_count} accounts into the local vault."
         )
-        self.accept()
-
-
-class JoinGameDialog(BorderlessDialog):
-    def __init__(self, account: RobloxAccount, favorites: List[FavoriteGame], parent=None):
-        super().__init__(parent, title=f"Join Game — @{account.username}", can_maximize=False, resizable=False)
-        self.account = account
-        self.favorites = favorites
-        self.place_id: Optional[int] = None
-        self.job_id: Optional[str] = None
-        self.private_server_link: Optional[str] = None
-
-        self.setWindowTitle(f"Join Game — @{account.username}")
-        self.setFixedWidth(460)
-        self._init_ui()
-
-    def _init_ui(self):
-        layout = self.body_layout
-        layout.setSpacing(12)
-        layout.setContentsMargins(20, 20, 20, 20)
-
-        layout.addWidget(QtWidgets.QLabel(f"<b>Launching game for @{self.account.username}</b>"))
-
-        # Favorites Quick Select
-        if self.favorites:
-            layout.addWidget(QtWidgets.QLabel("Select from Favorites:"))
-            self.fav_combo = QtWidgets.QComboBox()
-            self.fav_combo.addItem("-- Select Favorite Game --", None)
-            for f in self.favorites:
-                self.fav_combo.addItem(f"[{f.place_id}] {f.name}", f)
-            self.fav_combo.currentIndexChanged.connect(self._fav_selected)
-            layout.addWidget(self.fav_combo)
-
-        # Place ID
-        layout.addWidget(QtWidgets.QLabel("Place ID:"))
-        self.place_input = QtWidgets.QLineEdit()
-        self.place_input.setPlaceholderText("e.g. 189707 (Natural Disaster Survival)")
-        layout.addWidget(self.place_input)
-
-        # Job ID (Server Instance)
-        layout.addWidget(QtWidgets.QLabel("Job ID (Specific Server Instance, Optional):"))
-        self.job_input = QtWidgets.QLineEdit()
-        self.job_input.setPlaceholderText("e.g. 01234567-89ab-cdef-0123-456789abcdef")
-        layout.addWidget(self.job_input)
-
-        # Private Server Link
-        layout.addWidget(QtWidgets.QLabel("Private Server Link or Link Code (Optional):"))
-        self.server_input = QtWidgets.QLineEdit()
-        self.server_input.setPlaceholderText("https://www.roblox.com/games/... or linkCode")
-        layout.addWidget(self.server_input)
-
-        btn_box = QtWidgets.QHBoxLayout()
-        btn_box.addStretch()
-
-        cancel_btn = QtWidgets.QPushButton("Cancel")
-        cancel_btn.clicked.connect(self.reject)
-        btn_box.addWidget(cancel_btn)
-
-        launch_btn = QtWidgets.QPushButton("Launch Game")
-        launch_btn.setObjectName("primaryBtn")
-        launch_btn.clicked.connect(self._launch)
-        btn_box.addWidget(launch_btn)
-
-        layout.addLayout(btn_box)
-
-    def _fav_selected(self, index: int):
-        fav = self.fav_combo.currentData()
-        if fav:
-            self.place_input.setText(str(fav.place_id))
-            if fav.private_server_link:
-                self.server_input.setText(fav.private_server_link)
-
-    def _launch(self):
-        place_str = self.place_input.text().strip()
-        if not place_str or not place_str.isdigit():
-            QMessageBox.warning(self, "Invalid Place ID", "Please enter a valid numeric Place ID.")
-            return
-
-        self.place_id = int(place_str)
-        self.job_id = self.job_input.text().strip() or None
-        self.private_server_link = self.server_input.text().strip() or None
-        self.accept()
-
-
-class MultiLaunchDialog(BorderlessDialog):
-    def __init__(
-        self,
-        selected_accounts: List[RobloxAccount],
-        favorites: List[FavoriteGame],
-        parent=None,
-        default_place_id: str = "",
-        default_job_id: str = "",
-        default_delay: float = 3.0,
-    ):
-        super().__init__(parent, title=f"Multi-Launch ({len(selected_accounts)} Accounts)", can_maximize=False, resizable=True)
-        self.selected_accounts = selected_accounts
-        self.favorites = favorites
-        self.default_place_id = default_place_id
-        self.default_job_id = default_job_id
-        self.stagger_delay = default_delay
-
-        self.place_id: Optional[int] = None
-        self.job_id: Optional[str] = None
-        self.private_server_link: Optional[str] = None
-
-        self.setWindowTitle(f"Multi-Launch ({len(selected_accounts)} Accounts) - AERAM")
-        self.setFixedWidth(460)
-        self._init_ui()
-
-    def _init_ui(self):
-        layout = self.body_layout
-        layout.setSpacing(12)
-        layout.setContentsMargins(20, 20, 20, 20)
-
-        names = ", ".join([f"@{a.username}" for a in self.selected_accounts[:4]])
-        if len(self.selected_accounts) > 4:
-            names += f" and {len(self.selected_accounts)-4} more"
-
-        info = QtWidgets.QLabel(f"<b>Concurrent Multi-Instance Launch</b><br>Selected: {names}")
-        info.setWordWrap(True)
-        layout.addWidget(info)
-
-        # Place ID (Optional)
-        layout.addWidget(QtWidgets.QLabel("Place ID (Leave blank to launch into client menu):"))
-        self.place_input = QtWidgets.QLineEdit()
-        self.place_input.setPlaceholderText("Optional Place ID")
-        if self.default_place_id:
-            self.place_input.setText(self.default_place_id)
-        layout.addWidget(self.place_input)
-
-        # Job ID
-        layout.addWidget(QtWidgets.QLabel("Job ID (Join Same Server Instance, Optional):"))
-        self.job_input = QtWidgets.QLineEdit()
-        self.job_input.setPlaceholderText("Optional Job ID")
-        if self.default_job_id:
-            self.job_input.setText(self.default_job_id)
-        layout.addWidget(self.job_input)
-
-        # Stagger delay
-        delay_box = QtWidgets.QHBoxLayout()
-        delay_box.addWidget(QtWidgets.QLabel("Launch Delay Between Accounts (8-15s recommended):"))
-        self.delay_spin = QtWidgets.QDoubleSpinBox()
-        self.delay_spin.setRange(1.0, 60.0)
-        self.delay_spin.setValue(max(8.0, self.stagger_delay))
-        self.delay_spin.setSingleStep(1.0)
-        self.delay_spin.setSuffix(" sec")
-        delay_box.addWidget(self.delay_spin)
-        layout.addLayout(delay_box)
-
-        hint = QtWidgets.QLabel("<span style='color: #888888; font-size: 11px;'>Tip: 8–15 seconds delay prevents Roblox Arkose Labs from triggering CAPTCHAs.</span>")
-        hint.setWordWrap(True)
-        layout.addWidget(hint)
-
-        btn_box = QtWidgets.QHBoxLayout()
-        btn_box.addStretch()
-
-        cancel_btn = QtWidgets.QPushButton("Cancel")
-        cancel_btn.clicked.connect(self.reject)
-        btn_box.addWidget(cancel_btn)
-
-        launch_btn = QtWidgets.QPushButton(f"Launch Accounts ({len(self.selected_accounts)})")
-        launch_btn.setObjectName("primaryBtn")
-        launch_btn.clicked.connect(self._launch)
-        btn_box.addWidget(launch_btn)
-
-        layout.addLayout(btn_box)
-
-    def _launch(self):
-        place_str = self.place_input.text().strip()
-        self.place_id = int(place_str) if place_str and place_str.isdigit() else None
-        self.job_id = self.job_input.text().strip() or None
-        self.stagger_delay = self.delay_spin.value()
         self.accept()
 
 
@@ -2991,10 +2819,6 @@ class TwoFactorExportDialog(BorderlessDialog):
             self._live_timer.stop()
         super().reject()
 
-
-# Aliases
-TwoFactorImportDialog = GoogleAuthImportDialog
-GoogleAuthExportDialog = TwoFactorExportDialog
 
 
 def generate_strong_password(length: int = 16) -> str:

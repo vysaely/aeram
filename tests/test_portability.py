@@ -250,9 +250,9 @@ class TestDefaultBaseDirSelection(unittest.TestCase):
         conn.close()
 
     def _base_dir(self, home):
-        from core.platform.linux import LinuxPlatformProvider
+        from core.paths import default_base_dir
         with patch("pathlib.Path.home", return_value=home):
-            return LinuxPlatformProvider().get_default_base_dir()
+            return default_base_dir()
 
     def test_empty_aeram_dir_does_not_hide_legacy_accounts(self):
         import tempfile

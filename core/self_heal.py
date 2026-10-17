@@ -68,9 +68,6 @@ class SelfHealEngine:
         self.running = False
         log.info("Self-Healing Watchdog DISABLED.")
 
-    def register_account(self, account_id: str):
-        self.monitored_account_ids.add(account_id)
-
     def unregister_account(self, account_id: str):
         self.monitored_account_ids.discard(account_id)
         self.reconnect_cooldowns.pop(account_id, None)

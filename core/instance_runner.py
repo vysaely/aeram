@@ -21,7 +21,6 @@ except ImportError:
 from typing import Dict, Optional, List, Callable, Any, Tuple
 from pathlib import Path
 from urllib.parse import urlparse, parse_qs
-import urllib.request
 
 from .models import RobloxAccount, RunningInstance
 from .storage import StorageManager, DEFAULT_ALT_FPS
@@ -310,29 +309,6 @@ class InstanceRunner:
     def stop_instance(self, account_id: str) -> bool:
         """Alias for terminate_instance."""
         return self.terminate_instance(account_id)
-
-    def resolve_active_server_id(self, place_id: int) -> Optional[str]:
-        """
-        Queries Roblox's public server list to locate an active game instance with open slots.
-        Supplying a specific gameInstanceId causes the client to route through join-game-instance
-        rather than join-game, enabling the client GenericChallenge openWindow handler so
-        Arkose CAPTCHA verification windows pop up reliably instead of hanging in matchmaker queues.
-        """
-        try:
-            url = f"https://games.roblox.com/v1/games/{place_id}/servers/0?sortOrder=2&excludeFullGames=true&limit=10"
-            req = urllib.request.Request(url, headers={"User-Agent": "Roblox/Linux"})
-            with urllib.request.urlopen(req, timeout=1.8) as resp:
-                data = json.loads(resp.read().decode("utf-8"))
-                for s in data.get("data", []):
-                    sid = s.get("id")
-                    playing = s.get("playing", 0)
-                    max_players = s.get("maxPlayers", 0)
-                    if sid and (max_players <= 0 or playing < max_players):
-                        log.info(f"Resolved live server {sid} ({playing}/{max_players}) for place {place_id}")
-                        return str(sid)
-        except Exception as e:
-            log.debug(f"Could not resolve active server for place {place_id}: {e}")
-        return None
 
     def launch_instance(
         self,
@@ -889,17 +865,6 @@ class InstanceRunner:
         for aid, inst, pgid, signalled in pending:
             self._finish_termination(aid, inst, pgid, signalled, max(0.0, deadline - time.monotonic()))
         return len(pending)
-
-    @staticmethod
-    def get_available_memory_mb() -> int:
-        try:
-            with open("/proc/meminfo", "r", encoding="utf-8") as f:
-                for line in f:
-                    if line.startswith("MemAvailable:"):
-                        return int(line.split()[1]) // 1024
-        except Exception:
-            pass
-        return 4096
 
     @staticmethod
     def get_memory_stats() -> dict:

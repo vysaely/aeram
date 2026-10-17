@@ -16,12 +16,11 @@ from typing import List, Optional, Dict, Any, Generator, Set, Union
 
 from .models import RobloxAccount, FavoriteGame
 from .vault import Vault
-from .platform import get_platform
+from .paths import default_base_dir
 
 log = logging.getLogger("StorageManager")
 
-DEFAULT_BASE_DIR = get_platform().get_default_base_dir()
-DEFAULT_SOBER_SYSTEM_VAR = Path.home() / ".var" / "app" / "org.vinegarhq.Sober"
+DEFAULT_BASE_DIR = default_base_dir()
 DEFAULT_SHARED_MOCKTAIL = Path.home() / ".local" / "share" / "mocktail"
 
 # Frame cap for alt accounts when the user has not chosen one in Settings.
@@ -53,7 +52,6 @@ class StorageManager:
     def __init__(
         self,
         base_dir: Optional[Path] = None,
-        sober_var: Optional[Path] = None,
         mocktail_data: Optional[Path] = None,
         mocktail_bin: Optional[Path] = None,
     ):
@@ -61,7 +59,6 @@ class StorageManager:
         self.instances_dir = self.base_dir / "instances"
         self.db_path = self.base_dir / "manager.db"
         self.key_path = self.base_dir / "vault.key"
-        self.sober_system_var = Path(sober_var or DEFAULT_SOBER_SYSTEM_VAR)
         self.mocktail_data = Path(mocktail_data or DEFAULT_SHARED_MOCKTAIL)
         self.mocktail_bin = Path(mocktail_bin or get_default_mocktail_bin())
 
@@ -536,14 +533,6 @@ class StorageManager:
                 WHERE account_id = ?
             """, (avatar_url, robux_balance, display_name, account_id))
 
-    def update_profile_assets(self, account_id: str, avatar_url: str, robux_balance: int) -> None:
-        """Updates only avatar thumbnail and Robux balance, preserving custom alias."""
-        with self._db() as cursor:
-            cursor.execute("""
-                UPDATE accounts SET avatar_url = ?, robux_balance = ?
-                WHERE account_id = ?
-            """, (avatar_url, robux_balance, account_id))
-
     def update_alias(self, account_id: str, alias: str) -> None:
         with self._db() as cursor:
             cursor.execute("UPDATE accounts SET display_name = ? WHERE account_id = ?", (alias, account_id))
@@ -551,11 +540,6 @@ class StorageManager:
     def update_notes(self, account_id: str, notes: str) -> None:
         with self._db() as cursor:
             cursor.execute("UPDATE accounts SET notes = ? WHERE account_id = ?", (notes, account_id))
-
-    def update_group(self, account_id: str, group_name: str) -> None:
-        clean_group = group_name.strip() or "Default"
-        with self._db() as cursor:
-            cursor.execute("UPDATE accounts SET group_name = ? WHERE account_id = ?", (clean_group, account_id))
 
     def update_accounts_group(self, account_ids: List[str], group_name: str) -> None:
         if not account_ids:
@@ -566,20 +550,6 @@ class StorageManager:
             cursor.execute(
                 f"UPDATE accounts SET group_name = ? WHERE account_id IN ({placeholders})",
                 [clean_group, *account_ids]
-            )
-
-    def update_currency(self, account_id: str, robux: int, pending_robux: int = 0) -> None:
-        with self._db() as cursor:
-            cursor.execute(
-                "UPDATE accounts SET robux_balance = ?, pending_robux = ? WHERE account_id = ?",
-                (robux, pending_robux, account_id)
-            )
-
-    def update_join_privacy(self, account_id: str, join_privacy: str) -> None:
-        with self._db() as cursor:
-            cursor.execute(
-                "UPDATE accounts SET join_privacy = ? WHERE account_id = ?",
-                (join_privacy, account_id)
             )
 
     def get_group_order(self) -> List[str]:
@@ -1354,7 +1324,7 @@ class StorageManager:
     def get_runtime_dir(self, account: RobloxAccount) -> Path:
         """
         Returns the decoupled per-instance runtime directory.
-        Prefers /run/user/<uid>/ram-linux/<account_id> (tmpfs) on Linux to guarantee
+        Prefers /run/user/<uid>/aeram/<account_id> (tmpfs) on Linux to guarantee
         that UNIX domain socket paths never exceed the 108-byte kernel limit
         (UNIX_PATH_MAX). Falls back to <profile_dir>/run.
         """
@@ -1362,7 +1332,7 @@ class StorageManager:
         host_xdg = os.environ.get("XDG_RUNTIME_DIR") or f"/run/user/{my_uid}"
         base = Path(host_xdg)
         if base.exists() and os.access(base, os.W_OK):
-            target = base / "ram-linux" / account.account_id
+            target = base / "aeram" / account.account_id
         else:
             target = self.get_profile_dir(account) / "run"
         return target

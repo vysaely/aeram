@@ -1,5 +1,5 @@
 """
-Reproducible performance benchmarks for RAM-Linux.
+Reproducible performance benchmarks for AERAM.
 Measures startup latency, memory footprint (RSS), vault throughput, and instance tracking overhead.
 """
 
@@ -25,7 +25,7 @@ def measure_benchmark():
     # 1. Startup Latency & Storage Init
     t0 = time.perf_counter()
     with tempfile.TemporaryDirectory() as tmpdir:
-        base_dir = Path(tmpdir) / "ram-bench"
+        base_dir = Path(tmpdir) / "aeram-bench"
         mocktail_data = Path(tmpdir) / "mocktail_data"
         mocktail_bin = Path(tmpdir) / "mocktail_bin"
         (mocktail_data / "payloads").mkdir(parents=True, exist_ok=True)

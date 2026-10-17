@@ -15,7 +15,7 @@ Keeps background alts connected without ever interfering with active gameplay or
 import os
 import sys
 
-# Prevent core/ directory from shadowing the standard library 'platform' module
+# When run as a script, import project modules from the repo root rather than core/
 _script_dir = os.path.dirname(os.path.abspath(__file__))
 if sys.path and os.path.abspath(sys.path[0]) == _script_dir:
     sys.path.pop(0)
@@ -23,10 +23,8 @@ _project_root = os.path.dirname(_script_dir)
 if _project_root not in sys.path:
     sys.path.insert(0, _project_root)
 
-import platform  # noqa: F401 -- pre-import standard library platform before evdev uses it
 import glob
 import time
-import tempfile
 import signal
 import select
 import logging
@@ -38,14 +36,9 @@ from typing import List
 from core.compositor import get_compositor
 
 try:
-    import dbus
+    from evdev import InputDevice, ecodes
 except ImportError:
-    dbus = None
-
-try:
-    from evdev import InputDevice, UInput, ecodes
-except ImportError:
-    InputDevice = UInput = ecodes = None
+    InputDevice = ecodes = None
 
 log = logging.getLogger("AntiAFK")
 
@@ -136,61 +129,9 @@ class AntiAfkEngine:
         self.verbose = verbose
         self.running = False
 
-        self._bus = None
-        self._kwin_iface = None
         self._uinput = None
         self.compositor = get_compositor()
         self.monitor = PhysicalIdleMonitor()
-
-    def _ensure_uinput(self):
-        if not self._uinput and UInput and ecodes:
-            try:
-                self._uinput = UInput(
-                    {ecodes.EV_KEY: [self.key_code, ecodes.KEY_SPACE]},
-                    name="AERAM-AntiAFK-Keyboard",
-                )
-            except PermissionError:
-                log.warning("Permission denied to /dev/uinput. In-process IPC will still work 100%.")
-            except Exception as e:
-                log.debug(f"UInput setup note: {e}")
-
-    def _ensure_kwin(self):
-        if not self._bus and dbus:
-            try:
-                self._bus = dbus.SessionBus()
-                kwin_obj = self._bus.get_object("org.kde.KWin", "/Scripting")
-                self._kwin_iface = dbus.Interface(kwin_obj, "org.kde.kwin.Scripting")
-            except Exception as e:
-                log.debug(f"KWin DBus connection note: {e}")
-
-    def _execute_kwin_script(self, js_code: str) -> None:
-        if not dbus:
-            return
-        self._ensure_kwin()
-        if not self._kwin_iface:
-            return
-        script_path = None
-        try:
-            with tempfile.NamedTemporaryFile(mode="w", suffix=".js", prefix="aeram_afk_", delete=False, encoding="utf-8") as tf:
-                tf.write(js_code)
-                script_path = Path(tf.name)
-            try:
-                os.chmod(script_path, 0o600)
-            except OSError:
-                pass
-            sid = self._kwin_iface.loadScript(str(script_path))
-            script_obj = self._bus.get_object("org.kde.KWin", f"/Scripting/Script{sid}")
-            dbus.Interface(script_obj, "org.kde.kwin.Script").run()
-            self._kwin_iface.unloadScript(f"/Scripting/Script{sid}")
-        except Exception as e:
-            if self.verbose:
-                log.warning(f"KWin script note: {e}")
-        finally:
-            if script_path:
-                try:
-                    script_path.unlink(missing_ok=True)
-                except Exception:
-                    pass
 
     def get_mocktail_pids(self) -> List[int]:
         """
@@ -216,10 +157,6 @@ class AntiAfkEngine:
         except Exception:
             pass
         return pids
-
-    def get_roblox_windows_count(self) -> int:
-        """Returns the number of active Mocktail instances."""
-        return len(self.get_mocktail_pids())
 
     def trigger_ipc_pulse(self, pids: List[int]) -> int:
         """

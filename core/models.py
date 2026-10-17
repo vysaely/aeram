@@ -1,5 +1,5 @@
 """
-Core domain data models for Linux Roblox Account Manager.
+Core domain data models for AERAM.
 """
 
 from dataclasses import dataclass, field

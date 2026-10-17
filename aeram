@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-AERAM — Roblox Account Manager for Linux (Mocktail / Sober).
+AERAM — Roblox Account Manager for Linux (Mocktail).
 Main executable entry point for GUI and CLI.
 """
 

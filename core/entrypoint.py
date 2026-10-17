@@ -1,5 +1,5 @@
 """
-Unified application entry point for AERAM (GUI and CLI) on Linux and Windows.
+Unified application entry point for AERAM (GUI and CLI).
 """
 
 import sys
@@ -26,8 +26,8 @@ def _excepthook(exc_type, exc_val, exc_tb):
     import traceback
     err_msg = "".join(traceback.format_exception(exc_type, exc_val, exc_tb))
     try:
-        from core.platform import get_platform
-        log_file = get_platform().get_default_base_dir() / "crash.log"
+        from core.paths import default_base_dir
+        log_file = default_base_dir() / "crash.log"
         log_file.parent.mkdir(parents=True, exist_ok=True)
         log_file.write_text(err_msg, encoding="utf-8")
     except Exception:
@@ -208,7 +208,7 @@ def main():
     # Set window icon (check system theme first, fallback to bundled assets)
     app_icon = QtGui.QIcon.fromTheme("aeram")
     if app_icon.isNull():
-        for icon_name in ("aeram.svg", "aeram.png", "roblox-account-manager.svg", "aeram.ico"):
+        for icon_name in ("aeram.svg", "aeram.png"):
             icon_path = PROJECT_ROOT / "assets" / icon_name
             if icon_path.exists():
                 app_icon = QtGui.QIcon(str(icon_path))
