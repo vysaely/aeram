@@ -11,7 +11,6 @@ import subprocess
 import time
 import uuid
 from pathlib import Path
-from typing import Optional, List
 
 from core.models import RobloxAccount
 from core.storage import StorageManager, clean_cookie

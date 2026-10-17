@@ -16,7 +16,6 @@ from PyQt6.QtCore import Qt, pyqtSignal, QTimer
 from core.models import RobloxAccount
 from core.storage import StorageManager
 from core.roblox_api import RobloxAPI
-from ui.theme import DARK_THEME_QSS
 from ui.borderless_dialog import BorderlessDialog, BorderlessMessageBox as QMessageBox
 
 log = logging.getLogger("ServerMonitor")

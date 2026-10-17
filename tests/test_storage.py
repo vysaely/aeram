@@ -245,6 +245,12 @@ class TestStorageManager(unittest.TestCase):
         main_run = self.storage.init_profile_sandbox(main_acc)
         alt_run = self.storage.init_profile_sandbox(alt_acc)
 
+        # Only the main asks Mocktail for GameMode; alts stay deprioritised on their own cores
+        main_cfg = (main_run / "config" / "mocktail" / "config.yaml").read_text(encoding="utf-8")
+        alt_cfg = (alt_run / "config" / "mocktail" / "config.yaml").read_text(encoding="utf-8")
+        self.assertIn("  gamemode: auto\n", main_cfg)
+        self.assertIn("  gamemode: off\n", alt_cfg)
+
         main_xml = main_run / "data" / "files" / "appData" / "GlobalBasicSettings_13.xml"
         alt_xml = alt_run / "data" / "files" / "appData" / "GlobalBasicSettings_13.xml"
 

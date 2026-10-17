@@ -435,6 +435,67 @@ class TestTerminateSafety(unittest.TestCase):
             runner.terminate_instance("acc_safe")
             killpg.assert_not_called()
 
+    def test_client_ignoring_sigterm_is_killed_after_grace(self):
+        from unittest.mock import patch
+        import subprocess
+        import time
+        proc = subprocess.Popen(
+            ["bash", "-c", 'trap "" TERM; exec -a /opt/mocktail/mocktail_acc_safe sleep 30'],
+            start_new_session=True,
+        )
+        self.addCleanup(lambda: (proc.kill(), proc.wait()))
+        for _ in range(100):
+            if InstanceRunner._is_mocktail_process(proc.pid):
+                break
+            time.sleep(0.01)
+        runner = self._runner_tracking(proc.pid)
+
+        # Shared process group: only the PID itself may be signalled, so the SIGKILL has to
+        # come from the grace-period fallback rather than the group kill.
+        with patch("os.getpgid", return_value=os.getpgrp()):
+            started = time.monotonic()
+            self.assertTrue(runner.terminate_instance("acc_safe", grace=0.3))
+            self.assertGreaterEqual(time.monotonic() - started, 0.3)
+        self.assertFalse(os.path.exists(f"/proc/{proc.pid}"), "client must be dead and reaped")
+
+    def test_terminate_all_stops_instances_in_parallel(self):
+        import time
+        clients = [self._spawn(f"/opt/mocktail/mocktail_acc_{i}") for i in range(3)]
+        runner = InstanceRunner(MagicMock())
+        for i, client in enumerate(clients):
+            runner.active_instances[f"acc_{i}"] = RunningInstance(
+                account_id=f"acc_{i}", username=f"U{i}", pid=client.pid, start_time=0.0
+            )
+
+        started = time.monotonic()
+        self.assertEqual(runner.terminate_all_instances(), 3)
+        self.assertLess(time.monotonic() - started, 1.0)
+        self.assertEqual(runner.active_instances, {})
+        for client in clients:
+            self.assertFalse(os.path.exists(f"/proc/{client.pid}"))
+
+
+class TestMemoryLaunchCheck(unittest.TestCase):
+    def _runner(self, avail, swap_free):
+        runner = InstanceRunner(MagicMock())
+        runner.get_memory_stats = lambda: {
+            "mem_avail_mb": avail, "mem_total_mb": 32768, "swap_free_mb": swap_free, "swap_total_mb": 32768,
+        }
+        return runner
+
+    def test_comfortable_memory(self):
+        self.assertEqual(self._runner(8000, 8000).memory_launch_check("U"), (True, None))
+
+    def test_low_ram_with_swap_warns_but_launches(self):
+        may_launch, warning = self._runner(1000, 4000).memory_launch_check("U")
+        self.assertTrue(may_launch)
+        self.assertIn("RAM low", warning)
+
+    def test_critical_memory_blocks_launch(self):
+        may_launch, warning = self._runner(200, 100).memory_launch_check("U")
+        self.assertFalse(may_launch)
+        self.assertIn("U", warning)
+
 
 if __name__ == "__main__":
     unittest.main()

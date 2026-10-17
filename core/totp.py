@@ -4,8 +4,6 @@ migration QR code / URI parser for AERAM.
 Pure Python standard library implementation with zero external dependencies.
 """
 
-import os
-import sys
 import time
 import hmac
 import hashlib
@@ -13,7 +11,6 @@ import struct
 import base64
 import urllib.parse
 import subprocess
-import tempfile
 import logging
 from pathlib import Path
 from typing import Optional, List, Dict, Any, Union, Tuple

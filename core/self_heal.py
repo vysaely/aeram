@@ -13,7 +13,7 @@ import threading
 import subprocess
 from pathlib import Path
 import re
-from typing import Dict, Set, Optional, Tuple
+from typing import Dict, Set, Optional
 
 log = logging.getLogger("SelfHeal")
 

@@ -5,7 +5,7 @@ high-contrast monochrome styling, and native window dragging/resizing.
 """
 
 from typing import Optional
-from PyQt6 import QtWidgets, QtCore, QtGui
+from PyQt6 import QtWidgets, QtCore
 from ui.theme import DARK_THEME_QSS
 
 

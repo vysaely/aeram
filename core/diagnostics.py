@@ -14,7 +14,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import List, Dict, Any, Optional
 
-from core.mocktail_manager import MocktailManager, MocktailInstallationInfo
+from core.mocktail_manager import MocktailManager
 from core.compositor import detect_compositor_type, get_compositor, CompositorType
 
 log = logging.getLogger("Diagnostics")
@@ -142,7 +142,6 @@ class DiagnosticsRunner:
             ))
         except ImportError:
             try:
-                from core.vault import Vault
                 checks.append(DiagnosticCheck(
                     name="Security Vault",
                     category="Dependencies",

@@ -12,7 +12,6 @@ import subprocess
 import logging
 from contextlib import contextmanager
 from pathlib import Path
-import sys
 from typing import List, Optional, Dict, Any, Generator, Set, Union
 
 from .models import RobloxAccount, FavoriteGame
@@ -24,6 +23,9 @@ log = logging.getLogger("StorageManager")
 DEFAULT_BASE_DIR = get_platform().get_default_base_dir()
 DEFAULT_SOBER_SYSTEM_VAR = Path.home() / ".var" / "app" / "org.vinegarhq.Sober"
 DEFAULT_SHARED_MOCKTAIL = Path.home() / ".local" / "share" / "mocktail"
+
+# Frame cap for alt accounts when the user has not chosen one in Settings.
+DEFAULT_ALT_FPS = "6"
 
 
 def get_default_mocktail_bin() -> Path:
@@ -83,8 +85,8 @@ class StorageManager:
         if not mains_file.exists():
             try:
                 mains_file.write_text(
-                    "# List of accounts that should run at 165 FPS and high graphics quality.\n"
-                    "# All other accounts run in low-power 24 FPS farming mode (compact 800x600, muted, no shadows).\n"
+                    "# List of main accounts: full frame rate and graphics quality.\n"
+                    "# All other accounts run as low-power alts (capped FPS, compact 800x600, muted).\n"
                     "# Add one username per line below:\n"
                     "# YourMainUsername\n",
                     encoding="utf-8"
@@ -114,7 +116,7 @@ class StorageManager:
         return self._mains_cache
 
     def is_main_account(self, account: Any) -> bool:
-        """Determines if an account is a main account (165 FPS, high fidelity) or alt (24 FPS, ultra-low resource)."""
+        """Determines if an account is a main account (full FPS, high fidelity) or alt (capped FPS, ultra-low resource)."""
         if isinstance(account, str):
             acc_obj = self.get_account(account)
             if not acc_obj:
@@ -158,9 +160,9 @@ class StorageManager:
                 return 330
         else:
             try:
-                return int(self.get_setting("alt_fps", "6"))
+                return int(self.get_setting("alt_fps", DEFAULT_ALT_FPS))
             except (ValueError, TypeError):
-                return 6
+                return int(DEFAULT_ALT_FPS)
 
     def set_account_target_fps(self, account_id: str, fps: int):
         """Sets an explicit target FPS tag (e.g. 'fps:330', 'fps:60') on an account."""
@@ -206,8 +208,8 @@ class StorageManager:
 
         try:
             mains_file.write_text(
-                "# List of accounts that should run at 165 FPS and high graphics quality.\n"
-                "# All other accounts run in low-power 24 FPS farming mode (compact 800x600, muted, no shadows).\n"
+                "# List of main accounts: full frame rate and graphics quality.\n"
+                "# All other accounts run as low-power alts (capped FPS, compact 800x600, muted).\n"
                 + "\n".join(sorted(current_mains)) + "\n",
                 encoding="utf-8"
             )
@@ -1130,7 +1132,9 @@ class StorageManager:
             "performance:\n"
             "  multithreaded_rendering: true\n"
             f"  physics_worker_mode: {'throughput' if is_main else 'auto'}\n"
-            "  gamemode: auto\n"
+            # Alts are deliberately low-priority and confined to their own cores; GameMode would
+            # boost them and may re-pin their threads, so only the main requests it.
+            f"  gamemode: {'auto' if is_main else 'off'}\n"
             "window:\n"
             f"  width: {win_w}\n"
             f"  height: {win_h}\n"

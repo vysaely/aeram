@@ -9,7 +9,6 @@ import ctypes
 from pathlib import Path
 from typing import Optional
 
-import sys
 
 # Cryptographic constants (matching libsodium)
 crypto_secretbox_KEYBYTES = 32

@@ -9,10 +9,9 @@ import shutil
 import json
 import logging
 import subprocess
-import tempfile
 from enum import Enum
 from pathlib import Path
-from typing import Optional, List, Dict, Any, Tuple
+from typing import Optional, List, Dict, Any
 
 log = logging.getLogger("Compositor")
 
