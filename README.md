@@ -57,6 +57,21 @@ cd aeram
 ./install.sh
 ```
 
+### Patched Mocktail (recommended for the main account)
+
+```bash
+./install.sh --with-mocktail     # or: ./scripts/build_mocktail.sh
+```
+
+Builds upstream Mocktail with `native/mocktail/*.patch` and installs it to `~/.local` (the previous install is
+backed up to `~/.local/lib/mocktail-backup/`). Needs Mocktail's build dependencies; the script lists them if
+any are missing. AERAM uses this build automatically, even when a system Mocktail package is installed. It adds:
+
+- **Hardware cursor:** the desktop cursor replaces the arrow Roblox draws into each frame, so it no longer trails
+  the mouse. Toggle under Settings → Client Engine & FastFlags → Main Cursor.
+- **1 ms input polling** instead of 4 ms.
+- **No 240 FPS cap:** the main account's FPS setting above 240 actually applies.
+
 ## Usage
 
 ```bash

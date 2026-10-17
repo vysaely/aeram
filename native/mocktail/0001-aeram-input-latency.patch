@@ -1,0 +1,586 @@
+diff --git a/include/libc_shim/host_cursor_textures.h b/include/libc_shim/host_cursor_textures.h
+new file mode 100644
+index 0000000..cf0941e
+--- /dev/null
++++ b/include/libc_shim/host_cursor_textures.h
+@@ -0,0 +1,41 @@
++#ifndef MOCKTAIL_LIBC_SHIM_HOST_CURSOR_TEXTURES_H_
++#define MOCKTAIL_LIBC_SHIM_HOST_CURSOR_TEXTURES_H_
++
++#include <string_view>
++
++namespace libc_shim {
++
++// 64x64 fully transparent 8-bit gray+alpha PNG, the same format as Roblox's
++// own cursor textures. MOCKTAIL_HOST_CURSOR serves it in place of Roblox's
++// software arrow so only the desktop's hardware cursor is visible.
++inline constexpr unsigned char kTransparentCursorPng[] = {
++    0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d,
++    0x49, 0x48, 0x44, 0x52, 0x00, 0x00, 0x00, 0x40, 0x00, 0x00, 0x00, 0x40,
++    0x08, 0x04, 0x00, 0x00, 0x00, 0x00, 0x60, 0xb9, 0x55, 0x00, 0x00, 0x00,
++    0x1e, 0x49, 0x44, 0x41, 0x54, 0x78, 0xda, 0xed, 0xc1, 0x01, 0x01, 0x00,
++    0x00, 0x00, 0x82, 0x20, 0xff, 0xaf, 0x6e, 0x48, 0x40, 0x01, 0x00, 0x00,
++    0x00, 0x00, 0x00, 0x00, 0x00, 0xef, 0x06, 0x20, 0x40, 0x00, 0x01, 0x98,
++    0x01, 0xbe, 0xfd, 0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4e, 0x44, 0xae,
++    0x42, 0x60, 0x82};
++
++// Arrow textures relative to the content root.
++inline constexpr const char* kHostCursorArrowTextures[] = {
++    "textures/Cursors/KeyboardMouse/ArrowFarCursor.png",
++    "textures/Cursors/KeyboardMouse/ArrowCursor.png",
++    // Legacy default mouse icon still referenced by the Android client.
++    "textures/ArrowFarCursor.png",
++    "textures/ArrowCursor.png",
++};
++
++inline bool IsHostCursorArrowTexture(std::string_view content_relative) {
++  for (const char* texture : kHostCursorArrowTextures) {
++    if (content_relative == texture) {
++      return true;
++    }
++  }
++  return false;
++}
++
++}  // namespace libc_shim
++
++#endif  // MOCKTAIL_LIBC_SHIM_HOST_CURSOR_TEXTURES_H_
+diff --git a/include/libc_shim/libc_shim.h b/include/libc_shim/libc_shim.h
+index a18f2e3..a843e00 100644
+--- a/include/libc_shim/libc_shim.h
++++ b/include/libc_shim/libc_shim.h
+@@ -46,6 +46,10 @@ HostCaBundleResolution ResolveHostCaBundle();
+ // specific than the application data prefix and therefore retain the existing
+ // longest-prefix path semantics for every other application path.
+ HostCaBundleResolution ConfigureHostCaBundlePathMappings();
++// With MOCKTAIL_HOST_CURSOR set, maps Roblox's arrow cursor textures under
++// content_root to a transparent PNG written into data_root.
++bool ConfigureHostCursorTextureMappings(const std::string& data_root,
++                                        const std::string& content_root);
+ 
+ const char* HostCaBundleStatusName(HostCaBundleStatus status);
+ 
+diff --git a/src/legacy/legacy_runtime.cc b/src/legacy/legacy_runtime.cc
+index e57e4de..9b3a8a2 100644
+--- a/src/legacy/legacy_runtime.cc
++++ b/src/legacy/legacy_runtime.cc
+@@ -1858,6 +1858,73 @@ extern "C" void MocktailConstructorWrapper() {
+   MaybePrintLibRobloxConstructorSummary(idx);
+ }
+ 
++// The Android payload clamps DFIntTaskSchedulerTargetFps and the render
++// scheduler to 240 even though the desktop client honours higher Basic
++// Settings caps. Raise those immediates before JNI_OnLoad so a configured
++// frame_rate_limit above 240 actually applies. MOCKTAIL_KEEP_ROBLOX_FPS_CLAMP
++// restores the payload's behaviour.
++static void RaiseLibRobloxFrameRateClamps() {
++  if (IsEnabled("MOCKTAIL_KEEP_ROBLOX_FPS_CLAMP")) {
++    return;
++  }
++  // mov ecx, 240; cmp eax, ecx; cmovl ecx, eax  (signed min)
++  static constexpr unsigned char kSignedMin[] = {0xb9, 0xf0, 0x00, 0x00, 0x00,
++                                                 0x39, 0xc8, 0x0f, 0x4c, 0xc8};
++  // mov ecx, 240; cmp eax, ecx; cmovae eax, ecx  (unsigned min)
++  static constexpr unsigned char kUnsignedMin[] = {0xb9, 0xf0, 0x00, 0x00, 0x00,
++                                                   0x39, 0xc8, 0x0f, 0x43, 0xc1};
++  static_assert(sizeof(kSignedMin) == sizeof(kUnsignedMin));
++  constexpr uint32_t kRaisedLimit = 10000;
++  const long page_size_value = sysconf(_SC_PAGESIZE);
++  const uintptr_t page_size =
++      page_size_value > 0 ? static_cast<uintptr_t>(page_size_value) : 4096;
++
++  FILE* maps = std::fopen("/proc/self/maps", "r");
++  if (maps == nullptr) {
++    return;
++  }
++  int patched = 0;
++  char line[1024];
++  while (std::fgets(line, sizeof(line), maps) != nullptr) {
++    if (std::strstr(line, "libroblox.so") == nullptr) {
++      continue;
++    }
++    uintptr_t start = 0;
++    uintptr_t end = 0;
++    char perms[8] = {};
++    if (std::sscanf(line, "%lx-%lx %7s", &start, &end, perms) != 3 ||
++        perms[0] != 'r' || perms[2] != 'x' || end <= start) {
++      continue;
++    }
++    auto* const begin = reinterpret_cast<unsigned char*>(start);
++    const size_t length = end - start;
++    for (size_t i = 0; i + sizeof(kSignedMin) <= length; ++i) {
++      if (begin[i] != 0xb9 ||
++          (std::memcmp(begin + i, kSignedMin, sizeof(kSignedMin)) != 0 &&
++           std::memcmp(begin + i, kUnsignedMin, sizeof(kUnsignedMin)) != 0)) {
++        continue;
++      }
++      const uintptr_t page = reinterpret_cast<uintptr_t>(begin + i) &
++                             ~(page_size - 1);
++      const uintptr_t page_end =
++          (reinterpret_cast<uintptr_t>(begin + i + 5) + page_size - 1) &
++          ~(page_size - 1);
++      void* const page_ptr = reinterpret_cast<void*>(page);
++      if (mprotect(page_ptr, page_end - page,
++                   PROT_READ | PROT_WRITE | PROT_EXEC) != 0) {
++        continue;
++      }
++      std::memcpy(begin + i + 1, &kRaisedLimit, sizeof(kRaisedLimit));
++      mprotect(page_ptr, page_end - page, PROT_READ | PROT_EXEC);
++      ++patched;
++    }
++  }
++  std::fclose(maps);
++  std::cout << "  [runtime] libroblox 240 FPS clamps raised: " << patched
++            << '\n'
++            << std::flush;
++}
++
+ extern "C" void mocktail_before_soinfo_constructors(const char* realpath,
+                                                     uintptr_t base) {
+   if (realpath == nullptr || std::strstr(realpath, "libroblox.so") == nullptr ||
+@@ -5734,6 +5801,7 @@ int mocktail::legacy::Run(const runtime::CommandLineOptions& options,
+     return EXIT_FAILURE;
+   }
+ 
++  RaiseLibRobloxFrameRateClamps();
+   PrintStage(5, "Invoking JNI_OnLoad in libroblox.so");
+ 
+   auto* jni_onload =
+diff --git a/src/libc_shim/libc_shim.cc b/src/libc_shim/libc_shim.cc
+index eca2018..d34f1c1 100644
+--- a/src/libc_shim/libc_shim.cc
++++ b/src/libc_shim/libc_shim.cc
+@@ -1,4 +1,5 @@
+ #include "libc_shim/libc_shim.h"
++#include "libc_shim/host_cursor_textures.h"
+ 
+ #include <array>
+ #include <atomic>
+@@ -200,6 +201,59 @@ HostCaBundleResolution ResolveHostCaBundle() {
+   return {};
+ }
+ 
++std::atomic<bool> g_host_cursor_trace{false};
++std::atomic<int> g_host_cursor_trace_budget{32};
++
++// Logs which cursor textures Roblox actually opens, so a missed path shows up
++// in the session log instead of as a second arrow on screen.
++void TraceHostCursorTexture(const std::string& path, const std::string& host) {
++  if (!g_host_cursor_trace.load(std::memory_order_relaxed) ||
++      path.find("Cursor") == std::string::npos ||
++      g_host_cursor_trace_budget.fetch_sub(1, std::memory_order_relaxed) <=
++          0) {
++    return;
++  }
++  std::fprintf(stderr, "  [libc_shim] host cursor: %s %s\n",
++               host != path ? "blanked" : "opened", path.c_str());
++}
++
++bool WriteTransparentCursorPng(const std::string& path) {
++  FILE* file = std::fopen(path.c_str(), "wb");
++  if (file == nullptr) {
++    return false;
++  }
++  const bool written = std::fwrite(kTransparentCursorPng, 1,
++                                   sizeof(kTransparentCursorPng),
++                                   file) == sizeof(kTransparentCursorPng);
++  return std::fclose(file) == 0 && written;
++}
++
++// MOCKTAIL_HOST_CURSOR hides Roblox's software-rendered arrow so the window
++// layer can show the desktop's hardware cursor instead, which the compositor
++// moves at scanout without waiting for a rendered game frame.
++bool ConfigureHostCursorTextureMappings(const std::string& data_root,
++                                        const std::string& content_root) {
++  if (!IsEnabled("MOCKTAIL_HOST_CURSOR") || content_root.empty()) {
++    return false;
++  }
++  EnsureDirectory(data_root);
++  const std::string blank = data_root + "/mocktail_host_cursor_blank.png";
++  if (!WriteTransparentCursorPng(blank)) {
++    std::cerr << "  [libc_shim] host cursor disabled: cannot write " << blank
++              << '\n';
++    return false;
++  }
++  for (const char* texture : kHostCursorArrowTextures) {
++    RegisterPathMapping(content_root + "/" + texture, blank);
++    RegisterPathMapping(std::string("content/") + texture, blank);
++    RegisterPathMapping(std::string("rbx_bin/assets/content/") + texture,
++                        blank);
++  }
++  g_host_cursor_trace.store(true, std::memory_order_relaxed);
++  std::cout << "  [libc_shim] host cursor: Roblox arrow textures hidden\n";
++  return true;
++}
++
+ HostCaBundleResolution ConfigureHostCaBundlePathMappings() {
+   for (const auto& alias : g_ca_bundle_aliases) g_path_mappings.erase(alias);
+   g_ca_bundle_aliases.assign(kAndroidCaBundlePaths.begin(), kAndroidCaBundlePaths.end());
+@@ -286,6 +340,7 @@ void Install() {
+       RegisterPathMapping("rbx_bin/assets/content", content_root);
+       RegisterPathMapping("rbx_bin/assets", assets_root);
+     }
++    ConfigureHostCursorTextureMappings(data_root, content_root);
+   }
+   RegisterPathMapping("/sdcard/Android/data/com.roblox.client",
+                       data_root + "/sdcard/Android/data/com.roblox.client");
+@@ -309,9 +364,12 @@ std::string TranslatePath(const std::string& android_path) {
+     }
+   }
+   if (best_android_prefix != nullptr && best_host_prefix != nullptr) {
+-    return *best_host_prefix +
+-           android_path.substr(best_android_prefix->size());
++    std::string host_path =
++        *best_host_prefix + android_path.substr(best_android_prefix->size());
++    TraceHostCursorTexture(android_path, host_path);
++    return host_path;
+   }
++  TraceHostCursorTexture(android_path, android_path);
+   return android_path;
+ }
+ 
+@@ -323,6 +381,7 @@ void RegisterPathMapping(const std::string& android_prefix,
+ void ClearPathMappings() {
+   g_path_mappings.clear();
+   g_ca_bundle_aliases.clear();
++  g_host_cursor_trace.store(false, std::memory_order_relaxed);
+ }
+ 
+ }  // namespace libc_shim
+diff --git a/src/window/window.cc b/src/window/window.cc
+index 94ff955..923a589 100644
+--- a/src/window/window.cc
++++ b/src/window/window.cc
+@@ -945,6 +945,20 @@ bool ActivateWindowEventLifecycles() {
+       std::make_unique<SdlPointerCaptureBackend>(g_state.sdl_window);
+   g_pointer_capture_owner = std::make_unique<WindowPointerCaptureOwner>(
+       g_pointer_capture_backend.get());
++  // The libc shim blanks Roblox's arrow textures under the same switch, so
++  // the hardware cursor must stay visible even if the arrow image fails.
++  const char* asset_content = GetEnvNonEmpty("MOCKTAIL_ASSET_PATH");
++  if (IsEnabledEnv("MOCKTAIL_HOST_CURSOR") && asset_content != nullptr) {
++    // Roblox centers the 64x64 cursor texture on the pointer.
++    const std::string arrow =
++        std::string(asset_content) +
++        "/textures/Cursors/KeyboardMouse/ArrowFarCursor.png";
++    const bool image_ok =
++        g_pointer_capture_backend->SetCursorImage(arrow.c_str(), 32, 32);
++    g_pointer_capture_owner->SetHostCursorEnabled(true);
++    fprintf(stderr, "  [input] host hardware cursor enabled (%s)\n",
++            image_ok ? "Roblox arrow" : "system arrow");
++  }
+   fprintf(stderr,
+           "  [input] SDL event pump target=%llu Hz raw-motion, no smoothing\n",
+           static_cast<unsigned long long>(kProductionInputPumpHz));
+@@ -2188,13 +2202,25 @@ bool PumpEvents() {
+ 
+   SDL_Event event;
+   // Pump + PeepEvents drains without SDL_WaitEventTimeoutNS. Unthrottled
+-  // ticks only ingest OS events every 4ms so the leader does not contend
+-  // with the render thread on wl_display thousands of times per second.
+-  constexpr uint64_t kUnthrottledPumpIntervalNs = 4000000ULL;
++  // ticks only ingest OS events every 1ms (MOCKTAIL_INPUT_PUMP_INTERVAL_US)
++  // so the leader does not contend with the render thread on wl_display
++  // thousands of times per second, while pointer motion stays sub-frame.
++  static const uint64_t unthrottled_pump_interval_ns = [] {
++    const char* value = GetEnvNonEmpty("MOCKTAIL_INPUT_PUMP_INTERVAL_US");
++    if (value == nullptr) {
++      return 1000000ULL;
++    }
++    char* end = nullptr;
++    const unsigned long long us = std::strtoull(value, &end, 10);
++    if (end == value || *end != '\0' || us > 16000ULL) {
++      return 1000000ULL;
++    }
++    return static_cast<uint64_t>(us) * 1000ULL;
++  }();
+   static uint64_t last_os_pump_ns = 0;
+   const uint64_t now_ns = SDL_GetTicksNS();
+   if (!UnthrottledPresentationRequested() || last_os_pump_ns == 0 ||
+-      now_ns - last_os_pump_ns >= kUnthrottledPumpIntervalNs) {
++      now_ns - last_os_pump_ns >= unthrottled_pump_interval_ns) {
+     SDL_PumpEvents();
+     last_os_pump_ns = now_ns;
+   }
+diff --git a/src/window/window_pointer_capture_owner.cc b/src/window/window_pointer_capture_owner.cc
+index 58a5d14..0e3e19c 100644
+--- a/src/window/window_pointer_capture_owner.cc
++++ b/src/window/window_pointer_capture_owner.cc
+@@ -1,6 +1,7 @@
+ #include "window/window_pointer_capture_owner.h"
+ 
+ #include <SDL3/SDL_mouse.h>
++#include <SDL3/SDL_surface.h>
+ #include <SDL3/SDL_video.h>
+ 
+ #include <cstdio>
+@@ -102,8 +103,10 @@ bool WindowPointerCaptureOwner::Pump(bool text_input_active) {
+   const bool capture_requested =
+       native_capture_active || (right_drag_active && !text_input_active);
+   // When capture is released, Roblox still draws its own cursor.
+-  // Show the system pointer only when the native client cannot provide one.
+-  const bool cursor_visible = !client_active && !capture_requested;
++  // Show the system pointer only when the native client cannot provide one,
++  // unless host cursor mode replaced Roblox's software arrow.
++  const bool cursor_visible =
++      (!client_active || host_cursor_enabled_) && !capture_requested;
+   return Apply(capture_requested, cursor_visible);
+ }
+ 
+@@ -221,5 +224,40 @@ bool SdlPointerCaptureBackend::Apply(bool relative_mode, bool cursor_visible) {
+   return cursor_visible ? SDL_ShowCursor() : SDL_HideCursor();
+ }
+ 
++SdlPointerCaptureBackend::~SdlPointerCaptureBackend() {
++  if (cursor_ != nullptr) {
++    SDL_DestroyCursor(static_cast<SDL_Cursor*>(cursor_));
++  }
++}
++
++bool SdlPointerCaptureBackend::SetCursorImage(const char* png_path, int hot_x,
++                                              int hot_y) {
++  if (png_path == nullptr || png_path[0] == '\0') {
++    return false;
++  }
++  SDL_Surface* surface = SDL_LoadPNG(png_path);
++  if (surface == nullptr) {
++    std::fprintf(stderr, "  [input] host cursor image %s unavailable: %s\n",
++                 png_path, SDL_GetError());
++    return false;
++  }
++  SDL_Cursor* cursor = SDL_CreateColorCursor(surface, hot_x, hot_y);
++  SDL_DestroySurface(surface);
++  if (cursor == nullptr) {
++    std::fprintf(stderr, "  [input] host cursor creation failed: %s\n",
++                 SDL_GetError());
++    return false;
++  }
++  if (!SDL_SetCursor(cursor)) {
++    SDL_DestroyCursor(cursor);
++    return false;
++  }
++  if (cursor_ != nullptr) {
++    SDL_DestroyCursor(static_cast<SDL_Cursor*>(cursor_));
++  }
++  cursor_ = cursor;
++  return true;
++}
++
+ }  // namespace window
+ }  // namespace mocktail
+diff --git a/src/window/window_pointer_capture_owner.h b/src/window/window_pointer_capture_owner.h
+index 2d90bf0..be0d878 100644
+--- a/src/window/window_pointer_capture_owner.h
++++ b/src/window/window_pointer_capture_owner.h
+@@ -46,6 +46,11 @@ class WindowPointerCaptureOwner final {
+   bool OnFocusGained(bool text_input_active);
+   bool OnFocusLost();
+   bool Shutdown();
++  // Host cursor mode keeps the desktop (hardware) cursor visible whenever the
++  // pointer is not captured. The backend must have replaced Roblox's arrow
++  // textures, otherwise both cursors are drawn.
++  void SetHostCursorEnabled(bool enabled) { host_cursor_enabled_ = enabled; }
++  bool host_cursor_enabled() const { return host_cursor_enabled_; }
+ 
+   bool captured() const { return captured_; }
+   bool cursor_visible() const { return cursor_visible_; }
+@@ -69,16 +74,23 @@ class WindowPointerCaptureOwner final {
+   bool discard_next_motion_after_right_drag_ = false;
+   bool captured_ = false;
+   bool cursor_visible_ = true;
++  bool host_cursor_enabled_ = false;
+ };
+ 
+ class SdlPointerCaptureBackend final : public PointerCaptureBackend {
+  public:
+   explicit SdlPointerCaptureBackend(void* window) : window_(window) {}
+ 
++  ~SdlPointerCaptureBackend() override;
++
+   bool Apply(bool relative_mode, bool cursor_visible) override;
++  // Installs a color cursor from a PNG with the given hotspot. Returns false
++  // and leaves the default cursor when the image cannot be loaded.
++  bool SetCursorImage(const char* png_path, int hot_x, int hot_y);
+ 
+  private:
+   void* window_ = nullptr;
++  void* cursor_ = nullptr;
+   float capture_anchor_x_ = 0.0f;
+   float capture_anchor_y_ = 0.0f;
+   bool relative_mode_ = false;
+diff --git a/stubs/libandroid_stub.cc b/stubs/libandroid_stub.cc
+index d5f41d3..cfcc3d9 100644
+--- a/stubs/libandroid_stub.cc
++++ b/stubs/libandroid_stub.cc
+@@ -4,6 +4,7 @@
+ // Symbols sourced from Android NDK r28 android/native_activity.h,
+ // android/asset_manager.h, android/looper.h, android/configuration.h.
+ 
++#include "libc_shim/host_cursor_textures.h"
+ #include "libc_shim/vulkan_etc1_sky_transcoder.h"
+ 
+ #include <dlfcn.h>
+@@ -26,6 +27,7 @@
+ #include <cstdlib>
+ #include <cstring>
+ #include <deque>
++#include <iterator>
+ #include <limits>
+ #include <mutex>
+ #include <new>
+@@ -310,6 +312,11 @@ int MocktailWindowHeight() {
+   return fn != nullptr ? fn() : 720;
+ }
+ 
++bool HostCursorRequested() {
++  const char* value = GetEnvNonEmpty("MOCKTAIL_HOST_CURSOR");
++  return value != nullptr && value[0] != '0';
++}
++
+ bool MocktailUsesDirectVulkan() {
+   using Fn = bool (*)();
+   static Fn cached_fn = nullptr;
+@@ -330,6 +337,17 @@ AAsset* AAssetManager_open(AAssetManager* mgr, const char* filename,
+   if (mgr == nullptr) {
+     return nullptr;
+   }
++  if (filename != nullptr && HostCursorRequested() &&
++      libc_shim::IsHostCursorArrowTexture(
++          StripAndroidAssetPrefix(StripAssetUriPrefix(filename)))) {
++    // The window layer shows the desktop's hardware cursor instead.
++    auto* asset = new AAsset;
++    asset->path = filename;
++    asset->data.assign(std::begin(libc_shim::kTransparentCursorPng),
++                       std::end(libc_shim::kTransparentCursorPng));
++    std::fprintf(stderr, "  [asset] host cursor: blanked %s\n", filename);
++    return asset;
++  }
+   std::string path = ResolveAssetPath(filename);
+   if (path.empty()) {
+     return nullptr;
+diff --git a/tests/asset_manager_test.cc b/tests/asset_manager_test.cc
+index 1cad3a8..38e251d 100644
+--- a/tests/asset_manager_test.cc
++++ b/tests/asset_manager_test.cc
+@@ -1,3 +1,4 @@
++#include "libc_shim/host_cursor_textures.h"
+ #include "libc_shim/vulkan_etc1_sky_transcoder.h"
+ 
+ #include <array>
+@@ -298,4 +299,35 @@ TEST_F(AssetManagerTest, CacheSeparatesRuntimeAssetRootChanges) {
+   AAsset_close(second);
+ }
+ 
++TEST_F(AssetManagerTest, HostCursorServesTransparentArrowTextures) {
++  AAssetManager* mgr = AAssetManager_fromJava(nullptr, nullptr);
++  ASSERT_NE(mgr, nullptr);
++
++  ASSERT_EQ(setenv("MOCKTAIL_HOST_CURSOR", "1", 1), 0);
++  AAsset* arrow = AAssetManager_open(
++      mgr, "content/textures/Cursors/KeyboardMouse/ArrowFarCursor.png", 0);
++  AAsset* legacy =
++      AAssetManager_open(mgr, "rbxasset://textures/ArrowFarCursor.png", 0);
++  AAsset* ibeam = AAssetManager_open(
++      mgr, "content/textures/Cursors/KeyboardMouse/IBeamCursor.png", 0);
++  ASSERT_EQ(unsetenv("MOCKTAIL_HOST_CURSOR"), 0);
++
++  ASSERT_NE(arrow, nullptr);
++  ASSERT_NE(legacy, nullptr);
++  EXPECT_EQ(ibeam, nullptr);  // not blanked, and absent from this root
++  EXPECT_EQ(AAsset_getLength(arrow),
++            static_cast<off_t>(sizeof(libc_shim::kTransparentCursorPng)));
++  EXPECT_EQ(std::memcmp(AAsset_getBuffer(arrow),
++                        libc_shim::kTransparentCursorPng,
++                        sizeof(libc_shim::kTransparentCursorPng)),
++            0);
++  AAsset_close(arrow);
++  AAsset_close(legacy);
++
++  EXPECT_EQ(AAssetManager_open(
++                mgr, "content/textures/Cursors/KeyboardMouse/ArrowCursor.png",
++                0),
++            nullptr);
++}
++
+ }  // namespace
+diff --git a/tests/libc_shim_test.cc b/tests/libc_shim_test.cc
+index 4c25191..96d1da1 100644
+--- a/tests/libc_shim_test.cc
++++ b/tests/libc_shim_test.cc
+@@ -85,6 +85,36 @@ TEST_F(LibcShimTest, TranslatesRelativeRobloxAssetPrefixes) {
+             "/payload/assets/shaders/mobile.pack");
+ }
+ 
++TEST_F(LibcShimTest, HostCursorHidesOnlyRobloxArrowTextures) {
++  char data_root[] = "/tmp/mocktail-host-cursor-XXXXXX";
++  ASSERT_NE(mkdtemp(data_root), nullptr);
++  const std::string blank = std::string(data_root) +
++                            "/mocktail_host_cursor_blank.png";
++
++  ASSERT_EQ(unsetenv("MOCKTAIL_HOST_CURSOR"), 0);
++  EXPECT_FALSE(ConfigureHostCursorTextureMappings(data_root, "/payload/c"));
++
++  ASSERT_EQ(setenv("MOCKTAIL_HOST_CURSOR", "1", 1), 0);
++  EXPECT_TRUE(ConfigureHostCursorTextureMappings(data_root, "/payload/c"));
++  ASSERT_EQ(unsetenv("MOCKTAIL_HOST_CURSOR"), 0);
++
++  EXPECT_EQ(TranslatePath(
++                "/payload/c/textures/Cursors/KeyboardMouse/ArrowFarCursor.png"),
++            blank);
++  EXPECT_EQ(TranslatePath(
++                "content/textures/Cursors/KeyboardMouse/ArrowCursor.png"),
++            blank);
++  EXPECT_EQ(TranslatePath("/payload/c/textures/ArrowFarCursor.png"), blank);
++  EXPECT_EQ(TranslatePath("/payload/c/textures/Cursors/KeyboardMouse/"
++                          "IBeamCursor.png"),
++            "/payload/c/textures/Cursors/KeyboardMouse/IBeamCursor.png");
++  struct stat info {};
++  ASSERT_EQ(stat(blank.c_str(), &info), 0);
++  EXPECT_GT(info.st_size, 0);
++  unlink(blank.c_str());
++  rmdir(data_root);
++}
++
+ TEST_F(LibcShimTest, EmptyPathIsReturnedUnchanged) {
+   EXPECT_EQ(TranslatePath(""), "");
+ }
+diff --git a/tests/window_pointer_capture_owner_test.cc b/tests/window_pointer_capture_owner_test.cc
+index 1fa40e6..29ad848 100644
+--- a/tests/window_pointer_capture_owner_test.cc
++++ b/tests/window_pointer_capture_owner_test.cc
+@@ -287,6 +287,35 @@ TEST(WindowPointerCaptureOwnerTest, FocusGainHidesTheSystemCursorImmediately) {
+   EXPECT_FALSE(owner.cursor_visible());
+ }
+ 
++// Host cursor mode blanks Roblox's arrow, so the hardware cursor stays visible
++// while the pointer is free and hides only for relative capture.
++TEST(WindowPointerCaptureOwnerTest, HostCursorStaysVisibleUntilCaptured) {
++  FakeBackend backend;
++  QueryState query{true, false};
++  WindowPointerCaptureOwner owner(&backend);
++  owner.SetHostCursorEnabled(true);
++  ASSERT_TRUE(owner.RegisterQuery(Query, &query));
++
++  EXPECT_TRUE(owner.Pump(false));
++  EXPECT_FALSE(owner.captured());
++  EXPECT_TRUE(owner.cursor_visible());
++
++  query.locked_center = true;
++  EXPECT_TRUE(owner.Pump(false));
++  EXPECT_TRUE(owner.captured());
++  EXPECT_FALSE(owner.cursor_visible());
++
++  query.locked_center = false;
++  EXPECT_TRUE(owner.Pump(false));
++  EXPECT_TRUE(owner.OnRightButton(true, false));
++  EXPECT_TRUE(owner.captured());
++  EXPECT_FALSE(owner.cursor_visible());
++
++  EXPECT_TRUE(owner.OnRightButton(false, false));
++  EXPECT_FALSE(owner.captured());
++  EXPECT_TRUE(owner.cursor_visible());
++}
++
+ TEST(WindowPointerCaptureOwnerTest, TextInputWithoutNativeCursorShowsSystemCursor) {
+   FakeBackend backend;
+   QueryState query{false, false};

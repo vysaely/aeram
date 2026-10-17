@@ -5,6 +5,7 @@ identifying versions, validating configurations, checking companion helpers,
 and providing safe, idempotent setup/rollback workflows.
 """
 
+import mmap
 import os
 import shutil
 import json
@@ -19,6 +20,32 @@ log = logging.getLogger("MocktailManager")
 
 FLATPAK_APP_ID = "space.bigrat.mocktail"
 RELEASES_URL = "https://github.com/komaruworld/mocktail/releases"
+# Written by scripts/build_mocktail.sh next to the AERAM-patched build.
+AERAM_PATCH_MARKER_NAME = "aeram-mocktail-patch"
+# Present only in Mocktail builds carrying AERAM's input-latency patch.
+_LATENCY_PATCH_SIGNATURE = b"MOCKTAIL_HOST_CURSOR"
+_latency_patch_cache: dict = {}
+
+
+def binary_has_latency_patch(path: Optional[Path]) -> bool:
+    """True when the Mocktail ELF understands MOCKTAIL_HOST_CURSOR (cached per inode/mtime)."""
+    if path is None:
+        return False
+    try:
+        st = path.stat()
+    except OSError:
+        return False
+    key = (str(path), st.st_ino, st.st_mtime_ns, st.st_size)
+    cached = _latency_patch_cache.get(key)
+    if cached is None:
+        try:
+            with open(path, "rb") as f, mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ) as mm:
+                cached = mm.find(_LATENCY_PATCH_SIGNATURE) != -1
+        except (OSError, ValueError):
+            cached = False
+        _latency_patch_cache[key] = cached
+    return cached
+
 
 
 def _distro_family(os_release: Path = Path("/etc/os-release")) -> str:
@@ -59,6 +86,7 @@ class MocktailInstallationInfo:
     vulkan_available: bool = False
     opengl_available: bool = True
     issues: List[str] = None
+    latency_patched: bool = False
 
     def __post_init__(self):
         if self.issues is None:
@@ -133,12 +161,20 @@ class MocktailManager:
             vulkan_available=vulkan_avail,
             opengl_available=True,
             issues=issues,
+            latency_patched=binary_has_latency_patch(real_bin),
         )
 
     def _resolve_executable(self) -> Optional[Path]:
         """Resolves the mocktail executable path with strict fallback priority."""
         if self.custom_bin_path and Path(self.custom_bin_path).exists():
             return Path(self.custom_bin_path)
+
+        # An AERAM-patched build (scripts/build_mocktail.sh) wins over a system package on PATH
+        local = Path.home() / ".local"
+        patched_bin = local / "bin" / "mocktail"
+        if (local / "lib" / "mocktail" / AERAM_PATCH_MARKER_NAME).exists() \
+                and patched_bin.exists() and os.access(patched_bin, os.X_OK):
+            return patched_bin
 
         # Check PATH first
         in_path = shutil.which("mocktail")

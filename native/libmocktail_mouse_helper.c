@@ -202,6 +202,9 @@ static int dbg_checked = 0;
 // =============================================================================
 // Framerate Uncapping (Eliminates hardcoded 240 FPS ceilings in Mocktail & libroblox.so)
 // =============================================================================
+// Returns true once libroblox.so has been mapped and scanned. The scan result
+// is final either way: a Mocktail build that already raised the clamps leaves
+// no patterns behind, and rescanning ~100 MB of text every frame would stall.
 static bool unclamp_process_framerate(void) {
     FILE *f = fopen("/proc/self/maps", "r");
     if (!f) return false;
@@ -209,6 +212,8 @@ static bool unclamp_process_framerate(void) {
     char line[512];
     static bool mocktail_patched = false;
     static bool libroblox_patched = false;
+    bool libroblox_seen = false;
+    int patches_applied = 0;
 
     // Pattern 1 in libroblox.so (GetTaskSchedulerTargetFps & RenderScheduler clamps):
     // mov ecx, 240; cmp eax, ecx; cmovl ecx, eax -> b9 f0 00 00 00 39 c8 0f 4c c8
@@ -258,7 +263,7 @@ static bool unclamp_process_framerate(void) {
         }
 
         if (is_roblox && strchr(perms, 'x')) {
-            int patches_applied = 0;
+            libroblox_seen = true;
             for (size_t i = 0; i + 10 <= len; i++) {
                 if (memcmp(mem + i, pat_roblox1, sizeof(pat_roblox1)) == 0 ||
                     memcmp(mem + i, pat_roblox2, sizeof(pat_roblox2)) == 0) {
@@ -274,13 +279,25 @@ static bool unclamp_process_framerate(void) {
                     fprintf(stderr, "[AERAM-FPS] Unlocked libroblox.so 240 FPS clamp #%d at %p to %u FPS\n", patches_applied, (void *)(mem + i), uncapped_limit);
                 }
             }
-            if (patches_applied >= 4) {
-                libroblox_patched = true;
-            }
         }
     }
     fclose(f);
+    if (libroblox_seen) {
+        libroblox_patched = true;
+    }
     return libroblox_patched;
+}
+
+// Called from both the GL swap hook and the event pump hook, so the Vulkan
+// backend (which never calls SDL_GL_SwapWindow) is unclamped too.
+static void maybe_unclamp_framerate(void) {
+    static bool done = false;
+    static uint64_t last_attempt_ms = 0;
+    if (done) return;
+    uint64_t now_ms = get_time_ms();
+    if (last_attempt_ms != 0 && now_ms - last_attempt_ms < 250) return;
+    last_attempt_ms = now_ms;
+    done = unclamp_process_framerate();
 }
 
 __attribute__((constructor))
@@ -667,10 +684,7 @@ bool SDL_GL_SwapWindow(SDL_Window *window) {
         }
     }
 
-    static bool libroblox_unclamped = false;
-    if (!libroblox_unclamped) {
-        libroblox_unclamped = unclamp_process_framerate();
-    }
+    maybe_unclamp_framerate();
 
     // Composite overlay directly into the current OpenGL backbuffer
     render_text_overlay(window);
@@ -714,6 +728,7 @@ bool SDL_GL_SwapWindow(SDL_Window *window) {
 
 int SDL_PeepEvents(SDL_Event *events, int numevents, SDL_EventAction action, Uint32 minType, Uint32 maxType) {
     init_symbols();
+    maybe_unclamp_framerate();
     int count = real_SDL_PeepEvents ? real_SDL_PeepEvents(events, numevents, action, minType, maxType) : 0;
     if (events && count > 0 && (action == SDL_GETEVENT || action == SDL_PEEKEVENT)) {
         for (int i = 0; i < count; i++) {

@@ -11,10 +11,15 @@ PREFIX="${HOME}/.local"
 
 # Parse CLI arguments
 UNINSTALL=false
+WITH_MOCKTAIL=false
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --uninstall|-u)
             UNINSTALL=true
+            shift
+            ;;
+        --with-mocktail)
+            WITH_MOCKTAIL=true
             shift
             ;;
         --prefix|-p)
@@ -26,6 +31,8 @@ while [[ $# -gt 0 ]]; do
             echo ""
             echo "Options:"
             echo "  --prefix <path>   Installation prefix (default: ~/.local)"
+            echo "  --with-mocktail   Build and install Mocktail with AERAM's input-latency patch"
+            echo "                    (hardware cursor, 1 ms input polling, no 240 FPS cap)"
             echo "  --uninstall, -u   Remove AERAM desktop entries and launcher shortcuts"
             echo "  --help, -h        Show this help message"
             exit 0
@@ -150,13 +157,13 @@ from core.mocktail_manager import MocktailManager
 mgr = MocktailManager()
 info = mgr.detect()
 if info.is_installed:
-    print(f'INSTALLED|{info.bin_path}|{info.version_name or info.payload_id or \"unknown\"}')
+    print(f'INSTALLED|{info.bin_path}|{info.version_name or info.payload_id or \"unknown\"}|{int(info.latency_patched)}')
 else:
     print('MISSING')
 " 2>/dev/null || echo "MISSING")
 
 if [[ "${MOCKTAIL_INFO}" == INSTALLED* ]]; then
-    IFS='|' read -r _ M_PATH M_VER <<< "${MOCKTAIL_INFO}"
+    IFS='|' read -r _ M_PATH M_VER M_PATCHED <<< "${MOCKTAIL_INFO}"
     echo "  [✓] Mocktail detected: ${M_PATH} (Version: ${M_VER})"
 else
     echo "  [!] Mocktail binary not found on PATH or standard locations."
@@ -167,6 +174,15 @@ sys.path.insert(0, '${SCRIPT_DIR}')
 from core.mocktail_manager import MocktailManager
 print(MocktailManager().get_installation_instructions())
 " 2>/dev/null | sed 's/^/      /'
+fi
+
+if [ "${WITH_MOCKTAIL}" = true ]; then
+    echo "[3b] Building AERAM-patched Mocktail..."
+    if ! "${SCRIPT_DIR}/scripts/build_mocktail.sh"; then
+        echo "  [!] Patched Mocktail was not installed; AERAM keeps using the Mocktail found above."
+    fi
+elif [[ "${MOCKTAIL_INFO}" == INSTALLED* ]] && [ "${M_PATCHED:-0}" != "1" ]; then
+    echo "  [i] For a cursor that keeps up with the mouse, rerun with --with-mocktail."
 fi
 
 # 4. Native companion helper compilation
