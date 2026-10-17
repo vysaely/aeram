@@ -382,6 +382,79 @@ class TestGUI(unittest.TestCase):
 
         dlg.close()
 
+    def test_web_login_2fa_auto_watcher_challenge_discrimination(self):
+        """Verify WebLoginDialog 2FA watcher accurately discriminates Authenticator vs Email/Phone."""
+        from ui.web_login_dialog import WebLoginDialog
+        from unittest.mock import MagicMock
+
+        acc = RobloxAccount(
+            account_id="acc_2fa_discrim",
+            username="TwoFactorHero",
+            display_name="TwoFactorHero",
+            user_id=9999,
+            cookie="",
+            totp_secret="JBSWY3DPEHPK3PXP",
+        )
+        dlg = WebLoginDialog(
+            storage=self.storage,
+            api=self.api,
+            target_account=acc,
+            mode="login",
+        )
+        try:
+            # Start watcher
+            dlg._start_2fa_auto_watcher()
+            self.assertIsNotNone(dlg._2fa_watcher_timer)
+            self.assertTrue(dlg._2fa_watcher_timer.isActive())
+
+            # Simulate JS check execution and callback capture
+            captured_cb = []
+            mock_page = MagicMock()
+            def fake_run_js(script, callback):
+                captured_cb.append((script, callback))
+            mock_page.runJavaScript = fake_run_js
+            dlg.view.page = MagicMock(return_value=mock_page)
+
+            dlg._check_and_inject_2fa()
+            self.assertEqual(len(captured_cb), 1)
+            js_script, cb = captured_cb[0]
+
+            # Verify JS script contains modal scoping, login form bypass, and isAuthApp priority
+            self.assertIn("find2FAChallenge", js_script)
+            self.assertIn("login-password", js_script)
+            self.assertIn("isAuthApp", js_script)
+            self.assertIn("already been used", js_script)
+
+            # Test Authenticator App detection
+            cb({"status": "injected"})
+            self.assertIn("Authenticator 2FA detected", dlg.status_label.text())
+
+            # Test Code Rejected (already used / expired): tracks rejected code and displays countdown
+            cb({"status": "code_rejected", "code": "123456"})
+            self.assertIn("123456", dlg._2fa_rejected_codes)
+            self.assertIn("already used", dlg.status_label.text())
+
+            # Test Email Challenge detection: status label must inform user, BUT watcher must NOT stop
+            cb({"status": "email_challenge"})
+            self.assertIn("Email verification code detected", dlg.status_label.text())
+            self.assertTrue(dlg._2fa_watcher_timer.isActive(), "Watcher timer must remain active during email challenge so switching to Authenticator works")
+
+            # Test Phone Challenge detection
+            cb({"status": "phone_challenge"})
+            self.assertIn("SMS / Phone verification code detected", dlg.status_label.text())
+            self.assertTrue(dlg._2fa_watcher_timer.isActive())
+
+            # Test Already Injected status
+            cb({"status": "already_injected"})
+            self.assertIn("Submitting verification", dlg.status_label.text())
+
+            # Test Protect Account screen stops timer
+            cb({"status": "protect_account"})
+            self.assertFalse(dlg._2fa_watcher_timer.isActive())
+            self.assertIn("Account security screen", dlg.status_label.text())
+        finally:
+            dlg.close()
+
     def test_multi_launch_worker_lifecycle(self):
         from ui.main_window import MultiLaunchWorker
         from unittest.mock import MagicMock

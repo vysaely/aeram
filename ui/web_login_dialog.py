@@ -366,6 +366,8 @@ class WebLoginDialog(BorderlessDialog):
         self._pw_timer: Optional[QTimer] = None
         self._2fa_watcher_timer: Optional[QTimer] = None
         self._2fa_attempts: int = 0
+        self._2fa_rejected_codes: set = set()
+        self._2fa_submitted_code: str = ""
         self._is_verifying: bool = False
         self._is_saved: bool = False
 
@@ -977,6 +979,8 @@ class WebLoginDialog(BorderlessDialog):
         self._2fa_watcher_timer = QTimer(self)
         self._2fa_watcher_timer.setInterval(800)
         self._2fa_attempts = 0
+        self._2fa_rejected_codes = set()
+        self._2fa_submitted_code = ""
         self._2fa_watcher_timer.timeout.connect(self._check_and_inject_2fa)
         self._2fa_watcher_timer.start()
 
@@ -991,109 +995,282 @@ class WebLoginDialog(BorderlessDialog):
             return
 
         self._2fa_attempts = getattr(self, "_2fa_attempts", 0) + 1
-        if self._2fa_attempts > 60:  # Timeout after 48s
+        if self._2fa_attempts > 75:  # Timeout after ~60s
             if hasattr(self, "_2fa_watcher_timer") and self._2fa_watcher_timer:
                 self._2fa_watcher_timer.stop()
             return
 
-        from core.totp import generate_totp
+        from core.totp import generate_totp, get_totp_remaining_seconds
         code = generate_totp(self.target_account.totp_secret)
         if not code:
+            return
+
+        # If this exact code was already rejected or used, wait for the next 30-second TOTP rotation
+        if code in getattr(self, "_2fa_rejected_codes", set()):
+            rem = get_totp_remaining_seconds(30)
+            if hasattr(self, "status_label") and not self._is_verifying:
+                self.status_label.setStyleSheet("color: #ffd700; font-size: 11px; font-weight: bold;")
+                self.status_label.setText(
+                    f"Code {code[:3]} {code[3:]} already used. Waiting for next TOTP rotation ({rem}s remaining)..."
+                )
             return
 
         code_json = json.dumps(code)
         js = """
         (function(code) {
-            var bodyText = (document.body ? (document.body.innerText || document.body.textContent || '') : '').toLowerCase();
+            function find2FAChallenge(doc) {
+                if (!doc) return null;
 
-            // Detect "Protect your account" / Passkey screen and immediately switch to "Create new password"
-            // Detect "Protect your account" / Passkey screen: stop watcher immediately without clicking
-            if (bodyText.indexOf('protect your account') !== -1 || bodyText.indexOf('add a passkey') !== -1 || bodyText.indexOf('new password') !== -1) {
-                return { status: "protect_account" };
+                var selectors = [
+                    'input[placeholder*="6-digit" i]',
+                    'input[placeholder*="code" i]',
+                    'input[inputmode="numeric"]',
+                    'input[name*="code" i]',
+                    'input[name*="twoStep" i]',
+                    'input[type="text"][maxlength="6"]',
+                    'input[type="number"][maxlength="6"]'
+                ];
+
+                for (var s = 0; s < selectors.length; s++) {
+                    var inputs = doc.querySelectorAll(selectors[s]);
+                    for (var i = 0; i < inputs.length; i++) {
+                        var inp = inputs[i];
+                        if (!inp || inp.offsetParent === null) continue;
+                        if (inp.id === 'login-username' || inp.id === 'login-password' ||
+                            inp.name === 'username' || inp.name === 'password' || inp.type === 'password') {
+                            continue;
+                        }
+                        var rect = inp.getBoundingClientRect();
+                        if (rect.width <= 0 || rect.height <= 0) continue;
+
+                        // Check modal/dialog container around input
+                        var modal = inp.closest('[role="dialog"], .modal-dialog, .modal-content, [class*="modal" i], .two-step-verification, [class*="two-step" i], [class*="challenge" i], [class*="verification" i]') || inp.parentElement;
+                        var modalText = (modal ? (modal.innerText || modal.textContent || '') : '').toLowerCase();
+                        var placeholder = (inp.getAttribute('placeholder') || '').toLowerCase();
+
+                        // Must explicitly indicate a 2-step or security challenge
+                        var is2FA = (
+                            placeholder.indexOf('6-digit') !== -1 ||
+                            modalText.indexOf('2-step') !== -1 ||
+                            modalText.indexOf('two-step') !== -1 ||
+                            modalText.indexOf('authenticator') !== -1 ||
+                            modalText.indexOf('security code') !== -1 ||
+                            modalText.indexOf('sent to your email') !== -1 ||
+                            modalText.indexOf('sent an email') !== -1 ||
+                            modalText.indexOf('sent a code') !== -1
+                        );
+
+                        // Must not be the main login box
+                        if (modalText.indexOf('login to roblox') !== -1 && modalText.indexOf('2-step') === -1 && modalText.indexOf('authenticator') === -1) {
+                            continue;
+                        }
+
+                        if (is2FA) {
+                            return { inp: inp, modal: modal || doc.body, modalText: modalText, doc: doc };
+                        }
+                    }
+                }
+
+                var iframes = doc.querySelectorAll('iframe');
+                for (var f = 0; f < iframes.length; f++) {
+                    try {
+                        var subDoc = iframes[f].contentDocument || (iframes[f].contentWindow && iframes[f].contentWindow.document);
+                        var found = find2FAChallenge(subDoc);
+                        if (found) return found;
+                    } catch(e) {}
+                }
+                return null;
             }
 
-            // Detect Email Verification / Account Recovery challenges
-            var isEmail = (
-                bodyText.indexOf('email') !== -1 ||
-                bodyText.indexOf('sent a 6-digit') !== -1 ||
-                bodyText.indexOf('account recovery') !== -1 ||
-                bodyText.indexOf('including spam') !== -1 ||
-                bodyText.indexOf('resend code') !== -1 ||
-                bodyText.indexOf('check your inbox') !== -1 ||
-                bodyText.indexOf('verify your email') !== -1 ||
-                bodyText.indexOf('sent an email') !== -1 ||
-                bodyText.indexOf('folders, including') !== -1
+            var challenge = find2FAChallenge(document);
+            if (!challenge) {
+                var bodyText = (document.body ? (document.body.innerText || document.body.textContent || '') : '').toLowerCase();
+                if (bodyText.indexOf('protect your account') !== -1 || bodyText.indexOf('add a passkey') !== -1 || bodyText.indexOf('new password') !== -1) {
+                    return { status: "protect_account" };
+                }
+                return { status: "none" };
+            }
+
+            var inp = challenge.inp;
+            var modal = challenge.modal;
+            var modalText = challenge.modalText;
+            var doc = challenge.doc;
+
+            // 4. Detect rejected/used code errors displayed by Roblox
+            var isCodeUsedOrInvalid = (
+                modalText.indexOf('already been used') !== -1 ||
+                modalText.indexOf('enter a new code') !== -1 ||
+                modalText.indexOf('invalid code') !== -1 ||
+                modalText.indexOf('incorrect code') !== -1 ||
+                modalText.indexOf('code has expired') !== -1
+            );
+            if (isCodeUsedOrInvalid) {
+                try {
+                    var desc = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value');
+                    if (desc && desc.set) desc.set.call(inp, '');
+                    else inp.value = '';
+                } catch(e) { inp.value = ''; }
+                inp.dispatchEvent(new Event('input', { bubbles: true }));
+                return { status: "code_rejected", code: code };
+            }
+
+            // 5. Challenge type discrimination
+            var isAuthApp = (
+                modalText.indexOf('authenticator') !== -1 ||
+                modalText.indexOf('totp') !== -1
             );
 
-            // Detect SMS / Phone challenges
-            var isPhone = (
-                bodyText.indexOf('phone') !== -1 ||
-                bodyText.indexOf('sms') !== -1 ||
-                bodyText.indexOf('text message') !== -1 ||
-                bodyText.indexOf('sent a code to your phone') !== -1
+            var isEmail = !isAuthApp && (
+                modalText.indexOf('sent to your email') !== -1 ||
+                modalText.indexOf('sent an email') !== -1 ||
+                modalText.indexOf('sent you an email') !== -1 ||
+                modalText.indexOf('code sent to your email') !== -1 ||
+                modalText.indexOf('check your inbox') !== -1 ||
+                modalText.indexOf('verify your email') !== -1 ||
+                modalText.indexOf('sent a 6-digit code to your email') !== -1
+            );
+
+            var isPhone = !isAuthApp && !isEmail && (
+                modalText.indexOf('sent a code to your phone') !== -1 ||
+                modalText.indexOf('sent to your phone') !== -1 ||
+                modalText.indexOf('sent a text message') !== -1 ||
+                modalText.indexOf('code sent via sms') !== -1
             );
 
             if (isEmail) {
-                // Clear any mistakenly injected TOTP code so the user doesn't get stuck with 'Invalid code'
-                var inputs = document.querySelectorAll('input[placeholder*="6-digit" i], input[placeholder*="code" i], input[inputmode="numeric"]');
-                for (var i = 0; i < inputs.length; i++) {
-                    if (inputs[i].value === code) {
-                        try {
-                            var desc = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value');
-                            if (desc && desc.set) desc.set.call(inputs[i], '');
-                            else inputs[i].value = '';
-                        } catch(e) { inputs[i].value = ''; }
-                        inputs[i].dispatchEvent(new Event('input', { bubbles: true }));
-                    }
+                if (inp.value === code) {
+                    try {
+                        var d = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value');
+                        if (d && d.set) d.set.call(inp, '');
+                        else inp.value = '';
+                    } catch(e) { inp.value = ''; }
+                    inp.dispatchEvent(new Event('input', { bubbles: true }));
                 }
                 return { status: "email_challenge" };
             }
 
             if (isPhone) {
+                if (inp.value === code) {
+                    try {
+                        var d = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value');
+                        if (d && d.set) d.set.call(inp, '');
+                        else inp.value = '';
+                    } catch(e) { inp.value = ''; }
+                    inp.dispatchEvent(new Event('input', { bubbles: true }));
+                }
                 return { status: "phone_challenge" };
             }
 
-            // Only inject TOTP if this challenge explicitly refers to an Authenticator app, or general 2-step prompt without email/phone
-            var isAuthApp = (
-                bodyText.indexOf('authenticator') !== -1 ||
-                ((bodyText.indexOf('two-step') !== -1 || bodyText.indexOf('2-step') !== -1 || bodyText.indexOf('security code') !== -1) && !isEmail && !isPhone)
-            );
+            if (!isAuthApp) {
+                isAuthApp = (
+                    modalText.indexOf('two-step') !== -1 ||
+                    modalText.indexOf('2-step') !== -1 ||
+                    modalText.indexOf('security code') !== -1
+                );
+            }
+
             if (!isAuthApp) {
                 return { status: "none" };
             }
 
-            var selectors = [
-                'input[placeholder*="6-digit" i]',
-                'input[placeholder*="code" i]',
-                'input[inputmode="numeric"]',
-                'input[name*="code" i]',
-                'input[name*="twoStep" i]',
-                'input[type="text"][maxlength="6"]',
-                'input[type="number"][maxlength="6"]'
-            ];
-            for (var s = 0; s < selectors.length; s++) {
-                var inputs = document.querySelectorAll(selectors[s]);
-                for (var i = 0; i < inputs.length; i++) {
-                    var inp = inputs[i];
-                    if (inp && inp.offsetParent !== null && inp.value !== code) {
-                        try {
-                            var descriptor = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value');
-                            if (descriptor && descriptor.set) {
-                                descriptor.set.call(inp, code);
-                            } else {
-                                inp.value = code;
-                            }
-                        } catch(err) {
-                            inp.value = code;
-                        }
-                        inp.dispatchEvent(new Event('input', { bubbles: true }));
-                        inp.dispatchEvent(new Event('change', { bubbles: true }));
-                        // Do NOT auto-click buttons: let user click or let React auto-verify on 6th digit
-                        return { status: "injected" };
+            // 6. Find and click Verify button with full synthetic mouse/pointer event chain
+            function findVerifyButtons() {
+                var root = inp.closest('[role="dialog"], .modal-dialog, .modal-content, [class*="modal" i]') || modal || document;
+                var btns = root.querySelectorAll('button, input[type="submit"], [role="button"], a');
+                var results = [];
+                for (var b = 0; b < btns.length; b++) {
+                    var btn = btns[b];
+                    if (!btn || btn.offsetParent === null) continue;
+                    var txt = (btn.innerText || btn.textContent || btn.value || '').trim().toLowerCase();
+                    var aria = (btn.getAttribute('aria-label') || '').toLowerCase();
+                    if (txt.indexOf('passkey') !== -1 || aria.indexOf('passkey') !== -1 ||
+                        txt.indexOf('cancel') !== -1 || txt.indexOf('resend') !== -1 ||
+                        txt.indexOf('another') !== -1 || txt.indexOf('help') !== -1 ||
+                        txt.indexOf('close') !== -1 || aria.indexOf('close') !== -1) {
+                        continue;
+                    }
+                    if (txt === 'verify' || aria === 'verify' ||
+                        (txt.indexOf('verify') !== -1 && txt.indexOf('another') === -1 && txt.indexOf('method') === -1) ||
+                        btn.classList.contains('btn-primary-md') || btn.classList.contains('btn-primary')) {
+                        results.push(btn);
                     }
                 }
+                return results;
             }
-            return { status: "none" };
+
+            function triggerVerifyClick(btn) {
+                if (!btn) return;
+                try {
+                    btn.removeAttribute('disabled');
+                    btn.disabled = false;
+                    btn.focus();
+                    var opts = { bubbles: true, cancelable: true, view: window, buttons: 1 };
+                    try { btn.dispatchEvent(new PointerEvent('pointerdown', opts)); } catch(e) {}
+                    try { btn.dispatchEvent(new MouseEvent('mousedown', opts)); } catch(e) {}
+                    try { btn.dispatchEvent(new PointerEvent('pointerup', opts)); } catch(e) {}
+                    try { btn.dispatchEvent(new MouseEvent('mouseup', opts)); } catch(e) {}
+                    try { btn.dispatchEvent(new MouseEvent('click', opts)); } catch(e) {}
+                    btn.click();
+                } catch(e) {}
+            }
+
+            function submit2FA() {
+                // Dispatch Enter on input
+                try {
+                    inp.focus();
+                    var kOpts = { bubbles: true, cancelable: true, key: 'Enter', code: 'Enter', keyCode: 13, which: 13, view: window };
+                    inp.dispatchEvent(new KeyboardEvent('keydown', kOpts));
+                    inp.dispatchEvent(new KeyboardEvent('keypress', kOpts));
+                    inp.dispatchEvent(new KeyboardEvent('keyup', kOpts));
+                    if (inp.form) inp.form.requestSubmit();
+                } catch(e) {}
+
+                // Trigger Verify button clicks
+                var buttons = findVerifyButtons();
+                var clickedAny = false;
+                for (var i = 0; i < buttons.length; i++) {
+                    triggerVerifyClick(buttons[i]);
+                    clickedAny = true;
+                }
+                return clickedAny;
+            }
+
+            // 7. Inject code if not filled
+            if (inp.value !== code) {
+                try {
+                    if (inp._valueTracker) {
+                        inp._valueTracker.setValue('');
+                    }
+                    var descriptor = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value');
+                    if (descriptor && descriptor.set) {
+                        descriptor.set.call(inp, code);
+                    } else {
+                        inp.value = code;
+                    }
+                } catch(err) {
+                    inp.value = code;
+                }
+                inp.dispatchEvent(new Event('input', { bubbles: true }));
+                inp.dispatchEvent(new Event('change', { bubbles: true }));
+
+                // Check "Trust this device" checkbox
+                try {
+                    var cb = modal.querySelector('input[type="checkbox"]');
+                    if (cb && !cb.checked) {
+                        cb.click();
+                    }
+                } catch(e) {}
+
+                // Trigger submission after brief delays
+                setTimeout(submit2FA, 100);
+                setTimeout(submit2FA, 300);
+
+                return { status: "injected" };
+            }
+
+            // Code is already filled: continue submitting until page advances or errors
+            var clicked = submit2FA();
+            return { status: "already_injected", clicked: clicked };
         })(__CODE_JSON__);
         """.replace("__CODE_JSON__", code_json)
         if hasattr(self, "view") and self.view and hasattr(self.view, "page"):
@@ -1101,28 +1278,39 @@ class WebLoginDialog(BorderlessDialog):
                 if not isinstance(res, dict):
                     return
                 status = res.get("status")
-                if status == "protect_account":
+                if status == "code_rejected":
+                    rej_code = res.get("code") or code
+                    self._2fa_rejected_codes.add(rej_code)
+                    from core.totp import get_totp_remaining_seconds
+                    rem = get_totp_remaining_seconds(30)
+                    if hasattr(self, "status_label"):
+                        self.status_label.setStyleSheet("color: #ffd700; font-size: 11px; font-weight: bold;")
+                        self.status_label.setText(
+                            f"Code {rej_code[:3]} {rej_code[3:]} already used. Waiting for next TOTP rotation ({rem}s remaining)..."
+                        )
+                elif status == "protect_account":
                     if hasattr(self, "_2fa_watcher_timer") and self._2fa_watcher_timer:
                         self._2fa_watcher_timer.stop()
                     if hasattr(self, "status_label"):
                         self.status_label.setStyleSheet("color: #cccccc; font-size: 11px;")
                         self.status_label.setText("Account security screen: Please proceed on the page.")
                 elif status == "email_challenge":
-                    if hasattr(self, "_2fa_watcher_timer") and self._2fa_watcher_timer:
-                        self._2fa_watcher_timer.stop()
                     if hasattr(self, "status_label"):
                         self.status_label.setStyleSheet("color: #ffd700; font-size: 11px; font-weight: bold;")
                         self.status_label.setText("Email verification code detected! Please enter the 6-digit code sent to your email.")
                 elif status == "phone_challenge":
-                    if hasattr(self, "_2fa_watcher_timer") and self._2fa_watcher_timer:
-                        self._2fa_watcher_timer.stop()
                     if hasattr(self, "status_label"):
                         self.status_label.setStyleSheet("color: #ffd700; font-size: 11px; font-weight: bold;")
                         self.status_label.setText("SMS / Phone verification code detected! Please enter the code sent to your phone.")
                 elif status == "injected":
+                    self._2fa_submitted_code = code
                     if hasattr(self, "status_label"):
                         self.status_label.setStyleSheet("color: #ffffff; font-size: 11px; font-weight: bold;")
-                        self.status_label.setText(f"Authenticator 2FA detected! Injected code {code[:3]} {code[3:]}.")
+                        self.status_label.setText(f"Authenticator 2FA detected! Injected code {code[:3]} {code[3:]} and submitting...")
+                elif status == "already_injected":
+                    if hasattr(self, "status_label") and not self._is_verifying:
+                        self.status_label.setStyleSheet("color: #ffffff; font-size: 11px; font-weight: bold;")
+                        self.status_label.setText(f"Authenticator code {code[:3]} {code[3:]} entered. Submitting verification...")
             self.view.page().runJavaScript(js, _on_2fa_checked)
 
     def _prompt_and_submit_2fa(self):
@@ -1182,7 +1370,8 @@ class WebLoginDialog(BorderlessDialog):
                                     var txt = (btn.innerText || btn.textContent || btn.value || '').trim().toLowerCase();
                                     var aria = (btn.getAttribute('aria-label') || '').toLowerCase();
                                     if (txt.indexOf('passkey') !== -1 || aria.indexOf('passkey') !== -1 ||
-                                        txt.indexOf('cancel') !== -1 || txt.indexOf('resend') !== -1) {{
+                                        txt.indexOf('cancel') !== -1 || txt.indexOf('resend') !== -1 ||
+                                        txt.indexOf('another') !== -1 || txt.indexOf('help') !== -1) {{
                                         continue;
                                     }}
                                     if (txt === 'verify' || txt === 'submit' || txt === 'continue' || txt === 'ok') {{
