@@ -75,6 +75,8 @@ any are missing. AERAM uses this build automatically, even when a system Mocktai
   alts always rest.
 - **Login checks that finish:** solved verification challenges close their window, and login windows get 5 s to
   open instead of 3 (several instances starting at once often missed the old limit).
+- **Your own shift-lock icon:** Settings → Client Engine & FastFlags → Shift-Lock Cursor. It replaces Roblox's
+  icon in every account and keeps working after Roblox updates (newer Roblox versions no longer ship the file).
 - **Smoother texture loading on NVIDIA:** where the driver cannot read Android's ETC2 textures, Mocktail converts
   them on the CPU; it now reads them from GPU memory about 25x faster and writes them out in parallel.
 

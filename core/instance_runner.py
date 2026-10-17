@@ -492,6 +492,11 @@ class InstanceRunner:
         limit_fps = 10000 if is_unlimited else target_fps
 
         env["MOCKTAIL_GRAPHICS_QUALITY"] = graphics_quality
+        # Custom shift-lock icon, served by AERAM's Mocktail build in place of Roblox's (survives updates)
+        shiftlock_cursor = self.storage.get_setting("shiftlock_cursor_path", "")
+        if isinstance(shiftlock_cursor, str) and shiftlock_cursor.strip() and os.path.isfile(shiftlock_cursor.strip()):
+            shiftlock_cursor = shiftlock_cursor.strip()
+            env["MOCKTAIL_SHIFTLOCK_CURSOR"] = shiftlock_cursor
         env["vblank_mode"] = "0"
         env["MOCKTAIL_FRAME_RATE_LIMIT"] = str(limit_fps)
         env["MOCKTAIL_VSYNC"] = "off"
