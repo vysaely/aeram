@@ -1,0 +1,85 @@
+diff --git a/stubs/libandroid_stub.cc b/stubs/libandroid_stub.cc
+index cfcc3d9..6ef8579 100644
+--- a/stubs/libandroid_stub.cc
++++ b/stubs/libandroid_stub.cc
+@@ -312,6 +312,29 @@ int MocktailWindowHeight() {
+   return fn != nullptr ? fn() : 720;
+ }
+ 
++// MOCKTAIL_SHIFTLOCK_CURSOR names a PNG served for Roblox's shift-lock icon.
++// Requests are answered before the payload lookup, so the image also applies
++// to Roblox versions that no longer ship the texture and download it instead.
++constexpr std::string_view kShiftLockCursorTexture =
++    "textures/MouseLockedCursor.png";
++
++bool LoadShiftLockCursorOverride(std::string_view requested, AAsset* asset) {
++  const char* override_path = GetEnvNonEmpty("MOCKTAIL_SHIFTLOCK_CURSOR");
++  if (override_path == nullptr || requested != kShiftLockCursorTexture) {
++    return false;
++  }
++  if (!LoadFile(override_path, &asset->data) || asset->data.empty()) {
++    std::fprintf(stderr,
++                 "  [asset] shift-lock cursor %s unreadable; using Roblox's\n",
++                 override_path);
++    asset->data.clear();
++    return false;
++  }
++  asset->path = override_path;
++  std::fprintf(stderr, "  [asset] shift-lock cursor: %s\n", override_path);
++  return true;
++}
++
+ bool HostCursorRequested() {
+   const char* value = GetEnvNonEmpty("MOCKTAIL_HOST_CURSOR");
+   return value != nullptr && value[0] != '0';
+@@ -348,6 +371,14 @@ AAsset* AAssetManager_open(AAssetManager* mgr, const char* filename,
+     std::fprintf(stderr, "  [asset] host cursor: blanked %s\n", filename);
+     return asset;
+   }
++  if (filename != nullptr) {
++    auto* asset = new AAsset;
++    if (LoadShiftLockCursorOverride(
++            StripAndroidAssetPrefix(StripAssetUriPrefix(filename)), asset)) {
++      return asset;
++    }
++    delete asset;
++  }
+   std::string path = ResolveAssetPath(filename);
+   if (path.empty()) {
+     return nullptr;
+diff --git a/tests/asset_manager_test.cc b/tests/asset_manager_test.cc
+index 38e251d..aba0d07 100644
+--- a/tests/asset_manager_test.cc
++++ b/tests/asset_manager_test.cc
+@@ -330,4 +330,31 @@ TEST_F(AssetManagerTest, HostCursorServesTransparentArrowTextures) {
+             nullptr);
+ }
+ 
++TEST_F(AssetManagerTest, ShiftLockCursorOverrideReplacesRobloxTexture) {
++  AAssetManager* mgr = AAssetManager_fromJava(nullptr, nullptr);
++  ASSERT_NE(mgr, nullptr);
++  const std::string image = MakeTempRoot() + "/shiftlock.png";
++  const std::string bytes = "\x89PNG custom shift lock";
++  std::ofstream(image, std::ios::binary) << bytes;
++
++  ASSERT_EQ(setenv("MOCKTAIL_SHIFTLOCK_CURSOR", image.c_str(), 1), 0);
++  for (const char* name : {"content/textures/MouseLockedCursor.png",
++                           "rbxasset://textures/MouseLockedCursor.png"}) {
++    AAsset* asset = AAssetManager_open(mgr, name, 0);
++    ASSERT_NE(asset, nullptr) << name;
++    ASSERT_EQ(AAsset_getLength(asset), static_cast<off_t>(bytes.size()));
++    EXPECT_EQ(std::memcmp(AAsset_getBuffer(asset), bytes.data(), bytes.size()),
++              0);
++    AAsset_close(asset);
++  }
++  // Other textures are untouched, and an unreadable override falls back to
++  // the payload (which has no such file in this root).
++  EXPECT_EQ(AAssetManager_open(mgr, "content/textures/ArrowCursor.png", 0),
++            nullptr);
++  ASSERT_EQ(setenv("MOCKTAIL_SHIFTLOCK_CURSOR", "/nonexistent/x.png", 1), 0);
++  EXPECT_EQ(AAssetManager_open(mgr, "content/textures/MouseLockedCursor.png", 0),
++            nullptr);
++  ASSERT_EQ(unsetenv("MOCKTAIL_SHIFTLOCK_CURSOR"), 0);
++}
++
+ }  // namespace

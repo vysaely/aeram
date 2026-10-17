@@ -2,6 +2,7 @@
 Dialog modals for Account Adding, Windows RAM Importing, Game Joining, and Multi-Launching.
 """
 
+import os
 import uuid
 import time
 import json
@@ -834,6 +835,26 @@ class FastFlagsDialog(BorderlessDialog):
         )
         grid_eng.addWidget(self.combo_cursor, 3, 1)
 
+        # Custom shift-lock icon (kept across Roblox updates)
+        grid_eng.addWidget(QtWidgets.QLabel("Shift-Lock Cursor:"), 4, 0)
+        shiftlock_row = QtWidgets.QHBoxLayout()
+        shiftlock_row.setSpacing(4)
+        self.btn_shiftlock = QtWidgets.QPushButton()
+        self.btn_shiftlock.setFixedWidth(208)
+        self.btn_shiftlock.setFixedHeight(26)
+        self.btn_shiftlock.setToolTip(
+            "PNG shown instead of Roblox's shift-lock icon in every account, including after Roblox "
+            "updates. Needs AERAM's Mocktail build. Applies on next launch."
+        )
+        self.btn_shiftlock.clicked.connect(self._browse_shiftlock_cursor)
+        shiftlock_row.addWidget(self.btn_shiftlock)
+        btn_shiftlock_reset = QtWidgets.QPushButton("✕")
+        btn_shiftlock_reset.setFixedSize(28, 26)
+        btn_shiftlock_reset.setToolTip("Use Roblox's shift-lock icon")
+        btn_shiftlock_reset.clicked.connect(lambda: self._set_shiftlock_cursor(""))
+        shiftlock_row.addWidget(btn_shiftlock_reset)
+        grid_eng.addLayout(shiftlock_row, 4, 1)
+
         layout.addWidget(grp_engine)
 
         # ── 4. Action Buttons ──
@@ -911,6 +932,7 @@ class FastFlagsDialog(BorderlessDialog):
             self.combo_telemetry.setCurrentIndex(1)
         if self.storage.get_setting("main_host_cursor", "true").lower() == "false":
             self.combo_cursor.setCurrentIndex(1)
+        self._set_shiftlock_cursor(self.storage.get_setting("shiftlock_cursor_path", "") or "")
 
     def _on_preset_changed(self, index: int):
         if self._updating_preset or index == 3:  # Custom
@@ -958,6 +980,17 @@ class FastFlagsDialog(BorderlessDialog):
         self.combo_drs.setCurrentIndex(0)
         self.combo_telemetry.setCurrentIndex(0)
         self.combo_cursor.setCurrentIndex(0)
+        self._set_shiftlock_cursor("")
+
+    def _set_shiftlock_cursor(self, path: str):
+        self._shiftlock_cursor_path = path
+        self.btn_shiftlock.setText(os.path.basename(path) if path else "Roblox Default")
+
+    def _browse_shiftlock_cursor(self):
+        start = os.path.dirname(self._shiftlock_cursor_path) if self._shiftlock_cursor_path else os.path.expanduser("~")
+        path, _ = QtWidgets.QFileDialog.getOpenFileName(self, "Select Shift-Lock Cursor", start, "PNG Images (*.png)")
+        if path:
+            self._set_shiftlock_cursor(path)
 
     def _save(self):
         preset_idx = self.combo_preset.currentIndex()
@@ -992,6 +1025,7 @@ class FastFlagsDialog(BorderlessDialog):
         self.storage.set_setting("fflag_disable_drs", "true" if self.combo_drs.currentIndex() == 0 else "false")
         self.storage.set_setting("fflag_disable_telemetry", "true" if self.combo_telemetry.currentIndex() == 0 else "false")
         self.storage.set_setting("main_host_cursor", "true" if self.combo_cursor.currentIndex() == 0 else "false")
+        self.storage.set_setting("shiftlock_cursor_path", self._shiftlock_cursor_path)
         self.accept()
 
 

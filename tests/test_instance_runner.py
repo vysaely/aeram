@@ -153,6 +153,14 @@ class TestInstanceRunner(unittest.TestCase):
         self.assertNotIn("MOCKTAIL_HOST_CURSOR", self._launch_env({}, is_main=False))
         self.assertNotIn("MOCKTAIL_HOST_CURSOR", self._launch_env({"main_host_cursor": "false"}, is_main=True))
 
+    def test_shiftlock_cursor_passed_only_when_file_exists(self):
+        with tempfile.NamedTemporaryFile(suffix=".png") as image:
+            env = self._launch_env({"shiftlock_cursor_path": image.name}, is_main=False)
+            self.assertEqual(env.get("MOCKTAIL_SHIFTLOCK_CURSOR"), image.name)
+        self.assertNotIn("MOCKTAIL_SHIFTLOCK_CURSOR",
+                         self._launch_env({"shiftlock_cursor_path": "/missing/cursor.png"}, is_main=True))
+        self.assertNotIn("MOCKTAIL_SHIFTLOCK_CURSOR", self._launch_env({}, is_main=True))
+
     def test_alts_rest_between_engine_polls(self):
         self.assertEqual(self._launch_env({}, is_main=False).get("MOCKTAIL_ENGINE_PUMP_REST"), "sleep")
         self.assertNotIn("MOCKTAIL_ENGINE_PUMP_REST", self._launch_env({}, is_main=True))
