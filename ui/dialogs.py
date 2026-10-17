@@ -788,6 +788,10 @@ class FastFlagsDialog(BorderlessDialog):
         self.combo_api.addItems(["Auto (System Default)", "Vulkan", "OpenGL"])
         self.combo_api.setFixedWidth(240)
         self.combo_api.setFixedHeight(26)
+        self.combo_api.setToolTip(
+            "Vulkan runs the Main account on Mocktail's direct-vulkan backend for the lowest input latency "
+            "(experimental: the chat text overlay and in-game Anti-AFK need OpenGL). Alts always use OpenGL."
+        )
         self.combo_api.currentIndexChanged.connect(self._on_control_changed)
         grid_eng.addWidget(self.combo_api, 0, 1)
 

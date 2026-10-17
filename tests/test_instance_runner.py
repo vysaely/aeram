@@ -99,6 +99,36 @@ class TestInstanceRunner(unittest.TestCase):
                 self.assertEqual(env["MOCKTAIL_COOKIE_FILE"], str(profile_dir / "roblox.cookie"))
                 self.assertEqual(env["MOCKTAIL_GRAPHICS_BACKEND"], "opengl")
 
+    def _launch_with_backend_setting(self, api_setting, is_main):
+        from unittest.mock import patch
+        import tempfile
+        from pathlib import Path
+        storage = MagicMock()
+        storage.is_main_account.return_value = is_main
+        storage.get_setting.side_effect = lambda key, default=None: api_setting if key == "fflag_graphics_api" else default
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            profile_dir = Path(tmp_dir)
+            (profile_dir / "run").mkdir()
+            storage.init_profile_sandbox.return_value = profile_dir
+            storage.get_runtime_dir.return_value = profile_dir / "run"
+            storage.get_instance_binary.return_value = profile_dir / "mocktail"
+            runner = InstanceRunner(storage)
+            acc = RobloxAccount(account_id="acc_gfx", username="Gfx", display_name="Gfx", user_id=1, cookie="tok")
+            proc = MagicMock(pid=os.getpid())
+            proc.poll.return_value = None
+            with patch("subprocess.Popen", return_value=proc) as popen, patch("shutil.which", return_value=None):
+                runner.launch_instance(acc)
+            argv = popen.call_args[0][0]
+            return argv[argv.index("--graphics") + 1], popen.call_args.kwargs["env"]["MOCKTAIL_GRAPHICS_BACKEND"]
+
+    def test_main_account_uses_vulkan_when_selected(self):
+        self.assertEqual(self._launch_with_backend_setting("Vulkan", is_main=True), ("direct-vulkan", "direct-vulkan"))
+
+    def test_alts_and_default_settings_stay_on_opengl(self):
+        self.assertEqual(self._launch_with_backend_setting("Vulkan", is_main=False), ("opengl", "opengl"))
+        self.assertEqual(self._launch_with_backend_setting("Auto", is_main=True), ("opengl", "opengl"))
+        self.assertEqual(self._launch_with_backend_setting("OpenGL", is_main=True), ("opengl", "opengl"))
+
     def test_detects_http_401_on_early_exit(self):
         import tempfile
         from pathlib import Path
