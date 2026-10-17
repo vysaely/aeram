@@ -2,6 +2,7 @@
 Unit tests for InstanceRunner process supervisor logic.
 """
 
+import json
 import os
 import sys
 import unittest
@@ -119,10 +120,24 @@ class TestInstanceRunner(unittest.TestCase):
             with patch("subprocess.Popen", return_value=proc) as popen, patch("shutil.which", return_value=None):
                 runner.launch_instance(acc)
             argv = popen.call_args[0][0]
-            return argv[argv.index("--graphics") + 1], popen.call_args.kwargs["env"]["MOCKTAIL_GRAPHICS_BACKEND"]
+            env = popen.call_args.kwargs["env"]
+            self._last_fflags = json.loads(env["MOCKTAIL_FAST_FLAGS_JSON"])
+            return argv[argv.index("--graphics") + 1], env["MOCKTAIL_GRAPHICS_BACKEND"]
 
     def test_main_account_uses_vulkan_when_selected(self):
         self.assertEqual(self._launch_with_backend_setting("Vulkan", is_main=True), ("direct-vulkan", "direct-vulkan"))
+
+    def test_vulkan_main_gets_clean_fastflags(self):
+        self._launch_with_backend_setting("Vulkan", is_main=True)
+        flags = self._last_fflags
+        self.assertTrue(flags["FFlagDebugGraphicsPreferVulkan"])
+        self.assertTrue(flags["FFlagEnableGenericChallengeResponseHandling"])  # login challenges still work
+        for quality_override in ("DFIntDebugFRMQualityLevelOverride", "DFIntTextureQualityOverride",
+                                 "DFFlagDebugPauseVoxelizer", "FFlagDisablePostFx", "FFlagDebugGraphicsPreferOpenGL"):
+            self.assertNotIn(quality_override, flags)
+
+        self._launch_with_backend_setting("OpenGL", is_main=True)
+        self.assertIn("DFIntDebugFRMQualityLevelOverride", self._last_fflags)
 
     def test_alts_and_default_settings_stay_on_opengl(self):
         self.assertEqual(self._launch_with_backend_setting("Vulkan", is_main=False), ("opengl", "opengl"))
