@@ -3,9 +3,12 @@ Unit tests for InstanceRunner process supervisor logic.
 """
 
 import json
+import shutil
+import tempfile
 import os
 import sys
 import unittest
+from pathlib import Path
 from unittest.mock import MagicMock
 
 from core.instance_runner import extract_private_server_link_code, InstanceRunner
@@ -149,6 +152,20 @@ class TestInstanceRunner(unittest.TestCase):
         self.assertEqual(self._launch_env({}, is_main=True).get("MOCKTAIL_HOST_CURSOR"), "1")
         self.assertNotIn("MOCKTAIL_HOST_CURSOR", self._launch_env({}, is_main=False))
         self.assertNotIn("MOCKTAIL_HOST_CURSOR", self._launch_env({"main_host_cursor": "false"}, is_main=True))
+
+    def test_helper_fps_scan_skipped_only_for_patched_mocktail(self):
+        from unittest.mock import patch
+        from core.mocktail_manager import MocktailInstallationInfo
+        helper = Path(tempfile.mkdtemp()) / "libmocktail_mouse_helper.so"
+        helper.write_bytes(b"")
+        try:
+            for patched in (False, True):
+                info = MocktailInstallationInfo(is_installed=True, helper_path=helper, latency_patched=patched)
+                with patch("core.mocktail_manager.MocktailManager.detect", return_value=info):
+                    env = self._launch_env({}, is_main=True)
+                self.assertEqual(env.get("AERAM_SKIP_FPS_UNCLAMP") == "1", patched)
+        finally:
+            shutil.rmtree(helper.parent, ignore_errors=True)
 
     def test_main_account_uses_vulkan_when_selected(self):
         self.assertEqual(self._launch_with_backend_setting("Vulkan", is_main=True), ("direct-vulkan", "direct-vulkan"))

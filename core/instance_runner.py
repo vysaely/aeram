@@ -470,6 +470,9 @@ class InstanceRunner:
         if mouse_helper and mouse_helper.exists():
             existing_preload = env.get("LD_PRELOAD", "")
             env["LD_PRELOAD"] = f"{mouse_helper}:{existing_preload}".rstrip(":") if existing_preload else str(mouse_helper)
+            if mock_info.latency_patched:
+                # Mocktail already raised libroblox's FPS clamps; skip the helper's one-off text scan
+                env["AERAM_SKIP_FPS_UNCLAMP"] = "1"
 
         try:
             target_fps = int(self.storage.get_account_target_fps(account))

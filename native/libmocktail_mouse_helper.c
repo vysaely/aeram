@@ -200,7 +200,7 @@ static int dbg_checked = 0;
 // =============================================================================
 
 // =============================================================================
-// Framerate Uncapping (Eliminates hardcoded 240 FPS ceilings in Mocktail & libroblox.so)
+// Framerate Uncapping (raises libroblox.so's hardcoded 240 FPS ceilings)
 // =============================================================================
 // Returns true once libroblox.so has been mapped and scanned. The scan result
 // is final either way: a Mocktail build that already raised the clamps leaves
@@ -210,7 +210,6 @@ static bool unclamp_process_framerate(void) {
     if (!f) return false;
 
     char line[512];
-    static bool mocktail_patched = false;
     static bool libroblox_patched = false;
     bool libroblox_seen = false;
     int patches_applied = 0;
@@ -221,9 +220,6 @@ static bool unclamp_process_framerate(void) {
     // Pattern 2 in libroblox.so (nativePostClientSettingsLoadedInitialization3):
     // mov ecx, 240; cmp eax, ecx; cmovae eax, ecx -> b9 f0 00 00 00 39 c8 0f 43 c1
     const uint8_t pat_roblox2[] = { 0xb9, 0xf0, 0x00, 0x00, 0x00, 0x39, 0xc8, 0x0f, 0x43, 0xc1 };
-    // Pattern 3 in mocktail (MergeFrameRateClientSettingsOverrides mode 3 'unlimited'):
-    // mov esi, 240; mov rdi, r12 -> be f0 00 00 00 4c 89 e7
-    const uint8_t pat_mocktail[] = { 0xbe, 0xf0, 0x00, 0x00, 0x00, 0x4c, 0x89, 0xe7 };
 
     // Set engine ceiling to 10,000 FPS so any preset (60, 120, 144, 165, 240, 320, unlimited) runs uninhibited
     const uint32_t uncapped_limit = 10000;
@@ -231,10 +227,9 @@ static bool unclamp_process_framerate(void) {
     if (page_size <= 0) page_size = 4096;
 
     while (fgets(line, sizeof(line), f)) {
-        bool is_mocktail = (!mocktail_patched && strstr(line, "mocktail") && !strstr(line, "libmocktail_mouse_helper") && !strstr(line, ".log"));
         bool is_roblox = (!libroblox_patched && strstr(line, "libroblox.so"));
 
-        if (!is_mocktail && !is_roblox) continue;
+        if (!is_roblox) continue;
 
         uintptr_t start = 0, end = 0;
         char perms[16];
@@ -243,24 +238,6 @@ static bool unclamp_process_framerate(void) {
 
         size_t len = end - start;
         uint8_t *mem = (uint8_t *)start;
-
-        if (is_mocktail && strchr(perms, 'x')) {
-            for (size_t i = 0; i + sizeof(pat_mocktail) <= len; i++) {
-                if (memcmp(mem + i, pat_mocktail, sizeof(pat_mocktail)) == 0) {
-                    uintptr_t page_start = (uintptr_t)(mem + i) & ~(page_size - 1);
-                    uintptr_t page_end = ((uintptr_t)(mem + i + sizeof(pat_mocktail)) + page_size - 1) & ~(page_size - 1);
-                    size_t psize = page_end - page_start;
-                    mprotect((void *)page_start, psize, PROT_READ | PROT_WRITE | PROT_EXEC);
-                    memcpy(mem + i + 1, &uncapped_limit, sizeof(uncapped_limit));
-                    if (!strchr(perms, 'w')) {
-                        mprotect((void *)page_start, psize, PROT_READ | PROT_EXEC);
-                    }
-                    mocktail_patched = true;
-                    fprintf(stderr, "[AERAM-FPS] Unlocked Mocktail 'unlimited' hardcode at %p to %u FPS\n", (void *)(mem + i), uncapped_limit);
-                    break;
-                }
-            }
-        }
 
         if (is_roblox && strchr(perms, 'x')) {
             libroblox_seen = true;
@@ -294,6 +271,11 @@ static void maybe_unclamp_framerate(void) {
     static bool done = false;
     static uint64_t last_attempt_ms = 0;
     if (done) return;
+    const char *skip = getenv("AERAM_SKIP_FPS_UNCLAMP");
+    if (skip && skip[0] == '1') {
+        done = true;
+        return;
+    }
     uint64_t now_ms = get_time_ms();
     if (last_attempt_ms != 0 && now_ms - last_attempt_ms < 250) return;
     last_attempt_ms = now_ms;
@@ -302,7 +284,6 @@ static void maybe_unclamp_framerate(void) {
 
 __attribute__((constructor))
 static void ctor_init(void) {
-    unclamp_process_framerate();
     last_user_input_time = get_time_ms();
 
     struct sigaction sa;
