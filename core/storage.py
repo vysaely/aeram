@@ -1411,6 +1411,31 @@ class StorageManager:
 
     ENGINE_PRESET_MARKER = ".aeram-engine-preset"
 
+    @staticmethod
+    def _account_client_running(account: Optional[RobloxAccount]) -> bool:
+        """True when this account's Mocktail game process (argv[0] mocktail_<id>) is alive."""
+        if account is None or not os.path.isdir("/proc"):
+            return False
+        wanted = f"mocktail_{account.account_id}".encode()
+        try:
+            uid = os.getuid()
+            with os.scandir("/proc") as it:
+                for entry in it:
+                    if not entry.name.isdigit():
+                        continue
+                    try:
+                        if entry.stat().st_uid != uid:
+                            continue
+                        with open(os.path.join(entry.path, "cmdline"), "rb") as f:
+                            argv0 = f.read().split(b"\0", 1)[0]
+                        if os.path.basename(argv0) == wanted:
+                            return True
+                    except OSError:
+                        continue
+        except OSError:
+            return False
+        return False
+
     def engine_preset_generation(self) -> int:
         try:
             return int(self.get_setting("engine_preset_generation", "0") or 0)
@@ -1473,7 +1498,9 @@ class StorageManager:
                 applied = int(marker.read_text(encoding="utf-8").strip() or 0)
             except (OSError, ValueError):
                 applied = 0
-        apply_preset = applied < generation
+        # Roblox rewrites this file when a running client exits, which would silently drop the
+        # preset after it was marked applied; a running account gets it on its next launch.
+        apply_preset = applied < generation and not self._account_client_running(account)
 
         for xml_file in target_files:
             xml_file.parent.mkdir(parents=True, exist_ok=True)
@@ -1533,7 +1560,7 @@ class StorageManager:
             except Exception:
                 pass
 
-        if marker is not None and applied != generation:
+        if marker is not None and applied != generation and (apply_preset or applied > generation):
             try:
                 marker.write_text(str(generation), encoding="utf-8")
             except OSError:
@@ -1549,8 +1576,8 @@ class StorageManager:
         concurrent or batch multi-instance startups.
         """
         prof_dir = self.get_profile_dir(account)
-        # Clear any stale mocktail runtime or migration lock files
-        for lock_file in prof_dir.glob("**/*.lock"):
+        # Clear stale mocktail runtime or migration lock files, never ones a running client holds
+        for lock_file in ([] if self._account_client_running(account) else prof_dir.glob("**/*.lock")):
             try:
                 lock_file.unlink()
             except Exception:
