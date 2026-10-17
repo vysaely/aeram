@@ -311,6 +311,16 @@ class TestStorageManager(unittest.TestCase):
         self.storage._provision_engine_settings(main_run, main_acc)
         self.assertIn('<int name="GraphicsQualityLevel">5</int>', main_xml.read_text(encoding="utf-8"))
 
+        # A running client would overwrite the file on exit: the preset waits for its next launch
+        from unittest.mock import patch
+        set_in_game(main_xml, 9, 0.7, 0.5)
+        self.storage.request_engine_preset(4, 0.4)
+        with patch.object(StorageManager, "_account_client_running", return_value=True):
+            self.storage._provision_engine_settings(main_run, main_acc)
+        self.assertIn('<int name="GraphicsQualityLevel">9</int>', main_xml.read_text(encoding="utf-8"))
+        self.storage._provision_engine_settings(main_run, main_acc)
+        self.assertIn('<int name="GraphicsQualityLevel">4</int>', main_xml.read_text(encoding="utf-8"))
+
     def test_get_effective_fflags(self):
         # Default flags for alt and main
         alt_ff = self.storage.get_effective_fflags(is_alt=True)
