@@ -53,6 +53,18 @@ log = logging.getLogger("AntiAFK")
 AFK_PULSE_PATH = Path("/dev/shm/aeram_afk_pulse")
 
 
+def is_mocktail_game_cmdline(raw: bytes) -> bool:
+    """True only for a Mocktail game process: argv[0] is the mocktail binary or a per-account copy.
+
+    SIGUSR1 kills any process that does not handle it, so matching "/mocktail" anywhere in the
+    command line would also hit editors, builds or `tail -f` on Mocktail paths, and Mocktail's
+    own WebKit login window, where JavaScriptCore uses SIGUSR1 internally.
+    """
+    argv0 = raw.split(b"\0", 1)[0]
+    name = os.path.basename(argv0)
+    return name == b"mocktail" or name.startswith(b"mocktail_acc_")
+
+
 def write_pulse_file(timestamp: float, path: Path = AFK_PULSE_PATH) -> None:
     """Writes the pulse file as owner-only (0600), never following a planted symlink."""
     fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, "O_NOFOLLOW", 0), 0o600)
@@ -197,7 +209,7 @@ class AntiAfkEngine:
                             continue
                         with open(os.path.join(entry.path, "cmdline"), "rb") as f:
                             raw = f.read()
-                        if b"mocktail_acc_" in raw or b"/mocktail" in raw:
+                        if is_mocktail_game_cmdline(raw):
                             pids.append(int(entry.name))
                     except Exception:
                         continue

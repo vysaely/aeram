@@ -996,6 +996,11 @@ class StorageManager:
             try:
                 parsed = json.loads(custom_raw)
                 if isinstance(parsed, dict):
+                    # AERAM's FPS setting reaches Mocktail as frame_rate_limit, and Mocktail
+                    # refuses to start when a FastFlag sets these to anything else.
+                    for owned in ("DFIntTaskSchedulerTargetFps", "FFlagGameBasicSettingsFramerateCap5"):
+                        if parsed.pop(owned, None) is not None:
+                            log.warning(f"Ignoring custom {owned}: set the FPS cap in AERAM's settings instead")
                     ff.update(parsed)
             except Exception as e:
                 log.warning(f"Failed to parse custom_fastflags_json: {e}")
@@ -1404,29 +1409,71 @@ class StorageManager:
         self._provision_engine_settings(run_dir, account)
         return run_dir
 
+    ENGINE_PRESET_MARKER = ".aeram-engine-preset"
+
+    def engine_preset_generation(self) -> int:
+        try:
+            return int(self.get_setting("engine_preset_generation", "0") or 0)
+        except (ValueError, TypeError):
+            return 0
+
+    def request_engine_preset(self, graphics_level: int, mouse_sensitivity: float) -> int:
+        """Stores an in-game settings preset and marks it for every account's next launch.
+
+        The preset is applied once per request: afterwards Roblox's own in-game settings
+        (graphics slider, sensitivity) belong to the player until the preset is applied again.
+        Returns the new preset generation.
+        """
+        self.set_setting("graphics_quality_level", str(max(1, min(10, int(graphics_level)))))
+        self.set_setting("mouse_sensitivity", f"{float(mouse_sensitivity):.2f}")
+        generation = self.engine_preset_generation() + 1
+        self.set_setting("engine_preset_generation", str(generation))
+        return generation
+
     def _provision_engine_settings(self, run_dir: Path, account: Optional[RobloxAccount] = None):
         """
-        Pre-provisions Roblox engine settings in the instance run and profile directory:
-        - Configures FramerateCap in GlobalBasicSettings_13.xml (240 for mains, 24 for alts)
-        - Locks Manual Graphics Quality Level (10 for mains, 1 for alts)
-        - Controls MasterVolume (1 for mains, 0 for alts)
-        - Applies configured mouse/camera sensitivity
+        Prepares Roblox's GlobalBasicSettings_13.xml before a launch.
+
+        Every launch: FramerateCap follows AERAM's FPS setting; alts stay at graphics level 1
+        and muted. The in-game preset (graphics level, camera sensitivity, shift-lock switch)
+        is written when a settings file is created and once after each "Apply Preset", so
+        changes made in Roblox's own menu persist between launches. Master volume is only
+        set when the file is created.
         """
+        import re
         is_main = self.is_main_account(account) if account else True
         raw_fps = self.get_account_target_fps(account)
         fps_cap = 10000 if (raw_fps >= 1000 or raw_fps <= 0) else raw_fps
         vol = "1" if is_main else "0"
-        gfx_lvl = 7 if is_main else 1
-        sens = float(self.get_setting("mouse_sensitivity", "0.20"))
+        try:
+            preset_gfx = max(1, min(10, int(self.get_setting("graphics_quality_level", "7"))))
+        except (ValueError, TypeError):
+            preset_gfx = 7
+        gfx_lvl = preset_gfx if is_main else 1
+        try:
+            sens = float(self.get_setting("mouse_sensitivity", "0.20"))
+        except (ValueError, TypeError):
+            sens = 0.20
 
         target_files = [run_dir / "data" / "files" / "appData" / "GlobalBasicSettings_13.xml"]
+        marker = None
         if account:
             prof_dir = self.instances_dir / account.profile_dir_name
+            marker = prof_dir / self.ENGINE_PRESET_MARKER
             target_files.extend([
                 prof_dir / "data" / "mocktail" / "android" / "data" / "files" / "appData" / "GlobalBasicSettings_13.xml",
                 prof_dir / "data" / "android" / "data" / "files" / "appData" / "GlobalBasicSettings_13.xml",
                 prof_dir / "data" / "files" / "appData" / "GlobalBasicSettings_13.xml",
             ])
+
+        generation = self.engine_preset_generation()
+        applied = 0
+        if marker is not None:
+            try:
+                applied = int(marker.read_text(encoding="utf-8").strip() or 0)
+            except (OSError, ValueError):
+                applied = 0
+        apply_preset = applied < generation
 
         for xml_file in target_files:
             xml_file.parent.mkdir(parents=True, exist_ok=True)
@@ -1461,27 +1508,36 @@ class StorageManager:
                     xml_file.write_text(content, encoding="utf-8")
                 except Exception:
                     pass
-            else:
-                try:
-                    import re
-                    txt = xml_file.read_text(encoding="utf-8")
-                    txt = re.sub(r'<token name="ControlMode">\d+</token>', '<token name="ControlMode">1</token>', txt)
+                continue
+            try:
+                txt = xml_file.read_text(encoding="utf-8")
+                original = txt
+                txt = re.sub(r'<(?:int|token) name="FramerateCap">-?\d+</(?:int|token)>', f'<int name="FramerateCap">{fps_cap}</int>', txt)
+                if '<int name="FramerateCap">' not in txt:
+                    txt = txt.replace('<Properties>', f'<Properties>\n\t\t\t<int name="FramerateCap">{fps_cap}</int>')
+                if apply_preset or not is_main:
                     txt = re.sub(r'<token name="GraphicsOptimizationMode">\d+</token>', '<token name="GraphicsOptimizationMode">1</token>', txt)
                     txt = re.sub(r'<token name="SavedQualityLevel">\d+</token>', f'<token name="SavedQualityLevel">{gfx_lvl}</token>', txt)
                     txt = re.sub(r'<(?:int|token) name="GraphicsQualityLevel">\d+</(?:int|token)>', f'<int name="GraphicsQualityLevel">{gfx_lvl}</int>', txt)
                     txt = re.sub(r'<bool name="MaxQualityEnabled">(?:true|false)</bool>', '<bool name="MaxQualityEnabled">false</bool>', txt)
-                    txt = re.sub(r'<float name="MouseSensitivity">[\d\.]+</float>', f'<float name="MouseSensitivity">{sens:.6f}</float>', txt)
-                    txt = re.sub(r'<(?:int|token) name="FramerateCap">-?\d+</(?:int|token)>', f'<int name="FramerateCap">{fps_cap}</int>', txt)
-                    txt = re.sub(r'<float name="MasterVolume">[\d\.]+</float>', f'<float name="MasterVolume">{vol}</float>', txt)
+                if not is_main:
+                    txt = re.sub(r'<float name="MasterVolume">[\d\.]+</float>', '<float name="MasterVolume">0</float>', txt)
+                if apply_preset:
+                    txt = re.sub(r'<token name="ControlMode">\d+</token>', '<token name="ControlMode">1</token>', txt)
                     if '<token name="ControlMode">' not in txt:
                         txt = txt.replace('<Properties>', '<Properties>\n\t\t\t<token name="ControlMode">1</token>')
-                    if '<int name="FramerateCap">' not in txt:
-                        txt = txt.replace('<Properties>', f'<Properties>\n\t\t\t<int name="FramerateCap">{fps_cap}</int>')
-                    if '<float name="MasterVolume">' not in txt:
-                        txt = txt.replace('<Properties>', f'<Properties>\n\t\t\t<float name="MasterVolume">{vol}</float>')
+                    txt = re.sub(r'<float name="MouseSensitivity">[\d\.]+</float>', f'<float name="MouseSensitivity">{sens:.6f}</float>', txt)
+                    txt = re.sub(r'<X>[\d\.]+</X>\s*<Y>[\d\.]+</Y>', f'<X>{sens:.6f}</X>\n\t\t\t\t<Y>{sens:.6f}</Y>', txt)
+                if txt != original:
                     xml_file.write_text(txt, encoding="utf-8")
-                except Exception:
-                    pass
+            except Exception:
+                pass
+
+        if marker is not None and applied != generation:
+            try:
+                marker.write_text(str(generation), encoding="utf-8")
+            except OSError:
+                pass
 
     def _preprovision_android_cache(self, account: RobloxAccount) -> None:
         """
@@ -1555,65 +1611,6 @@ class StorageManager:
                     tmp.replace(app_storage_file)
                 except Exception:
                     pass
-
-    def apply_roblox_engine_preferences(self, mouse_sensitivity: Optional[float] = None, graphics_level: Optional[int] = None) -> None:
-        """
-        Applies engine preferences across all active and cached instance settings files:
-        - Shift Lock switch is permanently enabled (<token name="ControlMode">1</token>) for all clients.
-        - High-quality (main) accounts are set to graphics level 7 (or configured level).
-        - Alt accounts remain at low-power level 1.
-        """
-        import re, glob
-        if graphics_level is None:
-            try:
-                graphics_level = int(self.get_setting("graphics_quality_level", "7"))
-            except (ValueError, TypeError):
-                graphics_level = 7
-
-        accounts = self.list_accounts()
-        main_profiles = {acc.profile_dir_name for acc in accounts if self.is_main_account(acc)}
-        alt_profiles = {acc.profile_dir_name for acc in accounts if not self.is_main_account(acc)}
-
-        patterns = [
-            "/run/user/*/ram-linux/*/data/files/appData/GlobalBasicSettings_13.xml",
-            str(self.base_dir / "instances" / "*" / "data" / "files" / "appData" / "GlobalBasicSettings_13.xml"),
-            str(self.base_dir / "instances" / "*" / "data" / "mocktail" / "android" / "data" / "files" / "appData" / "GlobalBasicSettings_13.xml"),
-            str(self.base_dir / "instances" / "*" / "data" / "android" / "data" / "files" / "appData" / "GlobalBasicSettings_13.xml"),
-        ]
-        all_files = set()
-        for pat in patterns:
-            all_files.update(glob.glob(pat))
-
-        for xml_path in all_files:
-            try:
-                # Determine if this file belongs to a main account or alt
-                is_main_client = False
-                for mp in main_profiles:
-                    if mp in xml_path:
-                        is_main_client = True
-                        break
-                if not is_main_client and any(ap in xml_path for ap in alt_profiles):
-                    is_main_client = False
-                elif not is_main_client and not alt_profiles:
-                    # Fallback if no accounts listed
-                    is_main_client = True
-
-                acc_gfx = graphics_level if is_main_client else 1
-
-                txt = Path(xml_path).read_text(encoding="utf-8")
-                txt = re.sub(r'<token name="ControlMode">\d+</token>', '<token name="ControlMode">1</token>', txt)
-                txt = re.sub(r'<token name="GraphicsOptimizationMode">\d+</token>', '<token name="GraphicsOptimizationMode">1</token>', txt)
-                txt = re.sub(r'<token name="SavedQualityLevel">\d+</token>', f'<token name="SavedQualityLevel">{acc_gfx}</token>', txt)
-                txt = re.sub(r'<(?:int|token) name="GraphicsQualityLevel">\d+</(?:int|token)>', f'<int name="GraphicsQualityLevel">{acc_gfx}</int>', txt)
-                txt = re.sub(r'<bool name="MaxQualityEnabled">(?:true|false)</bool>', '<bool name="MaxQualityEnabled">false</bool>', txt)
-                if '<token name="ControlMode">' not in txt:
-                    txt = txt.replace('<Properties>', '<Properties>\n\t\t\t<token name="ControlMode">1</token>')
-                if mouse_sensitivity is not None:
-                    txt = re.sub(r'<float name="MouseSensitivity">[\d\.]+</float>', f'<float name="MouseSensitivity">{mouse_sensitivity:.6f}</float>', txt)
-                    txt = re.sub(r'<X>[\d\.]+</X>\s*<Y>[\d\.]+</Y>', f'<X>{mouse_sensitivity:.6f}</X>\n\t\t\t\t<Y>{mouse_sensitivity:.6f}</Y>', txt)
-                Path(xml_path).write_text(txt, encoding="utf-8")
-            except Exception as e:
-                log.debug(f"Could not apply engine preferences to {xml_path}: {e}")
 
     def _copy_or_reflink(self, src: Path, dest: Path):
         """

@@ -1,0 +1,212 @@
+diff --git a/src/legacy/legacy_runtime.cc b/src/legacy/legacy_runtime.cc
+index 69831c1..ff467cf 100644
+--- a/src/legacy/legacy_runtime.cc
++++ b/src/legacy/legacy_runtime.cc
+@@ -1859,70 +1859,168 @@ extern "C" void MocktailConstructorWrapper() {
+   MaybePrintLibRobloxConstructorSummary(idx);
+ }
+ 
+-// The Android payload clamps DFIntTaskSchedulerTargetFps and the render
+-// scheduler to 240 even though the desktop client honours higher Basic
+-// Settings caps. Raise those immediates before JNI_OnLoad so a configured
+-// frame_rate_limit above 240 actually applies. MOCKTAIL_KEEP_ROBLOX_FPS_CLAMP
+-// restores the payload's behaviour.
+-static void RaiseLibRobloxFrameRateClamps() {
+-  if (IsEnabled("MOCKTAIL_KEEP_ROBLOX_FPS_CLAMP")) {
+-    return;
+-  }
+-  // mov ecx, 240; cmp eax, ecx; cmovl ecx, eax  (signed min)
+-  static constexpr unsigned char kSignedMin[] = {0xb9, 0xf0, 0x00, 0x00, 0x00,
+-                                                 0x39, 0xc8, 0x0f, 0x4c, 0xc8};
+-  // mov ecx, 240; cmp eax, ecx; cmovae eax, ecx  (unsigned min)
+-  static constexpr unsigned char kUnsignedMin[] = {0xb9, 0xf0, 0x00, 0x00, 0x00,
+-                                                   0x39, 0xc8, 0x0f, 0x43, 0xc1};
+-  static_assert(sizeof(kSignedMin) == sizeof(kUnsignedMin));
+-  constexpr uint32_t kRaisedLimit = 10000;
+-  const long page_size_value = sysconf(_SC_PAGESIZE);
+-  const uintptr_t page_size =
+-      page_size_value > 0 ? static_cast<uintptr_t>(page_size_value) : 4096;
++// The Android payload clamps DFIntTaskSchedulerTargetFps to 240 even though
++// the desktop client honours higher Basic Settings caps. Raise only clamps
++// that read that flag's value before JNI_OnLoad, so a configured
++// frame_rate_limit above 240 applies. The same "mov ecx, 240; cmp; cmov"
++// shape also clamps network send rates (S2PhysicsSenderRate,
++// ISRBandwidthSendLimiterHz), which must keep Roblox's limits. The flag's
++// storage is found from its registration: the name string's address is stored
++// 8 bytes after the value. MOCKTAIL_KEEP_ROBLOX_FPS_CLAMP disables this.
++namespace {
+ 
++struct LibRobloxMapping {
++  unsigned char* begin;
++  std::size_t length;
++  bool executable;
++};
++
++std::vector<LibRobloxMapping> LibRobloxMappings() {
++  std::vector<LibRobloxMapping> mappings;
+   FILE* maps = std::fopen("/proc/self/maps", "r");
+   if (maps == nullptr) {
+-    return;
++    return mappings;
+   }
+-  int patched = 0;
+   char line[1024];
+   while (std::fgets(line, sizeof(line), maps) != nullptr) {
+-    if (std::strstr(line, "libroblox.so") == nullptr) {
+-      continue;
+-    }
+     uintptr_t start = 0;
+     uintptr_t end = 0;
+     char perms[8] = {};
+-    if (std::sscanf(line, "%lx-%lx %7s", &start, &end, perms) != 3 ||
+-        perms[0] != 'r' || perms[2] != 'x' || end <= start) {
++    if (std::strstr(line, "libroblox.so") == nullptr ||
++        std::sscanf(line, "%lx-%lx %7s", &start, &end, perms) != 3 ||
++        perms[0] != 'r' || end <= start) {
++      continue;
++    }
++    mappings.push_back({reinterpret_cast<unsigned char*>(start), end - start,
++                        perms[2] == 'x'});
++  }
++  std::fclose(maps);
++  return mappings;
++}
++
++int32_t ReadDisplacement(const unsigned char* at) {
++  int32_t value = 0;
++  std::memcpy(&value, at, sizeof(value));
++  return value;
++}
++
++// lea r64, [rip + disp32] / mov [rip + disp32], r64 with a REX.W prefix.
++bool IsRipLea(const unsigned char* at) {
++  return (at[0] == 0x48 || at[0] == 0x4c) && at[1] == 0x8d &&
++         (at[2] & 0xc7) == 0x05;
++}
++
++bool IsRipStoreOfSameRegister(const unsigned char* at,
++                              const unsigned char* lea) {
++  return at[0] == lea[0] && at[1] == 0x89 && (at[2] & 0xc7) == 0x05 &&
++         ((at[2] >> 3) & 7) == ((lea[2] >> 3) & 7);
++}
++
++uintptr_t FindTaskSchedulerTargetFpsValue(
++    const std::vector<LibRobloxMapping>& mappings) {
++  static constexpr char kName[] = "\0TaskSchedulerTargetFps";
++  uintptr_t name = 0;
++  for (const LibRobloxMapping& mapping : mappings) {
++    const void* found = memmem(mapping.begin, mapping.length, kName,
++                               sizeof(kName));  // includes the trailing NUL
++    if (found != nullptr) {
++      name = reinterpret_cast<uintptr_t>(found) + 1;
++      break;
++    }
++  }
++  if (name == 0) {
++    return 0;
++  }
++  for (const LibRobloxMapping& mapping : mappings) {
++    if (!mapping.executable || mapping.length < 64) {
+       continue;
+     }
+-    auto* const begin = reinterpret_cast<unsigned char*>(start);
+-    const size_t length = end - start;
+-    for (size_t i = 0; i + sizeof(kSignedMin) <= length; ++i) {
+-      if (begin[i] != 0xb9 ||
+-          (std::memcmp(begin + i, kSignedMin, sizeof(kSignedMin)) != 0 &&
+-           std::memcmp(begin + i, kUnsignedMin, sizeof(kUnsignedMin)) != 0)) {
++    for (std::size_t i = 0; i + 64 <= mapping.length; ++i) {
++      const unsigned char* lea = mapping.begin + i;
++      if (!IsRipLea(lea) ||
++          reinterpret_cast<uintptr_t>(lea) + 7 + ReadDisplacement(lea + 3) !=
++              name) {
+         continue;
+       }
+-      const uintptr_t page = reinterpret_cast<uintptr_t>(begin + i) &
++      for (std::size_t k = 7; k < 40; ++k) {
++        const unsigned char* store = lea + k;
++        if (IsRipStoreOfSameRegister(store, lea)) {
++          return reinterpret_cast<uintptr_t>(store) + 7 +
++                 ReadDisplacement(store + 3) - 8;
++        }
++      }
++    }
++  }
++  return 0;
++}
++
++// True when a "mov eax, [rip + disp32]" of the flag value precedes the clamp.
++bool ClampReadsValue(const unsigned char* clamp, uintptr_t value) {
++  for (std::size_t back = 6; back <= 40; ++back) {
++    const unsigned char* load = clamp - back;
++    if (load[0] == 0x8b && load[1] == 0x05 &&
++        reinterpret_cast<uintptr_t>(load) + 6 + ReadDisplacement(load + 2) ==
++            value) {
++      return true;
++    }
++  }
++  return false;
++}
++
++}  // namespace
++
++static void RaiseLibRobloxFrameRateClamps() {
++  if (IsEnabled("MOCKTAIL_KEEP_ROBLOX_FPS_CLAMP")) {
++    return;
++  }
++  const std::vector<LibRobloxMapping> mappings = LibRobloxMappings();
++  const uintptr_t value = FindTaskSchedulerTargetFpsValue(mappings);
++  if (value == 0) {
++    std::cout << "  [runtime] TaskSchedulerTargetFps not located; libroblox "
++                 "240 FPS clamp left in place\n"
++              << std::flush;
++    return;
++  }
++  // mov ecx, 240; cmp eax, ecx; then cmovl ecx, eax or cmovae eax, ecx.
++  static constexpr unsigned char kClamp[] = {0xb9, 0xf0, 0x00, 0x00,
++                                             0x00, 0x39, 0xc8};
++  constexpr uint32_t kRaisedLimit = 10000;
++  const long page_size_value = sysconf(_SC_PAGESIZE);
++  const uintptr_t page_size =
++      page_size_value > 0 ? static_cast<uintptr_t>(page_size_value) : 4096;
++  int patched = 0;
++  for (const LibRobloxMapping& mapping : mappings) {
++    if (!mapping.executable || mapping.length < 64) {
++      continue;
++    }
++    for (std::size_t i = 40; i + 10 <= mapping.length; ++i) {
++      unsigned char* const clamp = mapping.begin + i;
++      if (clamp[0] != 0xb9 ||
++          std::memcmp(clamp, kClamp, sizeof(kClamp)) != 0 ||
++          clamp[7] != 0x0f ||
++          !((clamp[8] == 0x4c && clamp[9] == 0xc8) ||
++            (clamp[8] == 0x43 && clamp[9] == 0xc1)) ||
++          !ClampReadsValue(clamp, value)) {
++        continue;
++      }
++      const uintptr_t page = reinterpret_cast<uintptr_t>(clamp) &
+                              ~(page_size - 1);
+       const uintptr_t page_end =
+-          (reinterpret_cast<uintptr_t>(begin + i + 5) + page_size - 1) &
++          (reinterpret_cast<uintptr_t>(clamp + 5) + page_size - 1) &
+           ~(page_size - 1);
+       void* const page_ptr = reinterpret_cast<void*>(page);
+       if (mprotect(page_ptr, page_end - page,
+                    PROT_READ | PROT_WRITE | PROT_EXEC) != 0) {
+         continue;
+       }
+-      std::memcpy(begin + i + 1, &kRaisedLimit, sizeof(kRaisedLimit));
++      std::memcpy(clamp + 1, &kRaisedLimit, sizeof(kRaisedLimit));
+       mprotect(page_ptr, page_end - page, PROT_READ | PROT_EXEC);
+       ++patched;
+     }
+   }
+-  std::fclose(maps);
+-  std::cout << "  [runtime] libroblox 240 FPS clamps raised: " << patched
+-            << '\n'
++  std::cout << "  [runtime] libroblox TaskSchedulerTargetFps 240 clamps "
++               "raised: "
++            << patched << '\n'
+             << std::flush;
+ }
+ 
