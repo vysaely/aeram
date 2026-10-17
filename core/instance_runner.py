@@ -52,7 +52,30 @@ def extract_private_server_link_code(link: str) -> Optional[str]:
     return None
 
 
-def compute_cpu_sets(total_cpus: int, custom_alt_cpus: Optional[str] = None) -> Tuple[set[int], set[int]]:
+def _physical_core_groups(total_cpus: int, core_of: Optional[Callable[[int], Optional[tuple]]] = None) -> List[set[int]]:
+    """Groups logical CPUs that share a physical core, ordered by their lowest CPU number."""
+    def sysfs_core(cpu: int) -> Optional[tuple]:
+        base = Path(f"/sys/devices/system/cpu/cpu{cpu}/topology")
+        try:
+            return (int((base / "physical_package_id").read_text()), int((base / "core_id").read_text()))
+        except (OSError, ValueError):
+            return None
+
+    lookup = core_of or sysfs_core
+    groups: Dict[tuple, set[int]] = {}
+    for cpu in range(total_cpus):
+        key = lookup(cpu)
+        if key is None:
+            return []  # topology unknown: callers fall back to numeric splitting
+        groups.setdefault(key, set()).add(cpu)
+    return sorted(groups.values(), key=min)
+
+
+def compute_cpu_sets(
+    total_cpus: int,
+    custom_alt_cpus: Optional[str] = None,
+    core_of: Optional[Callable[[int], Optional[tuple]]] = None,
+) -> Tuple[set[int], set[int]]:
     """
     Computes portable CPU affinity sets for main and background alt instances.
     Guarantees all cores are within range and dynamically scales across 2 to 128+ core systems.
@@ -71,7 +94,15 @@ def compute_cpu_sets(total_cpus: int, custom_alt_cpus: Optional[str] = None) -> 
             pass
 
     if total_cpus >= 8:
-        # On 8+ core systems, allocate upper ~35% of cores to alts and lower ~65% to main
+        # On 8+ core systems, give alts the upper ~35% of *physical* cores. Splitting logical CPUs by
+        # number put alts on the SMT siblings of the main's cores (Linux numbers siblings as
+        # cpuN and cpuN+cores), so a busy alt stole execution units from the main instance.
+        cores = _physical_core_groups(total_cpus, core_of)
+        if len(cores) >= 3:
+            alt_core_count = max(1, int(len(cores) * 0.35))
+            alt_set = set().union(*cores[-alt_core_count:])
+            main_set = set(range(total_cpus)) - alt_set
+            return main_set, alt_set
         alt_count = max(2, int(total_cpus * 0.35))
         alt_set = set(range(total_cpus - alt_count, total_cpus))
         main_set = set(range(0, total_cpus - alt_count))
@@ -350,8 +381,16 @@ class InstanceRunner:
         is_main = self.storage.is_main_account(account)
         is_alt = not is_main
 
+        # The main account may opt into Mocktail's direct-vulkan backend (Settings > FastFlags >
+        # Graphics Backend: Vulkan). Its unthrottled path presents with the immediate mode, which
+        # avoids waiting on the compositor. Alts stay on OpenGL: the native helper's chat overlay,
+        # in-process Anti-AFK and FPS unclamp all hook SDL_GL_SwapWindow.
+        graphics_backend = "opengl"
+        if is_main and self.storage.get_setting("fflag_graphics_api", "Auto") == "Vulkan":
+            graphics_backend = "direct-vulkan"
+
         # Build native Mocktail execution command
-        base_cmd = [str(bin_path), "--windowed", "--graphics", "opengl"]
+        base_cmd = [str(bin_path), "--windowed", "--graphics", graphics_backend]
 
         env = os.environ.copy()
 
@@ -388,7 +427,7 @@ class InstanceRunner:
         env["XDG_STATE_HOME"] = str(profile_dir / "state")
         env["MOCKTAIL_COOKIE_FILE"] = str(profile_dir / "roblox.cookie")
         env["MOCKTAIL_DISABLE_FAILURE_DIALOG"] = "1"
-        env["MOCKTAIL_GRAPHICS_BACKEND"] = "opengl"
+        env["MOCKTAIL_GRAPHICS_BACKEND"] = graphics_backend
 
         # Detect Mocktail installation details
         from core.mocktail_manager import MocktailManager
@@ -460,7 +499,6 @@ class InstanceRunner:
         # Completely mute audio and cap frame rate to prevent CPU starvation for alts
         if is_alt:
             env["SDL_AUDIODRIVER"] = "dummy"
-            env["MOCKTAIL_DISABLE_AUDIO"] = "1"
             env["PULSE_SERVER"] = "/dev/null"
             env["ALSA_CARD"] = "Dummy"
             env["MOCKTAIL_F11_FULLSCREEN"] = "0"

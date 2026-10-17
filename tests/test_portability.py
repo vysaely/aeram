@@ -44,15 +44,32 @@ class TestPortabilityAndTopology(unittest.TestCase):
         self.assertEqual(main_4, {0, 1, 2, 3})
         self.assertEqual(alt_4, {2, 3})
 
-        # 12-core machine
-        main_12, alt_12 = compute_cpu_sets(12)
+        # 12 logical CPUs with unknown topology: numeric split
+        unknown = lambda cpu: None
+        main_12, alt_12 = compute_cpu_sets(12, core_of=unknown)
         self.assertEqual(main_12, {0, 1, 2, 3, 4, 5, 6, 7})
         self.assertEqual(alt_12, {8, 9, 10, 11})
 
-        # 16-core machine
-        main_16, alt_16 = compute_cpu_sets(16)
+        # 16 logical CPUs with unknown topology
+        main_16, alt_16 = compute_cpu_sets(16, core_of=unknown)
         self.assertEqual(len(main_16) + len(alt_16), 16)
         self.assertTrue(len(alt_16) >= 2)
+
+    def test_compute_cpu_sets_never_shares_a_physical_core(self):
+        """6 cores / 12 threads numbered like Linux on Ryzen: cpuN and cpuN+6 are SMT siblings."""
+        smt = lambda cpu: (0, cpu % 6)
+        main, alts = compute_cpu_sets(12, core_of=smt)
+        self.assertEqual(main, {0, 1, 2, 3, 6, 7, 8, 9})
+        self.assertEqual(alts, {4, 5, 10, 11})
+        main_cores = {smt(c) for c in main}
+        alt_cores = {smt(c) for c in alts}
+        self.assertFalse(main_cores & alt_cores, "alts must not run on SMT siblings of the main's cores")
+
+        # 8 cores / 16 threads
+        smt16 = lambda cpu: (0, cpu % 8)
+        main16, alts16 = compute_cpu_sets(16, core_of=smt16)
+        self.assertFalse({smt16(c) for c in main16} & {smt16(c) for c in alts16})
+        self.assertEqual(len(main16) + len(alts16), 16)
 
 
 class TestMocktailManager(unittest.TestCase):
