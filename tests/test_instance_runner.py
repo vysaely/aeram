@@ -153,6 +153,10 @@ class TestInstanceRunner(unittest.TestCase):
         self.assertNotIn("MOCKTAIL_HOST_CURSOR", self._launch_env({}, is_main=False))
         self.assertNotIn("MOCKTAIL_HOST_CURSOR", self._launch_env({"main_host_cursor": "false"}, is_main=True))
 
+    def test_alts_rest_between_engine_polls(self):
+        self.assertEqual(self._launch_env({}, is_main=False).get("MOCKTAIL_ENGINE_PUMP_REST"), "sleep")
+        self.assertNotIn("MOCKTAIL_ENGINE_PUMP_REST", self._launch_env({}, is_main=True))
+
     def test_helper_fps_scan_skipped_only_for_patched_mocktail(self):
         from unittest.mock import patch
         from core.mocktail_manager import MocktailInstallationInfo

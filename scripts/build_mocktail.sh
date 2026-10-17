@@ -2,7 +2,7 @@
 # ==============================================================================
 # AERAM: build Mocktail with AERAM's input-latency patch
 #
-# Clones upstream Mocktail at a pinned commit, applies native/mocktail/*.patch,
+# Clones upstream Mocktail at a pinned commit, applies native/mocktail/*.patch (in order),
 # builds it and installs it under ~/.local (bin/mocktail + lib/mocktail/).
 # Anything already installed there is backed up first. AERAM prefers this build
 # over a system (AUR/.deb/.rpm) Mocktail once the marker file below exists.
@@ -12,6 +12,9 @@
 #     frame-rendered arrow (AERAM sets it for main accounts)
 #   - 1 ms input polling instead of 4 ms when presentation is unthrottled
 #   - removal of the Android client's 240 FPS clamp
+#   - from Nightcap (github.com/CoderDayton/nightcap, Apache-2.0): a 100 us rest
+#     between engine polls instead of a spinning core, and login challenge
+#     fixes (device-integrity answer, solved challenges close, 5 s web start)
 # ==============================================================================
 
 set -euo pipefail

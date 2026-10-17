@@ -1,0 +1,2783 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index a3019d7..585fe12 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -268,6 +268,7 @@ add_library(mocktail_runtime STATIC
+   src/runtime/crash_report_policy.cc
+   src/runtime/discord_rpc.cc
+   src/runtime/device_memory_profile.cc
++  src/runtime/engine_pump_rest.cc
+   src/runtime/device_profile.cc
+   src/runtime/environment.cc
+   src/runtime/external_launch_broker.cc
+@@ -291,6 +292,7 @@ add_library(mocktail_runtime STATIC
+   src/runtime/roblox_game_session_native_adapter.cc
+   src/runtime/roblox_web_view_bridge.cc
+   src/runtime/roblox_permissions_bridge.cc
++  src/runtime/roblox_account_bridge.cc
+   src/runtime/roblox_message_bus_request_bridge.cc
+   src/runtime/roblox_call_protocol_bridge.cc
+   src/runtime/payload_update_preflight.cc
+@@ -389,7 +391,7 @@ add_library(mocktail_webview_helper_policy STATIC
+   src/webview/webview_helper_policy.cc
+ )
+ add_library(Mocktail::WebViewHelperPolicy ALIAS mocktail_webview_helper_policy)
+-target_include_directories(mocktail_webview_helper_policy PUBLIC src)
++target_include_directories(mocktail_webview_helper_policy PUBLIC src include)
+ target_link_libraries(mocktail_webview_helper_policy PUBLIC
+   PkgConfig::WEBKITGTK6
+   nlohmann_json::nlohmann_json
+diff --git a/include/compat/web_view_protocol_contract.h b/include/compat/web_view_protocol_contract.h
+new file mode 100644
+index 0000000..4bbdbd7
+--- /dev/null
++++ b/include/compat/web_view_protocol_contract.h
+@@ -0,0 +1,190 @@
++#ifndef MOCKTAIL_COMPAT_WEB_VIEW_PROTOCOL_CONTRACT_H_
++#define MOCKTAIL_COMPAT_WEB_VIEW_PROTOCOL_CONTRACT_H_
++
++#include <cstddef>
++#include <cstdint>
++#include <cstring>
++#include <optional>
++#include <string_view>
++
++// Roblox's Subsystem<IWebViewProtocol> getter is not exported. The exported
++// WebViewProtocol.initializeAndroidWebViewProtocol calls it first, into a
++// stack slot, then reads the protocol from the returned holder:
++//
++//   x86-64:  lea slot(%rbp),%rbx; mov %rbx,%rdi; call getter;
++//            mov (%rbx),%rbx; mov 0x18(%rbx),%rax
++//   AArch64: add x8, sp, #slot; bl getter; ldr xN, [sp, #slot];
++//            ldr x8, [xN, #0x18]
++//
++// These functions find that call site in the initializer's first bytes and
++// check the getter's own code. Only relocated or build-varying fields (stack
++// slots, frame sizes, PC-relative offsets, the call target) are masked.
++// Verified on x86_64 2.734.917, 2.736.1408 and 2.738.1397, and on arm64-v8a
++// 2.738.1397 and 2.740.931.
++
++namespace mocktail::compat {
++
++// Covers the call site in every verified build (x86-64 +0x27, AArch64 +0x34).
++inline constexpr std::size_t kWebViewProtocolInitializerScanBytes = 128;
++inline constexpr std::size_t kWebViewProtocolGetterBytesX86_64 = 44;
++inline constexpr std::size_t kWebViewProtocolGetterBytesArm64 = 60;
++
++namespace web_view_protocol_contract_detail {
++
++inline bool MatchesMasked(std::string_view code, std::size_t offset,
++                          std::string_view pattern,
++                          std::string_view wildcard) {
++  if (offset > code.size() || code.size() - offset < pattern.size()) {
++    return false;
++  }
++  for (std::size_t index = 0; index < pattern.size(); ++index) {
++    if (wildcard[index] == 'x') continue;
++    if (code[offset + index] != pattern[index]) return false;
++  }
++  return true;
++}
++
++// AArch64 instructions are little-endian words.
++inline std::uint32_t Word(std::string_view code, std::size_t index) {
++  std::uint32_t word = 0;
++  for (std::size_t byte = 0; byte < 4; ++byte) {
++    word |= static_cast<std::uint32_t>(
++                static_cast<unsigned char>(code[index * 4 + byte]))
++            << (8 * byte);
++  }
++  return word;
++}
++
++// One AArch64 instruction word: bits outside `mask` may vary.
++struct MaskedWord {
++  std::uint32_t mask;
++  std::uint32_t value;
++};
++
++inline constexpr std::uint32_t kExact = 0xffffffffU;
++// adrp Xd, page: immlo and immhi vary.
++inline constexpr std::uint32_t kAdrpMask = 0x9f00001fU;
++// add Xd, Xn, #imm12: imm12 varies.
++inline constexpr std::uint32_t kAddImmediateMask = 0xffc003ffU;
++
++}  // namespace web_view_protocol_contract_detail
++
++// Returns the getter address called from the x86-64 initializer at
++// `address`, or nullopt unless the frame setup and exactly one call site
++// match.
++inline std::optional<std::uintptr_t> FindWebViewProtocolGetterCallX86_64(
++    std::string_view code, std::uintptr_t address) {
++  using web_view_protocol_contract_detail::MatchesMasked;
++  // push %rbp; mov %rsp,%rbp
++  if (!MatchesMasked(code, 0, "\x55\x48\x89\xe5", "....")) {
++    return std::nullopt;
++  }
++  static constexpr std::string_view kCallSite(
++      "\x48\x8d\x5d\x00\x48\x89\xdf\xe8\x00\x00\x00\x00\x48\x8b\x1b\x48\x8b\x43"
++      "\x18",
++      19);
++  static constexpr std::string_view kCallSiteWildcard("...x....xxxx.......");
++  static constexpr std::size_t kCallDisplacement = 8;
++  const std::string_view window =
++      code.substr(0, kWebViewProtocolInitializerScanBytes);
++  std::optional<std::size_t> call_site;
++  for (std::size_t offset = 0; offset < window.size(); ++offset) {
++    if (MatchesMasked(window, offset, kCallSite, kCallSiteWildcard)) {
++      if (call_site.has_value()) return std::nullopt;
++      call_site = offset;
++    }
++  }
++  if (!call_site.has_value()) return std::nullopt;
++  std::int32_t displacement = 0;
++  std::memcpy(&displacement, window.data() + *call_site + kCallDisplacement,
++              sizeof(displacement));
++  const std::uintptr_t next_instruction =
++      address + *call_site + kCallDisplacement + sizeof(displacement);
++  return next_instruction +
++         static_cast<std::uintptr_t>(static_cast<std::intptr_t>(displacement));
++}
++
++// The x86-64 getter stores the holder returned by the subsystem's acquire
++// into its result slot (%rdi) and returns that slot.
++inline bool HasWebViewProtocolGetterContractX86_64(std::string_view code) {
++  return web_view_protocol_contract_detail::MatchesMasked(
++      code, 0,
++      std::string_view(
++          "\x55\x48\x89\xe5\x53\x50\x48\x89\xfb\x8a\x05\x00\x00\x00\x00\x84\xc0"
++          "\x74\x19\x48\x8d\x3d\x00\x00\x00\x00\xe8\x59\x00\x00\x00\x48\x89\x03"
++          "\x48\x89\xd8\x48\x83\xc4\x08\x5b\x5d\xc3",
++          kWebViewProtocolGetterBytesX86_64),
++      "...........xxxx.......xxxx..................");
++}
++
++// Returns the getter address called from the AArch64 initializer at
++// `address`, or nullopt unless exactly one call site matches.
++inline std::optional<std::uintptr_t> FindWebViewProtocolGetterCallArm64(
++    std::string_view code, std::uintptr_t address) {
++  using web_view_protocol_contract_detail::Word;
++  const std::size_t words =
++      code.substr(0, kWebViewProtocolInitializerScanBytes).size() / 4;
++  std::optional<std::uintptr_t> getter;
++  for (std::size_t index = 0; index + 4 <= words; ++index) {
++    const std::uint32_t slot_address = Word(code, index);
++    const std::uint32_t call = Word(code, index + 1);
++    const std::uint32_t handle_load = Word(code, index + 2);
++    const std::uint32_t protocol_load = Word(code, index + 3);
++    // add x8, sp, #slot
++    if ((slot_address & 0xffc003ffU) != 0x910003e8U) continue;
++    // bl getter
++    if ((call & 0xfc000000U) != 0x94000000U) continue;
++    // ldr xN, [sp, #slot]
++    if ((handle_load & 0xffc003e0U) != 0xf94003e0U) continue;
++    const std::uint32_t slot = (slot_address >> 10) & 0xfffU;
++    if (((handle_load >> 10) & 0xfffU) * 8 != slot) continue;
++    // ldr x8, [xN, #0x18]
++    const std::uint32_t handle_register = handle_load & 0x1fU;
++    if (protocol_load != (0xf9400c08U | (handle_register << 5))) continue;
++    if (getter.has_value()) return std::nullopt;
++    // imm26 is a signed word offset from the bl instruction.
++    const std::int64_t imm26 = call & 0x03ffffffU;
++    const std::int64_t words_from_call =
++        (imm26 & 0x02000000) != 0 ? imm26 - 0x04000000 : imm26;
++    getter = address + (index + 1) * 4 +
++             static_cast<std::uintptr_t>(words_from_call * 4);
++  }
++  return getter;
++}
++
++// The AArch64 getter saves its result slot (x8) and stores the holder
++// returned by the subsystem's acquire there.
++inline bool HasWebViewProtocolGetterContractArm64(std::string_view code) {
++  using namespace web_view_protocol_contract_detail;
++  static constexpr MaskedWord kGetter[] = {
++      {kExact, 0xa9be7bfdU},              // stp x29, x30, [sp, #-0x20]!
++      {kExact, 0xf9000bf3U},              // str x19, [sp, #0x10]
++      {kExact, 0x910003fdU},              // mov x29, sp
++      {kAdrpMask, 0x90000009U},           // adrp x9, guard
++      {kAddImmediateMask, 0x91000129U},   // add x9, x9, :lo12:guard
++      {kExact, 0xaa0803f3U},              // mov x19, x8
++      {kExact, 0x08dffd29U},              // ldarb w9, [x9]
++      {kExact, 0x36000109U},              // tbz w9, #0, initialize
++      {kAdrpMask, 0x90000000U},           // adrp x0, holder
++      {kAddImmediateMask, 0x91000000U},   // add x0, x0, :lo12:holder
++      {kExact, 0x94000017U},              // bl acquire
++      {kExact, 0xf9000260U},              // str x0, [x19]
++      {kExact, 0xf9400bf3U},              // ldr x19, [sp, #0x10]
++      {kExact, 0xa8c27bfdU},              // ldp x29, x30, [sp], #0x20
++      {kExact, 0xd65f03c0U},              // ret
++  };
++  static_assert(sizeof(kGetter) / sizeof(kGetter[0]) * 4 ==
++                kWebViewProtocolGetterBytesArm64);
++  if (code.size() < kWebViewProtocolGetterBytesArm64) return false;
++  for (std::size_t index = 0; index < sizeof(kGetter) / sizeof(kGetter[0]);
++       ++index) {
++    if ((Word(code, index) & kGetter[index].mask) != kGetter[index].value) {
++      return false;
++    }
++  }
++  return true;
++}
++
++}  // namespace mocktail::compat
++
++#endif  // MOCKTAIL_COMPAT_WEB_VIEW_PROTOCOL_CONTRACT_H_
+diff --git a/include/runtime/engine_pump_rest.h b/include/runtime/engine_pump_rest.h
+new file mode 100644
+index 0000000..6eae2e8
+--- /dev/null
++++ b/include/runtime/engine_pump_rest.h
+@@ -0,0 +1,66 @@
++// Ported from Nightcap (github.com/CoderDayton/nightcap, Apache-2.0).
++#ifndef MOCKTAIL_RUNTIME_ENGINE_PUMP_REST_H_
++#define MOCKTAIL_RUNTIME_ENGINE_PUMP_REST_H_
++
++#include <cstdint>
++
++namespace mocktail::runtime {
++
++// The engine posts its per-frame main-thread step at a time of its own
++// choosing, with no signal the host can block on, so the host main thread
++// polls nativeCallMessagesFromMainThread. An empty poll costs a few
++// microseconds; polled back to back it burns a core.
++//
++// Between polls the thread rests for kEnginePumpRestNs. A post is then picked
++// up at most kEnginePumpRestNs + timer slack + wake latency late, far under
++// the engine's sub-millisecond slack.
++//
++// How it rests decides the clock. Under a power-saving governor the CPU clocks
++// a bursty core down unless some core stays awake, and the engine's render
++// thread then runs slower and drops frames. So:
++//   kSleep   nanosleep. The core idles. Correct only when the governor holds
++//            the clock up on its own (performance, which GameMode sets).
++//   kTpause  TPAUSE in C0.2. The core stays awake at reduced power, the clock
++//            holds, and the OS books the time as busy. Needs WAITPKG.
++//   kSpin    No rest. The core stays awake at full power.
++inline constexpr uint64_t kEnginePumpRestNs = 100'000;
++// Timer slack the calling thread is set to; the kernel default of 50 us would
++// otherwise stretch every sleep.
++inline constexpr uint64_t kEnginePumpTimerSlackNs = 10'000;
++// Shallow C-state exit plus scheduler latency on the host, for the bound.
++inline constexpr uint64_t kShallowWakeNs = 50'000;
++
++enum class EnginePumpRestMode { kSleep, kTpause, kSpin };
++
++const char* EnginePumpRestModeName(EnginePumpRestMode mode);
++
++struct EnginePumpRestInputs {
++  bool governor_performance = false;
++  bool cpu_has_waitpkg = false;
++  // MOCKTAIL_ENGINE_PUMP_REST: "sleep", "tpause" or "spin". Null, empty or
++  // unknown defers to the policy; "tpause" without WAITPKG does too.
++  const char* override = nullptr;
++};
++
++EnginePumpRestMode ChooseEnginePumpRestMode(const EnginePumpRestInputs& inputs);
++
++// True when the file holds "performance". `path` is a cpufreq
++// scaling_governor file; cpu0's stands for the machine.
++bool CpuGovernorIsPerformance(const char* path);
++
++bool CpuHasWaitPkg();
++
++// The mode chosen from the host on first use.
++EnginePumpRestMode ActiveEnginePumpRestMode();
++
++// Rests the calling thread in the given mode and returns the rest length, 0
++// for kSpin. The first call lowers the thread's timer slack to
++// kEnginePumpTimerSlackNs.
++uint64_t RestAfterEnginePump(EnginePumpRestMode mode);
++inline uint64_t RestAfterEnginePump() {
++  return RestAfterEnginePump(ActiveEnginePumpRestMode());
++}
++
++}  // namespace mocktail::runtime
++
++#endif  // MOCKTAIL_RUNTIME_ENGINE_PUMP_REST_H_
+diff --git a/include/runtime/roblox_account_bridge.h b/include/runtime/roblox_account_bridge.h
+new file mode 100644
+index 0000000..7f826ad
+--- /dev/null
++++ b/include/runtime/roblox_account_bridge.h
+@@ -0,0 +1,94 @@
++#ifndef MOCKTAIL_RUNTIME_ROBLOX_ACCOUNT_BRIDGE_H_
++#define MOCKTAIL_RUNTIME_ROBLOX_ACCOUNT_BRIDGE_H_
++
++#include <jni.h>
++
++#include <memory>
++#include <mutex>
++#include <string>
++
++#include "mocktail/status.h"
++#include "runtime/roblox_game_session_native_adapter.h"
++
++namespace mocktail {
++namespace runtime {
++
++// Exact JNI entrypoints behind the APK AccountProtocol device-integrity
++// handlers: JNIAccountProtocol name getters and MessageBus raw handlers.
++struct RobloxAccountProtocolSymbols {
++  using GetStringFn = jstring (*)(JNIEnv*, jclass);
++
++  GetStringFn get_protocol_name = nullptr;
++  GetStringFn get_device_integrity_available_method_name = nullptr;
++  GetStringFn get_integrity_token_method_name = nullptr;
++  GetStringFn get_support_key = nullptr;
++  GetStringFn get_token_key = nullptr;
++  GetStringFn get_result_key = nullptr;
++  void (*set_request_handler_raw)(JNIEnv*, jobject, jstring, jstring,
++                                  jobject) = nullptr;
++  void (*clear_request_handler)(JNIEnv*, jobject, jstring, jstring) = nullptr;
++
++  bool complete() const {
++    return get_protocol_name && get_device_integrity_available_method_name &&
++           get_integrity_token_method_name && get_support_key &&
++           get_token_key && get_result_key && set_request_handler_raw &&
++           clear_request_handler;
++  }
++};
++
++struct RobloxAccountProtocolObjects {
++  jobject message_bus = nullptr;
++  void* context = nullptr;
++  jobject (*create_request_handler)(void*, std::shared_ptr<void>,
++                                    std::string (*)(void*, JNIEnv*,
++                                                    jstring)) = nullptr;
++  void (*clear_request_handler)(void*, jobject) = nullptr;
++
++  bool complete() const {
++    return message_bus && context && create_request_handler &&
++           clear_request_handler;
++  }
++};
++
++// Answers AccountProtocol device-integrity requests for a host that cannot
++// produce Play Integrity tokens. No integrity token is ever produced.
++//
++// DeviceIntegrityAvailable reports no support. The APK handler always reports
++// support, so this answer differs from Android: it tells Roblox's challenge
++// flow up front that no token can come, instead of letting it request one.
++//
++// GetIntegrityToken returns at once with an empty token and
++// TOKEN_PROVIDER_UNINITIALIZED, the APK's answer when its Play token provider
++// never initialized. The APK answers INVALID_NONCE for a request without a
++// requestHash; this bridge never inspects the request, so it cannot.
++// LuaApp bounds each token request with its
++// DeviceIntegrityNativeTimeoutMilliseconds flag; an immediate answer keeps a
++// login challenge from sitting out that bound.
++class RobloxAccountBridge final {
++ public:
++  RobloxAccountBridge(JniEnvironmentProvider environment,
++                      RobloxAccountProtocolSymbols symbols,
++                      RobloxAccountProtocolObjects objects);
++  ~RobloxAccountBridge();
++  RobloxAccountBridge(const RobloxAccountBridge&) = delete;
++  RobloxAccountBridge& operator=(const RobloxAccountBridge&) = delete;
++
++  Status Initialize();
++  Status Shutdown();
++
++ private:
++  struct State;
++  Status ShutdownLocked();
++
++  const JniEnvironmentProvider environment_;
++  const RobloxAccountProtocolSymbols symbols_;
++  const RobloxAccountProtocolObjects objects_;
++  // Serializes lifecycle only. Native dispatch never holds this mutex.
++  std::mutex lifecycle_mutex_;
++  std::shared_ptr<State> state_;
++};
++
++}  // namespace runtime
++}  // namespace mocktail
++
++#endif  // MOCKTAIL_RUNTIME_ROBLOX_ACCOUNT_BRIDGE_H_
+diff --git a/include/runtime/roblox_experience_composition.h b/include/runtime/roblox_experience_composition.h
+index 80803fa..c3bc04f 100644
+--- a/include/runtime/roblox_experience_composition.h
++++ b/include/runtime/roblox_experience_composition.h
+@@ -3,6 +3,7 @@
+ 
+ #include <jni.h>
+ 
++#include <chrono>
+ #include <cstdint>
+ #include <deque>
+ #include <memory>
+@@ -18,6 +19,7 @@
+ #include "runtime/roblox_experience_launch_bridge.h"
+ #include "runtime/roblox_experience_presence.h"
+ #include "runtime/roblox_fresh_game_launch_controller.h"
++#include "runtime/roblox_account_bridge.h"
+ #include "runtime/roblox_permissions_bridge.h"
+ #include "runtime/roblox_web_view_bridge.h"
+ #include "runtime/webview_roblox_cookie.h"
+@@ -123,7 +125,8 @@ class RobloxExperienceComposition final {
+       RobloxExperienceSurfaceProvider surface_provider = {},
+       RobloxExperiencePresenceObserver presence_observer = {},
+       bool clear_persisted_web_view_cookie = false,
+-      bool microphone_enabled = false);
++      bool microphone_enabled = false,
++      RobloxAccountProtocolSymbols account_symbols = {});
+   ~RobloxExperienceComposition();
+ 
+   RobloxExperienceComposition(const RobloxExperienceComposition&) = delete;
+@@ -165,6 +168,7 @@ class RobloxExperienceComposition final {
+     bool visible = true;
+     bool back_navigation_disabled = false;
+     bool show_domain_as_title = false;
++    bool close_when_challenge_solved = false;
+   };
+ 
+   static Status DispatchLaunch(void* context,
+@@ -204,8 +208,11 @@ class RobloxExperienceComposition final {
+                         const WebSurfacePresentation& presentation);
+   // WebViewProtocol and BrowserService are two logical transports over the
+   // APK's single physical WebView container. Either protocol may close or
+-  // mutate the surface that the other one opened.
+-  Status CloseWebSurface();
++  // mutate the surface that the other one opened. A nonzero
++  // expected_logical_generation closes only that surface.
++  Status CloseWebSurface(uint64_t expected_logical_generation = 0);
++  // Closes a solved challenge that Roblox left open past its grace period.
++  Status CloseUnclaimedSolvedChallenge();
+   void HandleWebSurfaceExit(uint64_t process_generation);
+   Status Dispatch(const RobloxExperienceLaunchRequest& request);
+   Status PromoteAuthenticatedSession();
+@@ -232,6 +239,7 @@ class RobloxExperienceComposition final {
+   const RobloxWebViewMessageBusSymbols web_view_symbols_;
+   const RobloxBrowserServiceSymbols browser_service_symbols_;
+   const RobloxPermissionsMessageBusSymbols permissions_symbols_;
++  const RobloxAccountProtocolSymbols account_symbols_;
+   const bool microphone_enabled_;
+   const RobloxGameSessionSymbols game_symbols_;
+   const RobloxExperienceJniFactory jni_factory_;
+@@ -252,6 +260,8 @@ class RobloxExperienceComposition final {
+   std::unique_ptr<RobloxBrowserServiceBridge> browser_service_bridge_;
+   std::unique_ptr<RobloxPermissionsBridge> permissions_bridge_;
+   std::unique_ptr<RobloxCallProtocolBridge> call_protocol_bridge_;
++  // Optional: a payload without the AccountProtocol entrypoints still starts.
++  std::unique_ptr<RobloxAccountBridge> account_bridge_;
+   std::shared_ptr<WebViewHelperProcess> web_surface_process_;
+   std::shared_ptr<WebSurfaceExitTarget> web_surface_exit_target_;
+   std::shared_ptr<LifecycleTarget> lifecycle_target_;
+@@ -261,6 +271,13 @@ class RobloxExperienceComposition final {
+   uint64_t web_surface_logical_generation_ = 0;
+   uint64_t next_web_surface_process_generation_ = 1;
+   uint64_t next_web_surface_logical_generation_ = 1;
++  // The current surface closes as soon as its solved challenge is forwarded.
++  bool web_surface_close_when_challenge_solved_ = false;
++  // Set when a solved challenge is forwarded; applies only to that logical
++  // surface generation.
++  std::optional<std::chrono::steady_clock::time_point>
++      solved_challenge_close_deadline_;
++  uint64_t solved_challenge_logical_generation_ = 0;
+   SecureWebViewRobloxCookie web_view_cookie_;
+   std::string web_view_cookie_initialization_error_;
+   bool web_view_cookie_synchronized_ = false;
+diff --git a/include/runtime/roblox_platform_web_symbols.h b/include/runtime/roblox_platform_web_symbols.h
+index 2c86790..2b9c1be 100644
+--- a/include/runtime/roblox_platform_web_symbols.h
++++ b/include/runtime/roblox_platform_web_symbols.h
+@@ -1,6 +1,7 @@
+ #ifndef MOCKTAIL_RUNTIME_ROBLOX_PLATFORM_WEB_SYMBOLS_H_
+ #define MOCKTAIL_RUNTIME_ROBLOX_PLATFORM_WEB_SYMBOLS_H_
+ 
++#include "runtime/roblox_account_bridge.h"
+ #include "runtime/roblox_browser_service_bridge.h"
+ #include "runtime/roblox_permissions_bridge.h"
+ #include "runtime/roblox_web_view_bridge.h"
+@@ -15,6 +16,8 @@ struct RobloxPlatformWebSymbols {
+   RobloxWebViewMessageBusSymbols web_view;
+   RobloxBrowserServiceSymbols browser_service;
+   RobloxPermissionsMessageBusSymbols permissions;
++  // Optional and excluded from complete(); see RobloxExperienceComposition.
++  RobloxAccountProtocolSymbols account;
+ 
+   bool complete() const {
+     return web_view.complete() && browser_service.complete() &&
+diff --git a/include/runtime/roblox_web_view_bridge.h b/include/runtime/roblox_web_view_bridge.h
+index d93d7da..b78f087 100644
+--- a/include/runtime/roblox_web_view_bridge.h
++++ b/include/runtime/roblox_web_view_bridge.h
+@@ -13,6 +13,8 @@
+ #include <mutex>
+ #include <optional>
+ #include <string>
++#include <string_view>
++#include <type_traits>
+ 
+ #include "mocktail/status.h"
+ #include "runtime/roblox_game_session_native_adapter.h"
+@@ -30,6 +32,9 @@ inline constexpr char kRobloxOpenCaptchaViewNotification[] =
+     "OPEN_CAPTCHA_VIEW";
+ inline constexpr char kRobloxViewProfileNotification[] = "VIEW_PROFILE";
+ inline constexpr char kRobloxPurchaseRobuxNotification[] = "PURCHASE_ROBUX";
++// Sent with a decimal user id when the app asks for a chat with that user.
++inline constexpr char kRobloxLaunchConversationNotification[] =
++    "LAUNCH_CONVERSATION";
+ 
+ // Owned subset of WebViewProtocol's openWindow payload. The URL is copied
+ // before the MessageBus RawCallback returns, so no JNI local reference escapes.
+@@ -42,6 +47,10 @@ struct RobloxWebViewOpenRequest {
+   std::optional<bool> show_domain_as_title;
+   std::optional<bool> back_button_visible;
+   std::optional<bool> hide_header;
++  // Set by the bridge, never parsed. The host closes an OPEN_CAPTCHA_VIEW
++  // window once its solved captcha has been forwarded, as Android's captcha
++  // activity finishes itself on success.
++  bool close_when_challenge_solved = false;
+ };
+ 
+ // WebViewProtocol.mutateWindow is a partial update. Field absence must remain
+@@ -61,6 +70,9 @@ Status ParseRobloxWebViewMutationJson(const std::string& json,
+                                       RobloxWebViewMutationRequest* request);
+ Status ParseRobloxCaptchaOpenJson(const std::string& json,
+                                   RobloxWebViewOpenRequest* request);
++// True for a page's Navigation.navigateToFeature command reporting a solved
++// verification (see webview::IsRobloxChallengeSolvedFeature).
++bool IsRobloxWebViewChallengeSuccess(std::string_view command);
+ Status ParseRobloxProfileViewUrl(const std::string& url,
+                                  RobloxWebViewOpenRequest* request);
+ Status ParseRobloxPurchaseRobuxNotification(const std::string& json,
+@@ -106,8 +118,43 @@ using PublishWebViewRawFn = void (*)(JNIEnv *, jobject, jstring, jstring);
+ using BroadcastWebViewDataModelFocusFn = void (*)(JNIEnv *, jclass, jstring,
+                                                   jstring, jstring);
+ using SignalWebViewJavascriptCallbackFn = void (*)(JNIEnv*, jclass, jstring);
++// NativeGLInterface.nativeAppBridgeV2SendAppEventOnGameLoaded(namespace,
++// detail, detailType).
++using SendRobloxAppEventOnGameLoadedFn = void (*)(JNIEnv*, jclass, jstring,
++                                                  jstring, jstring);
++// NativeGLInterface.nativeAppBridgeV2SendAppEventOnAppReady(namespace, detail,
++// detailType, appName). The engine holds the event until appName is ready.
++using SendRobloxAppEventOnAppReadyFn = void (*)(JNIEnv*, jclass, jstring,
++                                                jstring, jstring, jstring);
+ using UpdateRobloxCookieSetHandlerFn =
+     void (*)(JNIEnv*, jobject, jobject);
++// Roblox's counted handle to its Subsystem<IWebViewProtocol>. The protocol,
++// and its handleJavascriptCallback subscriber, exist only while a handle is
++// held. Roblox's handle type is not trivially destructible, so its getter
++// returns it through the caller-supplied result slot (rdi on x86-64, x8 on
++// AArch64). The user-provided destructor gives this type the same calling
++// convention. It does not release the handle.
++class RobloxWebViewProtocolHandle final {
++ public:
++  RobloxWebViewProtocolHandle() = default;
++  explicit RobloxWebViewProtocolHandle(void* holder) : holder_(holder) {}
++  RobloxWebViewProtocolHandle(const RobloxWebViewProtocolHandle&) = default;
++  RobloxWebViewProtocolHandle& operator=(const RobloxWebViewProtocolHandle&) =
++      default;
++  ~RobloxWebViewProtocolHandle() {}
++
++  void* holder() const { return holder_; }
++
++ private:
++  void* holder_ = nullptr;
++};
++static_assert(sizeof(RobloxWebViewProtocolHandle) == sizeof(void*));
++static_assert(!std::is_trivially_destructible_v<RobloxWebViewProtocolHandle>);
++
++// Roblox's Subsystem<IWebViewProtocol> getter. It is not exported; the
++// resolver finds it through the first call in
++// WebViewProtocol.initializeAndroidWebViewProtocol.
++using AcquireWebViewProtocolFn = RobloxWebViewProtocolHandle (*)();
+ 
+ struct RobloxWebViewMessageBusSymbols {
+   GetWebViewOpenWindowIdFn get_open_window_id = nullptr;
+@@ -129,6 +176,11 @@ struct RobloxWebViewMessageBusSymbols {
+   GetWebViewCloseWindowIdFn get_close_window_id = nullptr;
+   SignalWebViewJavascriptCallbackFn signal_javascript_callback = nullptr;
+   UpdateRobloxCookieSetHandlerFn update_cookie_set_handler = nullptr;
++  // Optional: found by code contract, not by symbol name.
++  AcquireWebViewProtocolFn acquire_web_view_protocol = nullptr;
++  // Optional: without them LAUNCH_CONVERSATION is reported as unavailable.
++  SendRobloxAppEventOnGameLoadedFn send_app_event_on_game_loaded = nullptr;
++  SendRobloxAppEventOnAppReadyFn send_app_event_on_app_ready = nullptr;
+ 
+   bool complete() const {
+     return get_open_window_id != nullptr &&
+@@ -232,11 +284,14 @@ private:
+    kDataModelUnfocused,
+    kDataModelFocused,
+    kMessageBusWindowClose,
++   kStartConversationWithUser,
+  };
+ 
+  struct PendingHostWindowEvent {
+    HostWindowEventType type = HostWindowEventType::kDataModelUnfocused;
+    uint64_t generation = 0;
++   // Decimal user id of a kStartConversationWithUser event.
++   std::string user_id;
+  };
+ 
+   Status CheckJniException(JNIEnv *env, const char *operation) const;
+@@ -245,6 +300,8 @@ private:
+   Status DispatchOpenRequest(RobloxWebViewOpenRequest request,
+                              OpenSource source);
+   void QueueHostWindowEvent(HostWindowEventType type, uint64_t generation);
++  void QueueStartConversation(std::string user_id);
++  Status SendStartConversationEvents(JNIEnv* env, const std::string& user_id);
+   Status BeginDispatch();
+   void EndDispatch();
+   static void RawMessageCallback(void *context, JNIEnv *env, jstring message);
+@@ -287,6 +344,10 @@ private:
+   std::array<std::shared_ptr<RawCallbackTarget>, kSubscriptionCount>
+       raw_callback_targets_{};
+   std::shared_ptr<HostWindowCloseTarget> host_window_close_target_;
++  // The reference this counts is kept for the process lifetime, as Roblox's
++  // Android app start keeps its own. Neither Shutdown nor destruction
++  // releases it.
++  RobloxWebViewProtocolHandle web_view_protocol_handle_;
+   std::size_t in_flight_dispatches_ = 0;
+   bool initializing_ = false;
+   bool shutting_down_ = false;
+diff --git a/include/webview/roblox_challenge_features.h b/include/webview/roblox_challenge_features.h
+new file mode 100644
+index 0000000..8b20d4a
+--- /dev/null
++++ b/include/webview/roblox_challenge_features.h
+@@ -0,0 +1,19 @@
++#ifndef MOCKTAIL_WEBVIEW_ROBLOX_CHALLENGE_FEATURES_H_
++#define MOCKTAIL_WEBVIEW_ROBLOX_CHALLENGE_FEATURES_H_
++
++#include <string_view>
++
++namespace mocktail::webview {
++
++// Navigation.navigateToFeature features a Roblox verification page sends when
++// the user has solved it. The captcha page sends CaptchaSuccess; the generic
++// challenge page (challenge/cdn/hybrid) sends challengeCompleted. The WebView
++// helper and the runtime both classify page events with this list.
++inline bool IsRobloxChallengeSolvedFeature(std::string_view feature) {
++  return feature == "CaptchaSuccess" || feature == "challengeCompleted" ||
++         feature == "ChallengeCompleted";
++}
++
++}  // namespace mocktail::webview
++
++#endif  // MOCKTAIL_WEBVIEW_ROBLOX_CHALLENGE_FEATURES_H_
+diff --git a/src/legacy/legacy_runtime.cc b/src/legacy/legacy_runtime.cc
+index 9b3a8a2..0a04e7a 100644
+--- a/src/legacy/legacy_runtime.cc
++++ b/src/legacy/legacy_runtime.cc
+@@ -61,6 +61,7 @@
+ #include "mocktail/graphics/bionic_egl_bridge.h"
+ #include "runtime/device_memory_profile.h"
+ #include "runtime/display_size.h"
++#include "runtime/engine_pump_rest.h"
+ #include "runtime/environment.h"
+ #include "runtime/discord_rpc.h"
+ #include "runtime/jnivm_platform_web_callbacks.h"
+@@ -6750,7 +6751,8 @@ int mocktail::legacy::Run(const runtime::CommandLineOptions& options,
+               mocktail::runtime::RobloxExperienceSurfaceProvider{},
+               discord_rpc.observer(),
+               dependencies.clear_persisted_web_view_cookie(),
+-              runtime_config.microphone_enabled());
++              runtime_config.microphone_enabled(),
++              platform_web_symbols.account);
+       const mocktail::Status platform_protocol_status =
+           experience_composition->InitializePlatformProtocols();
+       if (!platform_protocol_status.ok()) {
+@@ -7007,6 +7009,10 @@ int mocktail::legacy::Run(const runtime::CommandLineOptions& options,
+   bool input_shutdown_completed = window_input_runtime == nullptr;
+   bool resize_readiness_completed = true;
+   if (mocktail::window::IsInitialised()) {
++    std::cout << "  [main] engine pump rest: "
++              << mocktail::runtime::EnginePumpRestModeName(
++                     mocktail::runtime::ActiveEnginePumpRestMode())
++              << " (MOCKTAIL_ENGINE_PUMP_REST=sleep|tpause|spin)\n";
+     std::cout << "  [main] entering SDL event loop (close the window to quit)\n"
+               << std::flush;
+     std::unique_ptr<mocktail::window::WindowGameSurfaceBridge> surface_bridge;
+@@ -7122,7 +7128,14 @@ int mocktail::legacy::Run(const runtime::CommandLineOptions& options,
+         }
+       }
+       const uint64_t fps_after_launch_ns = fps_trace ? MonotonicNanos() : 0;
+-      const uint64_t fps_pace_ns = mocktail::window::PaceInputPump();
++      // The pacer sleeps only under throttled presentation. Unthrottled, the
++      // engine pump above is a poll, and the rest between polls is what keeps
++      // it from spinning a core (about 146k empty polls a second).
++      uint64_t fps_pace_ns = mocktail::window::PaceInputPump();
++      if (fps_pace_ns == 0 &&
++          mocktail::window::UnthrottledPresentationRequested()) {
++        fps_pace_ns = mocktail::runtime::RestAfterEnginePump();
++      }
+       if (fps_trace) {
+         const uint64_t fps_tick_end_ns = MonotonicNanos();
+         ++fps_samples;
+diff --git a/src/runtime/engine_pump_rest.cc b/src/runtime/engine_pump_rest.cc
+new file mode 100644
+index 0000000..9b6aa42
+--- /dev/null
++++ b/src/runtime/engine_pump_rest.cc
+@@ -0,0 +1,147 @@
++// Ported from Nightcap (github.com/CoderDayton/nightcap, Apache-2.0).
++#include "runtime/engine_pump_rest.h"
++
++#include <sys/prctl.h>
++#include <time.h>
++
++#if defined(__x86_64__)
++#include <cpuid.h>
++#include <immintrin.h>
++#include <x86intrin.h>
++#endif
++
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++
++namespace mocktail::runtime {
++namespace {
++
++uint64_t NowNs() {
++  timespec now{};
++  clock_gettime(CLOCK_MONOTONIC, &now);
++  return static_cast<uint64_t>(now.tv_sec) * 1'000'000'000ULL +
++         static_cast<uint64_t>(now.tv_nsec);
++}
++
++// The kernel caps one TPAUSE at umwait_control/max_time TSC cycles (100000 by
++// default), so the wait is a loop of short pauses up to the deadline. Control
++// bit 0 clear selects C0.2, the deeper of the two light states.
++#if defined(__x86_64__)
++__attribute__((target("waitpkg"))) void TpauseUntil(uint64_t deadline_ns) {
++  while (NowNs() < deadline_ns) {
++    _tpause(0, __rdtsc() + 100000ULL);
++  }
++}
++#else
++// TPAUSE is x86-only. CpuHasWaitPkg() is false on other hosts, so kTpause is
++// never chosen there; this waits out the deadline if it is forced anyway.
++void TpauseUntil(uint64_t deadline_ns) {
++  while (NowNs() < deadline_ns) {
++  }
++}
++#endif
++
++void LowerTimerSlackOnce() {
++  // Only the main thread rests, so the slack is set once per process.
++  static const bool slack_set = [] {
++    return prctl(PR_SET_TIMERSLACK, kEnginePumpTimerSlackNs) == 0;
++  }();
++  (void)slack_set;
++}
++
++}  // namespace
++
++const char* EnginePumpRestModeName(EnginePumpRestMode mode) {
++  switch (mode) {
++    case EnginePumpRestMode::kSleep:
++      return "sleep";
++    case EnginePumpRestMode::kTpause:
++      return "tpause";
++    case EnginePumpRestMode::kSpin:
++      return "spin";
++  }
++  return "spin";
++}
++
++EnginePumpRestMode ChooseEnginePumpRestMode(
++    const EnginePumpRestInputs& inputs) {
++  if (inputs.override != nullptr) {
++    if (std::strcmp(inputs.override, "sleep") == 0) {
++      return EnginePumpRestMode::kSleep;
++    }
++    if (std::strcmp(inputs.override, "spin") == 0) {
++      return EnginePumpRestMode::kSpin;
++    }
++    if (std::strcmp(inputs.override, "tpause") == 0 &&
++        inputs.cpu_has_waitpkg) {
++      return EnginePumpRestMode::kTpause;
++    }
++  }
++  if (inputs.governor_performance) {
++    return EnginePumpRestMode::kSleep;
++  }
++  return inputs.cpu_has_waitpkg ? EnginePumpRestMode::kTpause
++                                : EnginePumpRestMode::kSpin;
++}
++
++bool CpuGovernorIsPerformance(const char* path) {
++  std::FILE* file = std::fopen(path, "r");
++  if (file == nullptr) {
++    return false;
++  }
++  char governor[32] = {};
++  const bool read = std::fgets(governor, sizeof(governor), file) != nullptr;
++  std::fclose(file);
++  if (!read) {
++    return false;
++  }
++  governor[std::strcspn(governor, "\r\n")] = '\0';
++  return std::strcmp(governor, "performance") == 0;
++}
++
++bool CpuHasWaitPkg() {
++#if defined(__x86_64__)
++  unsigned eax = 0, ebx = 0, ecx = 0, edx = 0;
++  if (__get_cpuid_count(7, 0, &eax, &ebx, &ecx, &edx) == 0) {
++    return false;
++  }
++  return (ecx & (1u << 5)) != 0;
++#else
++  return false;
++#endif
++}
++
++EnginePumpRestMode ActiveEnginePumpRestMode() {
++  static const EnginePumpRestMode mode = [] {
++    EnginePumpRestInputs inputs;
++    inputs.governor_performance = CpuGovernorIsPerformance(
++        "/sys/devices/system/cpu/cpu0/cpufreq/scaling_governor");
++    inputs.cpu_has_waitpkg = CpuHasWaitPkg();
++    inputs.override = std::getenv("MOCKTAIL_ENGINE_PUMP_REST");
++    return ChooseEnginePumpRestMode(inputs);
++  }();
++  return mode;
++}
++
++uint64_t RestAfterEnginePump(EnginePumpRestMode mode) {
++  LowerTimerSlackOnce();
++  switch (mode) {
++    case EnginePumpRestMode::kSpin:
++      return 0;
++    case EnginePumpRestMode::kTpause:
++      TpauseUntil(NowNs() + kEnginePumpRestNs);
++      return kEnginePumpRestNs;
++    case EnginePumpRestMode::kSleep:
++      break;
++  }
++  timespec rest{};
++  rest.tv_sec = 0;
++  rest.tv_nsec = static_cast<long>(kEnginePumpRestNs);
++  // A signal may cut the rest short. The remainder is not slept again: an
++  // early poll only costs a few microseconds.
++  (void)clock_nanosleep(CLOCK_MONOTONIC, 0, &rest, nullptr);
++  return kEnginePumpRestNs;
++}
++
++}  // namespace mocktail::runtime
+diff --git a/src/runtime/roblox_account_bridge.cc b/src/runtime/roblox_account_bridge.cc
+new file mode 100644
+index 0000000..1a42159
+--- /dev/null
++++ b/src/runtime/roblox_account_bridge.cc
+@@ -0,0 +1,239 @@
++#include "runtime/roblox_account_bridge.h"
++
++#include <array>
++#include <condition_variable>
++#include <cstdio>
++#include <iterator>
++#include <nlohmann/json.hpp>
++#include <string>
++#include <utility>
++
++namespace mocktail {
++namespace runtime {
++namespace {
++
++constexpr char kAccountProtocolClass[] =
++    "com/roblox/universalapp/account/JNIAccountProtocol";
++// Serialized name of the APK status enum for a missing Play token provider.
++constexpr char kTokenProviderUninitialized[] = "TOKEN_PROVIDER_UNINITIALIZED";
++constexpr std::size_t kMaximumNameBytes = 128;
++
++enum Method : std::size_t { kDeviceIntegrityAvailable, kGetIntegrityToken };
++constexpr std::size_t kMethodCount = 2;
++constexpr const char* kMethodLabels[kMethodCount] = {"DeviceIntegrityAvailable",
++                                                     "GetIntegrityToken"};
++
++Status Unavailable(const char* message) {
++  return Status::Error(StatusCode::kUnavailable, message);
++}
++
++Status CheckJni(JNIEnv* env) {
++  if (!env->ExceptionCheck()) return Status::Ok();
++  env->ExceptionClear();
++  return Unavailable("AccountProtocol JNI operation failed");
++}
++
++// Copies a non-empty, bounded engine-provided name.
++bool ReadName(JNIEnv* env, jstring value, std::string* name) {
++  if (!value) return false;
++  const jsize size = env->GetStringUTFLength(value);
++  const char* bytes = env->GetStringUTFChars(value, nullptr);
++  const bool valid = bytes && size > 0 &&
++                     static_cast<std::size_t>(size) <= kMaximumNameBytes;
++  if (valid) name->assign(bytes, static_cast<std::size_t>(size));
++  if (bytes) env->ReleaseStringUTFChars(value, bytes);
++  return valid;
++}
++
++// Pins a valid engine-provided name as a global reference.
++jstring RetainName(JNIEnv* env, jstring value) {
++  std::string ignored;
++  return ReadName(env, value, &ignored)
++             ? static_cast<jstring>(env->NewGlobalRef(value))
++             : nullptr;
++}
++
++}  // namespace
++
++struct RobloxAccountBridge::State {
++  struct Endpoint {
++    std::shared_ptr<State> state;
++    Method method;
++  };
++  struct Registration {
++    jobject handler = nullptr;
++    jstring method = nullptr;
++    bool registered = false;
++  };
++
++  jobject bus = nullptr;
++  jstring protocol = nullptr;
++  std::string support_key;
++  std::string token_key;
++  std::string result_key;
++  std::array<Registration, kMethodCount> registrations;
++  std::mutex mutex;
++  std::condition_variable drained;
++  bool accepting = true;
++  std::size_t in_flight = 0;
++
++  // The request payload is never parsed or logged: both answers are fixed.
++  static std::string Answer(void* context, JNIEnv*, jstring) {
++    const auto* endpoint = static_cast<Endpoint*>(context);
++    const auto state = endpoint->state;
++    {
++      std::lock_guard<std::mutex> lock(state->mutex);
++      if (!state->accepting) return {};
++      ++state->in_flight;
++    }
++    struct Finish {
++      std::shared_ptr<State> state;
++      ~Finish() {
++        std::lock_guard<std::mutex> lock(state->mutex);
++        --state->in_flight;
++        state->drained.notify_all();
++      }
++    } finish{state};
++
++    nlohmann::json body;
++    const char* result = nullptr;
++    if (endpoint->method == kDeviceIntegrityAvailable) {
++      body = {{state->support_key, false}};
++      result = "unsupported";
++    } else {
++      body = {{state->token_key, ""},
++              {state->result_key, kTokenProviderUninitialized}};
++      result = kTokenProviderUninitialized;
++    }
++    std::fprintf(stderr, "  [account] AccountProtocol method=%s result=%s\n",
++                 kMethodLabels[endpoint->method], result);
++    return body.dump();
++  }
++};
++
++RobloxAccountBridge::RobloxAccountBridge(JniEnvironmentProvider environment,
++                                         RobloxAccountProtocolSymbols symbols,
++                                         RobloxAccountProtocolObjects objects)
++    : environment_(environment), symbols_(symbols), objects_(objects) {}
++
++RobloxAccountBridge::~RobloxAccountBridge() { (void)Shutdown(); }
++
++Status RobloxAccountBridge::Initialize() {
++  std::lock_guard<std::mutex> lifecycle(lifecycle_mutex_);
++  if (state_) {
++    return Status::Error(StatusCode::kFailedPrecondition,
++                         "AccountProtocol is already initialized");
++  }
++  if (!environment_.valid() || !symbols_.complete() || !objects_.complete()) {
++    return Unavailable("AccountProtocol prerequisites are incomplete");
++  }
++  JNIEnv* env = nullptr;
++  Status status = environment_.Acquire(&env);
++  if (!status.ok()) return status;
++
++  jclass protocol_class = env->FindClass(kAccountProtocolClass);
++  if (!protocol_class) {
++    (void)CheckJni(env);
++    return Unavailable("JNIAccountProtocol class is unavailable");
++  }
++  const jstring protocol = symbols_.get_protocol_name(env, protocol_class);
++  const jstring methods[kMethodCount] = {
++      symbols_.get_device_integrity_available_method_name(env, protocol_class),
++      symbols_.get_integrity_token_method_name(env, protocol_class)};
++  const jstring keys[] = {symbols_.get_support_key(env, protocol_class),
++                          symbols_.get_token_key(env, protocol_class),
++                          symbols_.get_result_key(env, protocol_class)};
++  env->DeleteLocalRef(protocol_class);
++
++  state_ = std::make_shared<State>();
++  std::string* const key_targets[] = {&state_->support_key,
++                                      &state_->token_key, &state_->result_key};
++  bool names_valid = true;
++  for (std::size_t i = 0; i < std::size(keys); ++i) {
++    names_valid = ReadName(env, keys[i], key_targets[i]) && names_valid;
++    if (keys[i]) env->DeleteLocalRef(keys[i]);
++  }
++  state_->protocol = RetainName(env, protocol);
++  if (protocol) env->DeleteLocalRef(protocol);
++  for (std::size_t i = 0; i < kMethodCount; ++i) {
++    state_->registrations[i].method = RetainName(env, methods[i]);
++    names_valid = state_->registrations[i].method && names_valid;
++    if (methods[i]) env->DeleteLocalRef(methods[i]);
++  }
++  state_->bus = env->NewGlobalRef(objects_.message_bus);
++  auto fail = [this](Status failure) {
++    (void)ShutdownLocked();
++    return failure;
++  };
++  if (!CheckJni(env).ok() || !names_valid || !state_->protocol ||
++      !state_->bus) {
++    return fail(Unavailable("AccountProtocol names are unavailable"));
++  }
++
++  for (std::size_t i = 0; i < kMethodCount; ++i) {
++    auto& entry = state_->registrations[i];
++    auto endpoint = std::make_shared<State::Endpoint>(
++        State::Endpoint{state_, static_cast<Method>(i)});
++    jobject handler = objects_.create_request_handler(objects_.context,
++                                                      endpoint, &State::Answer);
++    if (handler) {
++      entry.handler = env->NewGlobalRef(handler);
++      if (!entry.handler) {
++        objects_.clear_request_handler(objects_.context, handler);
++      }
++      env->DeleteLocalRef(handler);
++    }
++    if (!entry.handler || !CheckJni(env).ok()) {
++      return fail(Unavailable("could not create AccountProtocol handler"));
++    }
++    entry.registered = true;
++    symbols_.set_request_handler_raw(env, state_->bus, state_->protocol,
++                                     entry.method, entry.handler);
++    status = CheckJni(env);
++    if (!status.ok()) return fail(status);
++  }
++  std::fprintf(stderr,
++               "  [account] AccountProtocol ready device_integrity=unsupported\n");
++  return Status::Ok();
++}
++
++Status RobloxAccountBridge::Shutdown() {
++  std::lock_guard<std::mutex> lifecycle(lifecycle_mutex_);
++  return ShutdownLocked();
++}
++
++Status RobloxAccountBridge::ShutdownLocked() {
++  if (!state_) return Status::Ok();
++  {
++    std::unique_lock<std::mutex> lock(state_->mutex);
++    state_->accepting = false;
++    state_->drained.wait(lock, [this] { return state_->in_flight == 0; });
++  }
++  JNIEnv* env = nullptr;
++  Status status = environment_.Acquire(&env);
++  if (!status.ok()) return status;  // Keep roots for a later shutdown retry.
++  // Clear any exception from partially failed initialization before cleanup.
++  const Status pending = CheckJni(env);
++  if (!pending.ok()) status = pending;
++  for (auto& entry : state_->registrations) {
++    if (entry.registered) {
++      symbols_.clear_request_handler(env, state_->bus, state_->protocol,
++                                     entry.method);
++      const Status cleared = CheckJni(env);
++      if (!cleared.ok()) status = cleared;
++    }
++    if (entry.handler) {
++      objects_.clear_request_handler(objects_.context, entry.handler);
++      env->DeleteGlobalRef(entry.handler);
++    }
++    if (entry.method) env->DeleteGlobalRef(entry.method);
++    entry = {};
++  }
++  if (state_->protocol) env->DeleteGlobalRef(state_->protocol);
++  if (state_->bus) env->DeleteGlobalRef(state_->bus);
++  state_.reset();
++  return status;
++}
++
++}  // namespace runtime
++}  // namespace mocktail
+diff --git a/src/runtime/roblox_experience_composition.cc b/src/runtime/roblox_experience_composition.cc
+index c6f7746..6d22279 100644
+--- a/src/runtime/roblox_experience_composition.cc
++++ b/src/runtime/roblox_experience_composition.cc
+@@ -11,6 +11,7 @@
+ 
+ #include "jnivm/jnivm.h"
+ #include "runtime/external_launch_broker.h"
++#include "runtime/roblox_launch_uri.h"
+ #include "runtime/webview_helper_launcher.h"
+ #include "window/window.h"
+ 
+@@ -21,7 +22,13 @@ namespace {
+ constexpr size_t kMaxPendingLaunchRequests = 8;
+ // libroblox's static TLS requires the proven 16 MiB guest-thread stack floor.
+ constexpr size_t kLaunchWorkerStackSize = 64ULL * 1024 * 1024;
+-constexpr std::chrono::milliseconds kWebSurfaceReadyTimeout{3000};
++// Covers helper exec through window creation, including cold Flatpak starts.
++constexpr std::chrono::milliseconds kWebSurfaceReadyTimeout{5000};
++// Roblox closes a solved WebViewProtocol challenge itself with closeWindow,
++// as on Android. The host closes it only if Roblox has not done so within
++// this period. Captcha windows close at once instead (see
++// RobloxWebViewOpenRequest::close_when_challenge_solved).
++constexpr std::chrono::milliseconds kSolvedChallengeCloseGrace{3000};
+ constexpr char kRobloxBaseUrl[] = "https://www.roblox.com/";
+ 
+ Status Invalid(std::string message) {
+@@ -163,24 +170,33 @@ Status LaunchRobloxWebSurface(
+   }
+   std::fprintf(stderr, "  [%s] opening validated Roblox web surface\n",
+                transport);
++  const auto started = std::chrono::steady_clock::now();
+   const WebViewHelperLaunchResult launched =
+       LaunchWebViewHelper(helper, url, std::move(exit_observer));
+   if (!launched) {
+     return Unavailable("could not display Roblox web surface: " +
+                        launched.error);
+   }
+-  if (launched.process == nullptr ||
+-      !launched.process->WaitUntilReady(kWebSurfaceReadyTimeout)) {
++  const bool ready = launched.process != nullptr &&
++                     launched.process->WaitUntilReady(kWebSurfaceReadyTimeout);
++  const long long elapsed_ms =
++      std::chrono::duration_cast<std::chrono::milliseconds>(
++          std::chrono::steady_clock::now() - started)
++          .count();
++  if (!ready) {
+     if (launched.process != nullptr) {
+       (void)launched.process->RequestClose();
+     }
+     return Unavailable(
+-        "Roblox web surface did not become ready before the deadline");
++        "Roblox web surface did not become ready before the deadline (" +
++        std::to_string(elapsed_ms) + " ms of " +
++        std::to_string(kWebSurfaceReadyTimeout.count()) + " ms)");
+   }
+   if (process != nullptr) {
+     *process = launched.process;
+   }
+-  std::fprintf(stderr, "  [%s] Roblox web surface launched\n", transport);
++  std::fprintf(stderr, "  [%s] Roblox web surface launched in %lld ms\n",
++               transport, elapsed_ms);
+   return Status::Ok();
+ }
+ 
+@@ -309,12 +325,14 @@ RobloxExperienceComposition::RobloxExperienceComposition(
+     const SecureRobloxCredential* initial_web_view_credential,
+     RobloxExperienceSurfaceProvider surface_provider,
+     RobloxExperiencePresenceObserver presence_observer,
+-    bool clear_persisted_web_view_cookie, bool microphone_enabled)
++    bool clear_persisted_web_view_cookie, bool microphone_enabled,
++    RobloxAccountProtocolSymbols account_symbols)
+     : environment_(environment),
+       message_bus_symbols_(message_bus_symbols),
+       web_view_symbols_(web_view_symbols),
+       browser_service_symbols_(browser_service_symbols),
+       permissions_symbols_(permissions_symbols),
++      account_symbols_(account_symbols),
+       microphone_enabled_(microphone_enabled),
+       game_symbols_(game_symbols),
+       jni_factory_(jni_factory),
+@@ -448,12 +466,34 @@ Status RobloxExperienceComposition::InitializePlatformProtocols() {
+     (void)ReleaseGlobalObjects();
+     return status;
+   }
++  // AccountProtocol only shortens a device-integrity login challenge that
++  // cannot succeed here, so its absence or failure never blocks startup.
++  std::unique_ptr<RobloxAccountBridge> account_bridge;
++  if (account_symbols_.complete()) {
++    account_bridge = std::make_unique<RobloxAccountBridge>(
++        environment_, account_symbols_,
++        RobloxAccountProtocolObjects{web_view_objects.message_bus,
++                                     jni_factory_.context,
++                                     jni_factory_.create_request_handler,
++                                     jni_factory_.clear_request_handler});
++    const Status account_status = account_bridge->Initialize();
++    if (!account_status.ok()) {
++      std::fprintf(stderr, "  [account] AccountProtocol unavailable: %s\n",
++                   account_status.message().c_str());
++      account_bridge.reset();
++    }
++  } else {
++    std::fprintf(stderr,
++                 "  [account] AccountProtocol entrypoints are missing; "
++                 "device-integrity challenges wait for Roblox's timeout\n");
++  }
+   {
+     std::lock_guard<std::mutex> lock(mutex_);
+     web_view_bridge_ = std::move(web_view_bridge);
+     browser_service_bridge_ = std::move(browser_service_bridge);
+     permissions_bridge_ = std::move(permissions_bridge);
+     call_protocol_bridge_ = std::move(call_protocol_bridge);
++    account_bridge_ = std::move(account_bridge);
+     platform_protocols_initialized_ = true;
+   }
+   std::fprintf(stderr,
+@@ -627,6 +667,8 @@ Status RobloxExperienceComposition::OpenWebSurface(
+     web_surface_process_generation_ = process_generation;
+     web_surface_route_ = route;
+     web_surface_logical_generation_ = logical_generation;
++    web_surface_close_when_challenge_solved_ =
++        presentation.close_when_challenge_solved;
+     web_surface_logical_exit_observer_ = std::move(exit_observer);
+   }
+   if (superseded_observer.valid()) {
+@@ -639,13 +681,16 @@ Status RobloxExperienceComposition::OpenWebSurface(
+   return Status::Ok();
+ }
+ 
+-Status RobloxExperienceComposition::CloseWebSurface() {
++Status RobloxExperienceComposition::CloseWebSurface(
++    uint64_t expected_logical_generation) {
+   std::lock_guard<std::mutex> operation_lock(web_surface_operation_mutex_);
+   std::shared_ptr<WebViewHelperProcess> process;
+   WebViewHelperExitObserver exit_observer;
+   {
+     std::lock_guard<std::mutex> lock(mutex_);
+-    if (web_surface_route_ == WebSurfaceRoute::kNone) {
++    if (web_surface_route_ == WebSurfaceRoute::kNone ||
++        (expected_logical_generation != 0 &&
++         expected_logical_generation != web_surface_logical_generation_)) {
+       return Status::Ok();
+     }
+     process = std::move(web_surface_process_);
+@@ -653,6 +698,7 @@ Status RobloxExperienceComposition::CloseWebSurface() {
+     exit_observer = std::move(web_surface_logical_exit_observer_);
+     web_surface_route_ = WebSurfaceRoute::kNone;
+     web_surface_logical_generation_ = 0;
++    web_surface_close_when_challenge_solved_ = false;
+   }
+   // A closed challenge must stop executing. Reusing its hidden document lets
+   // late callbacks from the old attempt reach the next login attempt. The APK
+@@ -668,6 +714,33 @@ Status RobloxExperienceComposition::CloseWebSurface() {
+   return Status::Ok();
+ }
+ 
++Status RobloxExperienceComposition::CloseUnclaimedSolvedChallenge() {
++  uint64_t generation = 0;
++  {
++    std::lock_guard<std::mutex> lock(mutex_);
++    if (!solved_challenge_close_deadline_.has_value()) {
++      return Status::Ok();
++    }
++    const bool still_open =
++        web_surface_route_ != WebSurfaceRoute::kNone &&
++        solved_challenge_logical_generation_ == web_surface_logical_generation_;
++    if (still_open &&
++        std::chrono::steady_clock::now() < *solved_challenge_close_deadline_) {
++      return Status::Ok();
++    }
++    solved_challenge_close_deadline_.reset();
++    if (!still_open) {
++      return Status::Ok();
++    }
++    generation = solved_challenge_logical_generation_;
++  }
++  std::fprintf(stderr,
++               "  [webview] closing solved challenge window; Roblox did not "
++               "close it within %lld ms\n",
++               static_cast<long long>(kSolvedChallengeCloseGrace.count()));
++  return CloseWebSurface(generation);
++}
++
+ void RobloxExperienceComposition::WebSurfaceExited(void* context) {
+   auto* exit_context = static_cast<WebSurfaceExitContext*>(context);
+   if (exit_context == nullptr || exit_context->target == nullptr ||
+@@ -693,6 +766,7 @@ void RobloxExperienceComposition::HandleWebSurfaceExit(
+     web_surface_process_generation_ = 0;
+     web_surface_route_ = WebSurfaceRoute::kNone;
+     web_surface_logical_generation_ = 0;
++    web_surface_close_when_challenge_solved_ = false;
+     exit_observer = std::move(web_surface_logical_exit_observer_);
+   }
+   if (exit_observer.valid()) {
+@@ -718,6 +792,8 @@ Status RobloxExperienceComposition::DispatchWebViewOpen(
+   // host back navigation too.
+   presentation.back_navigation_disabled =
+       request.back_button_visible.has_value() && !*request.back_button_visible;
++  presentation.close_when_challenge_solved =
++      request.close_when_challenge_solved;
+   return composition->OpenWebSurface(request.url, "webview",
+                                      WebSurfaceRoute::kWebView,
+                                      std::move(exit_observer), presentation);
+@@ -976,9 +1052,32 @@ Status RobloxExperienceComposition::RouteCurrentWebSurfaceEvent(
+     route = web_surface_route_;
+     web_view_bridge = web_view_bridge_.get();
+   }
+-  return event.type == WebViewHelperEventType::kRobloxCookie
+-             ? AcceptWebViewRobloxCookie(event.payload)
+-             : RouteWebSurfaceEvent(route, event, web_view_bridge);
++  if (event.type == WebViewHelperEventType::kRobloxCookie) {
++    return AcceptWebViewRobloxCookie(event.payload);
++  }
++  const Status status = RouteWebSurfaceEvent(route, event, web_view_bridge);
++  if (!status.ok() || !IsRobloxWebViewChallengeSuccess(event.payload)) {
++    return status;
++  }
++  std::fprintf(stderr, "  [webview] solved challenge forwarded to Roblox\n");
++  bool close_now = false;
++  {
++    std::lock_guard<std::mutex> lock(mutex_);
++    if (logical_generation != web_surface_logical_generation_) {
++      return status;
++    }
++    close_now = web_surface_close_when_challenge_solved_;
++    if (!close_now) {
++      solved_challenge_close_deadline_ =
++          std::chrono::steady_clock::now() + kSolvedChallengeCloseGrace;
++      solved_challenge_logical_generation_ = logical_generation;
++    }
++  }
++  if (!close_now) {
++    return status;
++  }
++  std::fprintf(stderr, "  [webview] closing solved captcha window\n");
++  return CloseWebSurface(logical_generation);
+ }
+ 
+ Status RobloxExperienceComposition::DrainPlatformEvents() {
+@@ -1027,6 +1126,9 @@ Status RobloxExperienceComposition::DrainPlatformEvents() {
+     status = drain_helper(web_surface_process, process_generation,
+                           logical_generation);
+   }
++  if (status.ok()) {
++    status = CloseUnclaimedSolvedChallenge();
++  }
+   if (status.ok() && browser_service_bridge != nullptr) {
+     status = browser_service_bridge->DrainOutgoingEvents();
+   }
+@@ -1575,6 +1677,7 @@ Status RobloxExperienceComposition::Shutdown() {
+   std::unique_ptr<RobloxBrowserServiceBridge> browser_service_bridge;
+   std::unique_ptr<RobloxPermissionsBridge> permissions_bridge;
+   std::unique_ptr<RobloxCallProtocolBridge> call_protocol_bridge;
++  std::unique_ptr<RobloxAccountBridge> account_bridge;
+   std::shared_ptr<WebViewHelperProcess> web_surface_process;
+   jnivm::VM* late_lifecycle_vm = nullptr;
+   {
+@@ -1599,6 +1702,7 @@ Status RobloxExperienceComposition::Shutdown() {
+     browser_service_bridge = std::move(browser_service_bridge_);
+     permissions_bridge = std::move(permissions_bridge_);
+     call_protocol_bridge = std::move(call_protocol_bridge_);
++    account_bridge = std::move(account_bridge_);
+     web_surface_process = std::move(web_surface_process_);
+     web_surface_logical_exit_observer_ = {};
+     web_surface_route_ = WebSurfaceRoute::kNone;
+@@ -1618,6 +1722,10 @@ Status RobloxExperienceComposition::Shutdown() {
+   Status status = call_protocol_bridge != nullptr
+                       ? call_protocol_bridge->Shutdown()
+                       : Status::Ok();
++  const Status account_status =
++      account_bridge != nullptr ? account_bridge->Shutdown() : Status::Ok();
++  if (status.ok())
++    status = account_status;
+   const Status permissions_status = permissions_bridge != nullptr
+                                         ? permissions_bridge->Shutdown()
+                                         : Status::Ok();
+@@ -1640,6 +1748,7 @@ Status RobloxExperienceComposition::Shutdown() {
+   }
+   browser_service_bridge.reset();
+   call_protocol_bridge.reset();
++  account_bridge.reset();
+   permissions_bridge.reset();
+   web_view_bridge.reset();
+   bridge.reset();
+diff --git a/src/runtime/roblox_platform_web_symbols.cc b/src/runtime/roblox_platform_web_symbols.cc
+index a5d7af4..31f5ee9 100644
+--- a/src/runtime/roblox_platform_web_symbols.cc
++++ b/src/runtime/roblox_platform_web_symbols.cc
+@@ -1,7 +1,11 @@
+ #include "runtime/roblox_platform_web_symbols.h"
+ 
++#include <cstdint>
++#include <optional>
+ #include <string>
++#include <string_view>
+ 
++#include "compat/web_view_protocol_contract.h"
+ #include "linker/linker.h"
+ 
+ namespace mocktail {
+@@ -14,6 +18,41 @@ Function Resolve(void* library, const char* name) {
+       linker::ResolveSymbol(library, std::string(name)));
+ }
+ 
++// Reads the mapped initializer and follows its getter call only when both
++// match the code contract for this host's architecture. Both reads stay
++// inside libroblox.so's text segment: the initializer is longer than the scan
++// window, and the getter address comes from a verified call site.
++AcquireWebViewProtocolFn FindWebViewProtocolGetter(const void* initializer) {
++  if (initializer == nullptr) return nullptr;
++  const auto address = reinterpret_cast<std::uintptr_t>(initializer);
++  const std::string_view code(static_cast<const char*>(initializer),
++                              compat::kWebViewProtocolInitializerScanBytes);
++#if defined(__x86_64__)
++  const std::optional<std::uintptr_t> getter =
++      compat::FindWebViewProtocolGetterCallX86_64(code, address);
++  const bool getter_matches =
++      getter.has_value() &&
++      compat::HasWebViewProtocolGetterContractX86_64(std::string_view(
++          reinterpret_cast<const char*>(*getter),
++          compat::kWebViewProtocolGetterBytesX86_64));
++#elif defined(__aarch64__)
++  const std::optional<std::uintptr_t> getter =
++      compat::FindWebViewProtocolGetterCallArm64(code, address);
++  const bool getter_matches =
++      getter.has_value() &&
++      compat::HasWebViewProtocolGetterContractArm64(std::string_view(
++          reinterpret_cast<const char*>(*getter),
++          compat::kWebViewProtocolGetterBytesArm64));
++#else
++  const std::optional<std::uintptr_t> getter;
++  const bool getter_matches = false;
++  (void)code;
++  (void)address;
++#endif
++  return getter_matches ? reinterpret_cast<AcquireWebViewProtocolFn>(*getter)
++                        : nullptr;
++}
++
+ }  // namespace
+ 
+ RobloxPlatformWebSymbols ResolveRobloxPlatformWebSymbols(
+@@ -46,6 +85,9 @@ RobloxPlatformWebSymbols ResolveRobloxPlatformWebSymbols(
+           roblox_library,
+           "Java_com_roblox_protocols_webview_WebViewProtocol_"
+           "initializeAndroidWebViewProtocol");
++  symbols.web_view.acquire_web_view_protocol = FindWebViewProtocolGetter(
++      reinterpret_cast<const void*>(
++          symbols.web_view.initialize_android_web_view_protocol));
+   symbols.web_view.subscribe_raw = subscribe_raw;
+   symbols.web_view.delete_connection = delete_connection;
+   symbols.web_view.set_request_handler_raw =
+@@ -83,6 +125,16 @@ RobloxPlatformWebSymbols ResolveRobloxPlatformWebSymbols(
+           roblox_library,
+           "Java_com_roblox_universalapp_cookie_JNICookieProtocol_"
+           "updateOnSetCookieHandler");
++  symbols.web_view.send_app_event_on_game_loaded =
++      Resolve<SendRobloxAppEventOnGameLoadedFn>(
++          roblox_library,
++          "Java_com_roblox_engine_jni_NativeGLInterface_"
++          "nativeAppBridgeV2SendAppEventOnGameLoaded");
++  symbols.web_view.send_app_event_on_app_ready =
++      Resolve<SendRobloxAppEventOnAppReadyFn>(
++          roblox_library,
++          "Java_com_roblox_engine_jni_NativeGLInterface_"
++          "nativeAppBridgeV2SendAppEventOnAppReady");
+ 
+   symbols.browser_service.bind = Resolve<BindRobloxMemStorageFn>(
+       roblox_library, "Java_com_roblox_engine_jni_memstorage_MemStorage_bind");
+@@ -118,6 +170,24 @@ RobloxPlatformWebSymbols ResolveRobloxPlatformWebSymbols(
+           roblox_library,
+           "Java_com_roblox_universalapp_messagebus_MessageBus_"
+           "callResponseHandlerRaw");
++  using AccountStringFn = RobloxAccountProtocolSymbols::GetStringFn;
++  constexpr char kAccountPrefix[] =
++      "Java_com_roblox_universalapp_account_JNIAccountProtocol_";
++  const auto account_getter = [&](const char* name) {
++    return Resolve<AccountStringFn>(roblox_library,
++                                    (std::string(kAccountPrefix) + name).c_str());
++  };
++  symbols.account.get_protocol_name = account_getter("getProtocolName");
++  symbols.account.get_device_integrity_available_method_name =
++      account_getter("getDeviceIntegrityAvailableMethodName");
++  symbols.account.get_integrity_token_method_name =
++      account_getter("getGetIntegrityTokenMethodName");
++  symbols.account.get_support_key = account_getter("getSupportKey");
++  symbols.account.get_token_key = account_getter("getTokenKey");
++  symbols.account.get_result_key = account_getter("getResultKey");
++  symbols.account.set_request_handler_raw =
++      symbols.web_view.set_request_handler_raw;
++  symbols.account.clear_request_handler = symbols.web_view.clear_request_handler;
+   return symbols;
+ }
+ 
+diff --git a/src/runtime/roblox_web_view_bridge.cc b/src/runtime/roblox_web_view_bridge.cc
+index 2de6421..c3743aa 100644
+--- a/src/runtime/roblox_web_view_bridge.cc
++++ b/src/runtime/roblox_web_view_bridge.cc
+@@ -9,6 +9,7 @@
+ #include <utility>
+ 
+ #include "runtime/environment.h"
++#include "webview/roblox_challenge_features.h"
+ 
+ namespace mocktail {
+ namespace runtime {
+@@ -35,6 +36,8 @@ constexpr char kNativeGlInterfaceClass[] =
+     "com/roblox/engine/jni/NativeGLInterface";
+ constexpr char kConnectionPointerField[] = "a";
+ constexpr std::size_t kMaximumPendingHostWindowEvents = 256;
++// Digits of the largest signed 64-bit user id.
++constexpr std::size_t kMaximumRobloxUserIdDigits = 19;
+ constexpr std::string_view kBrowserLoginUrl = "https://www.roblox.com/login";
+ 
+ bool EqualsIgnoreCase(std::string_view a, std::string_view b) {
+@@ -95,6 +98,21 @@ bool IsLoginChallengeUrl(std::string_view url) {
+   return false;
+ }
+ 
++// A positive decimal that fits a signed 64-bit integer, without sign, spaces
++// or leading zero.
++bool IsRobloxUserId(std::string_view value) {
++  constexpr std::string_view kLargest = "9223372036854775807";
++  if (value.empty() || value.size() > kLargest.size() || value[0] == '0') {
++    return false;
++  }
++  for (const char digit : value) {
++    if (digit < '0' || digit > '9') {
++      return false;
++    }
++  }
++  return value.size() < kLargest.size() || value <= kLargest;
++}
++
+ Status Invalid(std::string message) {
+   return Status::Error(StatusCode::kInvalidArgument, std::move(message));
+ }
+@@ -401,6 +419,39 @@ Status ParseRobloxCaptchaOpenJson(const std::string& json,
+   return Status::Ok();
+ }
+ 
++bool IsRobloxWebViewChallengeSuccess(std::string_view command) {
++  if (command.empty() || command.size() > kMaximumRobloxWebViewJsonBytes) {
++    return false;
++  }
++  const nlohmann::json document =
++      nlohmann::json::parse(command.begin(), command.end(), nullptr, false);
++  const auto string_field = [](const nlohmann::json& object,
++                               const char* key) -> const std::string* {
++    const auto field = object.find(key);
++    return field != object.end() && field->is_string()
++               ? &field->get_ref<const std::string&>()
++               : nullptr;
++  };
++  const auto object_field = [](const nlohmann::json& object,
++                               const char* key) -> const nlohmann::json* {
++    const auto field = object.find(key);
++    return field != object.end() && field->is_object() ? &*field : nullptr;
++  };
++  if (!document.is_object()) {
++    return false;
++  }
++  const std::string* module = string_field(document, "moduleID");
++  const std::string* function = string_field(document, "functionName");
++  const nlohmann::json* outer = object_field(document, "params");
++  const nlohmann::json* navigation =
++      outer != nullptr ? object_field(*outer, "params") : nullptr;
++  const std::string* feature =
++      navigation != nullptr ? string_field(*navigation, "feature") : nullptr;
++  return module != nullptr && *module == "Navigation" && function != nullptr &&
++         *function == "navigateToFeature" && feature != nullptr &&
++         webview::IsRobloxChallengeSolvedFeature(*feature);
++}
++
+ Status ParseRobloxProfileViewUrl(const std::string& url,
+                                  RobloxWebViewOpenRequest* request) {
+   if (request == nullptr) {
+@@ -911,6 +962,20 @@ Status RobloxWebViewBridge::Initialize() {
+   // handler and window subscriptions are installed before the native Android
+   // protocol is initialized. Calling the native initializer earlier loses
+   // messages that it can publish synchronously during startup.
++  // Roblox's Android app start holds a WebViewProtocol handle for the process
++  // lifetime. Without one, the protocol is deleted as soon as each caller
++  // releases it, and page callbacks wait for the next Lua WebView call to
++  // recreate it. Taking it before the native initializer keeps the protocol
++  // that initializer configures.
++  if (symbols_.acquire_web_view_protocol != nullptr) {
++    if (web_view_protocol_handle_.holder() == nullptr) {
++      web_view_protocol_handle_ = symbols_.acquire_web_view_protocol();
++    }
++  } else {
++    std::fprintf(stderr,
++                 "  [webview] WebViewProtocol getter not recognized; page "
++                 "callbacks may wait for the next Roblox WebView call\n");
++  }
+   jclass initialization_class = env->FindClass(kWebViewProtocolClass);
+   if (initialization_class != nullptr) {
+     symbols_.initialize_android_web_view_protocol(env, initialization_class);
+@@ -1266,6 +1331,7 @@ Status RobloxWebViewBridge::DispatchOpenRequest(
+           exit_context->target->browser_login_fallback = browser_login_fallback;
+         }
+       }
++      request.close_when_challenge_solved = source == OpenSource::kCaptcha;
+       if (status.ok()) {
+         status = sink_.dispatch_open(
+             sink_.context, request,
+@@ -1306,7 +1372,20 @@ void RobloxWebViewBridge::QueueHostWindowEvent(HostWindowEventType type,
+                  "  [webview] pending host event queue overflow; preserving "
+                  "newest lifecycle state\n");
+   }
+-  pending_host_window_events_.push_back({type, generation});
++  pending_host_window_events_.push_back({type, generation, {}});
++}
++
++void RobloxWebViewBridge::QueueStartConversation(std::string user_id) {
++  std::lock_guard<std::mutex> lock(host_window_event_mutex_);
++  if (pending_host_window_events_.size() == kMaximumPendingHostWindowEvents) {
++    pending_host_window_events_.pop_front();
++    std::fprintf(stderr,
++                 "  [webview] pending host event queue overflow; preserving "
++                 "newest lifecycle state\n");
++  }
++  pending_host_window_events_.push_back(
++      {HostWindowEventType::kStartConversationWithUser, 0,
++       std::move(user_id)});
+ }
+ 
+ Status RobloxWebViewBridge::DrainHostWindowEvents() {
+@@ -1369,8 +1448,24 @@ Status RobloxWebViewBridge::DrainHostWindowEvents() {
+         }
+         break;
+       }
++      case HostWindowEventType::kStartConversationWithUser: {
++        // A failed send is dropped, not retried: the click that asked for
++        // the conversation is stale by the next drain.
++        const Status sent = SendStartConversationEvents(env, event.user_id);
++        if (sent.ok()) {
++          std::fprintf(stderr,
++                       "  [app-shell] Chat opened with a conversation "
++                       "request\n");
++        } else {
++          std::fprintf(stderr,
++                       "  [app-shell] conversation request failed: %s\n",
++                       sent.message().c_str());
++        }
++        break;
++      }
+     }
+-    if (status.ok() && event.type != HostWindowEventType::kDataModelUnfocused) {
++    if (status.ok() && event.type != HostWindowEventType::kDataModelUnfocused &&
++        event.type != HostWindowEventType::kStartConversationWithUser) {
+       const std::shared_ptr<HostWindowCloseTarget> target =
+           host_window_close_target_;
+       if (target != nullptr) {
+@@ -1423,6 +1518,28 @@ Status RobloxWebViewBridge::HandleDataModelNotification(JNIEnv* env,
+                                         OpenSource::kDataModelNotification);
+   }
+ 
++  if (owned_type == kRobloxLaunchConversationNotification) {
++    std::string user_id;
++    status = CopyJniString(env, data, kMaximumRobloxUserIdDigits,
++                           "conversation user id", &user_id);
++    if (!status.ok()) {
++      return status;
++    }
++    if (!IsRobloxUserId(user_id)) {
++      return Invalid("LAUNCH_CONVERSATION payload is not a user id");
++    }
++    if (symbols_.send_app_event_on_game_loaded == nullptr ||
++        symbols_.send_app_event_on_app_ready == nullptr) {
++      return Unavailable("Roblox app event entrypoints are unavailable");
++    }
++    std::fprintf(stderr,
++                 "  [app-shell] LAUNCH_CONVERSATION notification received\n");
++    // The engine is inside its notification callback. The reply is sent from
++    // the next host event drain, as Android posts it to its main thread.
++    QueueStartConversation(std::move(user_id));
++    return Status::Ok();
++  }
++
+   RobloxWebViewOpenRequest request;
+   if (owned_type == kRobloxViewProfileNotification) {
+     std::string owned_url;
+@@ -1603,6 +1720,53 @@ Status RobloxWebViewBridge::BroadcastDataModelFocus(JNIEnv *env,
+   return CheckJniException(env, "broadcast AppInput DataModel focus event");
+ }
+ 
++// Mirrors the Android app shell's reply to LAUNCH_CONVERSATION: switch the
++// Lua app to its Chat destination, then ask Chat to start the conversation
++// once that app reports ready.
++Status RobloxWebViewBridge::SendStartConversationEvents(
++    JNIEnv* env, const std::string& user_id) {
++  if (env == nullptr || symbols_.send_app_event_on_game_loaded == nullptr ||
++      symbols_.send_app_event_on_app_ready == nullptr) {
++    return Unavailable("Roblox app event entrypoints are unavailable");
++  }
++  jclass native_gl_class = env->FindClass(kNativeGlInterfaceClass);
++  const std::array<jstring, 7> strings = {
++      env->NewStringUTF("Navigations"),
++      env->NewStringUTF(R"({"appName":"Chat"})"),
++      env->NewStringUTF("Destination"),
++      env->NewStringUTF("AppShellNotifications"),
++      env->NewStringUTF(user_id.c_str()),
++      env->NewStringUTF("StartConversationWithUserId"),
++      env->NewStringUTF("Chat"),
++  };
++  bool allocated = native_gl_class != nullptr;
++  for (jstring value : strings) {
++    allocated = allocated && value != nullptr;
++  }
++  Status status = allocated
++                      ? Status::Ok()
++                      : Unavailable("could not allocate conversation events");
++  if (status.ok()) {
++    symbols_.send_app_event_on_game_loaded(env, native_gl_class, strings[0],
++                                           strings[1], strings[2]);
++    status = CheckJniException(env, "send Chat destination app event");
++  }
++  if (status.ok()) {
++    symbols_.send_app_event_on_app_ready(env, native_gl_class, strings[3],
++                                         strings[4], strings[5], strings[6]);
++    status = CheckJniException(env, "send start conversation app event");
++  }
++  for (jstring value : strings) {
++    if (value != nullptr) {
++      env->DeleteLocalRef(value);
++    }
++  }
++  if (native_gl_class != nullptr) {
++    env->DeleteLocalRef(native_gl_class);
++  }
++  return status;
++}
++
+ Status RobloxWebViewBridge::BeginDispatch() {
+   std::lock_guard<std::mutex> lock(mutex_);
+   if ((!initializing_ && !initialized_) || !accepting_messages_) {
+diff --git a/src/webview/mocktail_webview_helper.cc b/src/webview/mocktail_webview_helper.cc
+index e2414cc..3ff579c 100644
+--- a/src/webview/mocktail_webview_helper.cc
++++ b/src/webview/mocktail_webview_helper.cc
+@@ -108,15 +108,9 @@ struct SurfaceState {
+   unsigned int resource_retries = 0;
+ };
+ 
++// A solved challenge stays open: the host forwards the event to Roblox, and
++// Roblox or the host closes the window after Roblox has received it.
+ struct CallbackConfirmation {
+-  CallbackConfirmation(GtkWindow* surface_window, CaptchaEventType event_type)
+-      : type(event_type) {
+-    g_weak_ref_init(&window, G_OBJECT(surface_window));
+-  }
+-
+-  ~CallbackConfirmation() { g_weak_ref_clear(&window); }
+-
+-  GWeakRef window;
+   CaptchaEventType type = CaptchaEventType::kShown;
+ };
+ 
+@@ -612,16 +606,6 @@ void FinishCallbackConfirmation(GObject* source_object, GAsyncResult* result,
+   if (value != nullptr) {
+     g_object_unref(value);
+   }
+-
+-  auto* window_object =
+-      static_cast<GObject*>(g_weak_ref_get(&confirmation->window));
+-  if (confirmed && confirmation->type == CaptchaEventType::kSuccess &&
+-      window_object != nullptr) {
+-    gtk_window_close(GTK_WINDOW(window_object));
+-  }
+-  if (window_object != nullptr) {
+-    g_object_unref(window_object);
+-  }
+   delete confirmation;
+ }
+ 
+@@ -644,9 +628,8 @@ void HandleHybridCommand(WebKitUserContentManager* manager,
+   if (window_object == nullptr) {
+     return;
+   }
+-  auto* confirmation =
+-      new CallbackConfirmation(GTK_WINDOW(window_object), event.type);
+   g_object_unref(window_object);
++  auto* confirmation = new CallbackConfirmation{event.type};
+   const std::string script = BuildCallbackScript(event.callback_id);
+   WebKitWebView* web_view = WEBKIT_WEB_VIEW(
+       g_object_get_data(G_OBJECT(manager), "mocktail-web-view"));
+@@ -1441,6 +1424,11 @@ void Activate(GtkApplication* application, gpointer user_data) {
+   state->disable_hardware_acceleration =
+       mocktail::webview::ShouldDisableWebViewHardwareAcceleration(
+           wayland_display, std::getenv("WEBKIT_DISABLE_COMPOSITING_MODE"));
++  // GTK picks its renderer when a window is realized, which is after this.
++  if (mocktail::webview::ShouldForceSoftwareGtkRenderer(
++          state->disable_hardware_acceleration, std::getenv("GSK_RENDERER"))) {
++    setenv("GSK_RENDERER", "cairo", 0);
++  }
+   std::cerr << "[webview] display=" << (wayland_display ? "wayland" : "other")
+             << " compositing="
+             << (state->disable_hardware_acceleration ? "software" : "default")
+diff --git a/src/webview/webview_helper_policy.cc b/src/webview/webview_helper_policy.cc
+index 00220db..828b252 100644
+--- a/src/webview/webview_helper_policy.cc
++++ b/src/webview/webview_helper_policy.cc
+@@ -9,6 +9,8 @@
+ #include <string>
+ #include <string_view>
+ 
++#include "webview/roblox_challenge_features.h"
++
+ namespace mocktail {
+ namespace webview {
+ namespace {
+@@ -131,6 +133,11 @@ bool ShouldDisableWebViewHardwareAcceleration(
+   return wayland_display;
+ }
+ 
++bool ShouldForceSoftwareGtkRenderer(bool software_compositing,
++                                    const char* renderer_override) {
++  return software_compositing && renderer_override == nullptr;
++}
++
+ const char* AndroidBridgeSource() { return kBridgeSource; }
+ 
+ std::string BuildRobloxAndroidUserAgent() {
+@@ -306,7 +313,7 @@ bool ParseCaptchaEvent(std::string_view command, CaptchaEvent* event) {
+     event->type = CaptchaEventType::kShown;
+     return true;
+   }
+-  if (feature == "CaptchaSuccess") {
++  if (IsRobloxChallengeSolvedFeature(feature)) {
+     event->type = CaptchaEventType::kSuccess;
+     return true;
+   }
+diff --git a/src/webview/webview_helper_policy.h b/src/webview/webview_helper_policy.h
+index 4e3e783..e2333f2 100644
+--- a/src/webview/webview_helper_policy.h
++++ b/src/webview/webview_helper_policy.h
+@@ -38,6 +38,13 @@ bool ShouldDisableWebKitSandbox(std::string_view kernel_version,
+ // Match WebKit's WEBKIT_DISABLE_COMPOSITING_MODE override semantics.
+ bool ShouldDisableWebViewHardwareAcceleration(
+     bool wayland_display, const char* compositing_override);
++// GTK's GL renderer aborts in libepoxy when it snapshots a page switch on
++// hosts where its GL context cannot become current. With software compositing
++// the helper does not need GL for its UI, so use the Cairo renderer unless the
++// user chose one through GSK_RENDERER.
++bool ShouldForceSoftwareGtkRenderer(bool software_compositing,
++                                    const char* renderer_override);
++
+ const char* AndroidBridgeSource();
+ std::string BuildRobloxAndroidUserAgent();
+ bool IsBrowserLoginUrl(std::string_view url);
+diff --git a/tests/CMakeLists.txt b/tests/CMakeLists.txt
+index 794998b..242f9bd 100644
+--- a/tests/CMakeLists.txt
++++ b/tests/CMakeLists.txt
+@@ -477,6 +477,31 @@ target_link_libraries(vulkan_present_observer_test PRIVATE
+ )
+ mocktail_apply_compile_options(vulkan_present_observer_test)
+ 
++add_executable(roblox_account_bridge_test roblox_account_bridge_test.cc)
++target_link_libraries(roblox_account_bridge_test PRIVATE
++  Mocktail::LegacyJni
++  Mocktail::Runtime
++  GTest::gtest_main
++  Threads::Threads
++)
++mocktail_apply_compile_options(roblox_account_bridge_test)
++
++add_executable(web_view_protocol_contract_test
++  web_view_protocol_contract_test.cc
++)
++target_link_libraries(web_view_protocol_contract_test PRIVATE
++  Mocktail::Compat
++  GTest::gtest_main
++)
++mocktail_apply_compile_options(web_view_protocol_contract_test)
++
++add_executable(engine_pump_rest_test engine_pump_rest_test.cc)
++target_link_libraries(engine_pump_rest_test PRIVATE
++  Mocktail::Runtime
++  GTest::gtest_main
++)
++mocktail_apply_compile_options(engine_pump_rest_test)
++
+ add_executable(input_pump_pacer_test
+   input_pump_pacer_test.cc
+ )
+@@ -983,6 +1008,9 @@ gtest_discover_tests(jnivm_experience_lifecycle_test)
+ gtest_discover_tests(jnivm_native_text_box_info_test)
+ gtest_discover_tests(jnivm_webrtc_audio_manager_test)
+ gtest_discover_tests(vulkan_present_observer_test)
++gtest_discover_tests(engine_pump_rest_test)
++gtest_discover_tests(roblox_account_bridge_test)
++gtest_discover_tests(web_view_protocol_contract_test)
+ gtest_discover_tests(input_pump_pacer_test)
+ gtest_discover_tests(vulkan_surface_recovery_gate_test)
+ gtest_discover_tests(vulkan_present_progress_gate_test)
+diff --git a/tests/engine_pump_rest_test.cc b/tests/engine_pump_rest_test.cc
+new file mode 100644
+index 0000000..46a7042
+--- /dev/null
++++ b/tests/engine_pump_rest_test.cc
+@@ -0,0 +1,132 @@
++// Ported from Nightcap (github.com/CoderDayton/nightcap, Apache-2.0).
++#include "runtime/engine_pump_rest.h"
++
++#include <gtest/gtest.h>
++#include <sys/prctl.h>
++#include <unistd.h>
++
++#include <cstdio>
++#include <ctime>
++#include <filesystem>
++#include <fstream>
++#include <string>
++
++namespace mocktail::runtime {
++namespace {
++
++uint64_t NowNs() {
++  timespec now{};
++  clock_gettime(CLOCK_MONOTONIC, &now);
++  return static_cast<uint64_t>(now.tv_sec) * 1'000'000'000ULL +
++         static_cast<uint64_t>(now.tv_nsec);
++}
++
++class GovernorFile final {
++ public:
++  explicit GovernorFile(const char* content) {
++    char pattern[] = "/tmp/mocktail_governor_XXXXXX";
++    const int fd = mkstemp(pattern);
++    if (fd >= 0) {
++      close(fd);
++      path_ = pattern;
++      std::ofstream(path_) << content;
++    }
++  }
++  ~GovernorFile() {
++    std::error_code error;
++    std::filesystem::remove(path_, error);
++  }
++  const char* path() const { return path_.c_str(); }
++
++ private:
++  std::string path_;
++};
++
++// A performance governor holds the clock up on its own, so the thread can
++// sleep. Without it, only a core that stays awake keeps the clock up: tpause
++// where the CPU has it, a spin otherwise.
++TEST(EnginePumpRestTest, PolicyFollowsGovernorThenCpuFeature) {
++  EXPECT_EQ(ChooseEnginePumpRestMode({true, true, nullptr}),
++            EnginePumpRestMode::kSleep);
++  EXPECT_EQ(ChooseEnginePumpRestMode({true, false, nullptr}),
++            EnginePumpRestMode::kSleep);
++  EXPECT_EQ(ChooseEnginePumpRestMode({false, true, nullptr}),
++            EnginePumpRestMode::kTpause);
++  EXPECT_EQ(ChooseEnginePumpRestMode({false, false, nullptr}),
++            EnginePumpRestMode::kSpin);
++}
++
++TEST(EnginePumpRestTest, OverrideWinsWhenTheCpuCanHonorIt) {
++  EXPECT_EQ(ChooseEnginePumpRestMode({false, true, "sleep"}),
++            EnginePumpRestMode::kSleep);
++  EXPECT_EQ(ChooseEnginePumpRestMode({true, true, "spin"}),
++            EnginePumpRestMode::kSpin);
++  EXPECT_EQ(ChooseEnginePumpRestMode({true, true, "tpause"}),
++            EnginePumpRestMode::kTpause);
++  // tpause needs the instruction; without it the policy decides.
++  EXPECT_EQ(ChooseEnginePumpRestMode({false, false, "tpause"}),
++            EnginePumpRestMode::kSpin);
++  EXPECT_EQ(ChooseEnginePumpRestMode({false, true, "bogus"}),
++            EnginePumpRestMode::kTpause);
++  EXPECT_EQ(ChooseEnginePumpRestMode({false, true, ""}),
++            EnginePumpRestMode::kTpause);
++}
++
++TEST(EnginePumpRestTest, ReadsThePerformanceGovernorFromSysfs) {
++  GovernorFile performance("performance\n");
++  GovernorFile powersave("powersave\n");
++  EXPECT_TRUE(CpuGovernorIsPerformance(performance.path()));
++  EXPECT_FALSE(CpuGovernorIsPerformance(powersave.path()));
++  EXPECT_FALSE(CpuGovernorIsPerformance("/nonexistent/scaling_governor"));
++}
++
++TEST(EnginePumpRestTest, ModeNamesAreStable) {
++  EXPECT_STREQ(EnginePumpRestModeName(EnginePumpRestMode::kSleep), "sleep");
++  EXPECT_STREQ(EnginePumpRestModeName(EnginePumpRestMode::kTpause), "tpause");
++  EXPECT_STREQ(EnginePumpRestModeName(EnginePumpRestMode::kSpin), "spin");
++}
++
++// The rest bounds how late an engine post is picked up. With the thread's
++// timer slack lowered and a shallow C-state exit, the bound sits far under
++// the engine's sub-millisecond slack.
++TEST(EnginePumpRestTest, BoundStaysUnderTheEngineSlack) {
++  EXPECT_LE(kEnginePumpRestNs + kEnginePumpTimerSlackNs + kShallowWakeNs,
++            300'000ULL);
++}
++
++TEST(EnginePumpRestTest, LowersTheCallingThreadTimerSlackOnce) {
++  (void)RestAfterEnginePump(EnginePumpRestMode::kSleep);
++  EXPECT_EQ(prctl(PR_GET_TIMERSLACK), static_cast<int>(kEnginePumpTimerSlackNs));
++}
++
++// A real sleep, not a spin: the call takes at least the rest, and on an idle
++// core not much more. The upper bound is loose so a loaded box does not flake.
++TEST(EnginePumpRestTest, SleepModeSleepsForTheRestInterval) {
++  const uint64_t start = NowNs();
++  const uint64_t reported = RestAfterEnginePump(EnginePumpRestMode::kSleep);
++  const uint64_t elapsed = NowNs() - start;
++  EXPECT_EQ(reported, kEnginePumpRestNs);
++  EXPECT_GE(elapsed, kEnginePumpRestNs);
++  EXPECT_LT(elapsed, 2'000'000ULL) << "rest overshot by " << elapsed << " ns";
++}
++
++TEST(EnginePumpRestTest, TpauseModeWaitsForTheRestInterval) {
++  if (!CpuHasWaitPkg()) {
++    GTEST_SKIP() << "CPU has no WAITPKG";
++  }
++  const uint64_t start = NowNs();
++  const uint64_t reported = RestAfterEnginePump(EnginePumpRestMode::kTpause);
++  const uint64_t elapsed = NowNs() - start;
++  EXPECT_EQ(reported, kEnginePumpRestNs);
++  EXPECT_GE(elapsed, kEnginePumpRestNs);
++  EXPECT_LT(elapsed, 2'000'000ULL) << "rest overshot by " << elapsed << " ns";
++}
++
++TEST(EnginePumpRestTest, SpinModeDoesNotRest) {
++  const uint64_t start = NowNs();
++  EXPECT_EQ(RestAfterEnginePump(EnginePumpRestMode::kSpin), 0U);
++  EXPECT_LT(NowNs() - start, kEnginePumpRestNs);
++}
++
++}  // namespace
++}  // namespace mocktail::runtime
+diff --git a/tests/roblox_account_bridge_test.cc b/tests/roblox_account_bridge_test.cc
+new file mode 100644
+index 0000000..25f7141
+--- /dev/null
++++ b/tests/roblox_account_bridge_test.cc
+@@ -0,0 +1,221 @@
++#include "runtime/roblox_account_bridge.h"
++
++#include <gtest/gtest.h>
++
++#include <algorithm>
++#include <map>
++#include <memory>
++#include <nlohmann/json.hpp>
++#include <string>
++#include <utility>
++#include <vector>
++
++#include "jnivm/jnivm.h"
++
++namespace mocktail {
++namespace runtime {
++namespace {
++
++using Json = nlohmann::json;
++
++// Distinct from the production values so tests prove the bridge uses the
++// names the engine reports instead of hard-coded strings.
++constexpr char kProtocol[] = "TestAccountProtocol";
++constexpr char kAvailableMethod[] = "TestIntegrityAvailable";
++constexpr char kTokenMethod[] = "TestIntegrityToken";
++constexpr char kSupportKey[] = "testSupport";
++constexpr char kTokenKey[] = "testToken";
++constexpr char kResultKey[] = "testResult";
++constexpr char kTokenRequest[] =
++    R"({"requestHash":"opaque-hash","timeoutMillis":60000})";
++
++std::string Copy(JNIEnv* env, jstring value) {
++  if (!value) return {};
++  const char* chars = env->GetStringUTFChars(value, nullptr);
++  const std::string copy = chars ? chars : "";
++  if (chars) env->ReleaseStringUTFChars(value, chars);
++  return copy;
++}
++
++struct Probe {
++  jnivm::VM* vm = nullptr;
++  std::map<std::string, jobject> handlers;
++  std::vector<std::string> native_cleared;
++  int handlers_created = 0;
++  int handlers_cleared = 0;
++  int fail_handler_at = 0;
++  bool null_token_key = false;
++};
++
++Probe* g_probe = nullptr;
++
++void Prepare(void* context) {
++  static_cast<jnivm::VM*>(context)->RestoreFunctions();
++}
++
++jstring ProtocolName(JNIEnv* env, jclass) { return env->NewStringUTF(kProtocol); }
++jstring AvailableMethod(JNIEnv* env, jclass) {
++  return env->NewStringUTF(kAvailableMethod);
++}
++jstring TokenMethod(JNIEnv* env, jclass) {
++  return env->NewStringUTF(kTokenMethod);
++}
++jstring SupportKey(JNIEnv* env, jclass) {
++  return env->NewStringUTF(kSupportKey);
++}
++jstring TokenKey(JNIEnv* env, jclass) {
++  return g_probe->null_token_key ? nullptr : env->NewStringUTF(kTokenKey);
++}
++jstring ResultKey(JNIEnv* env, jclass) { return env->NewStringUTF(kResultKey); }
++
++void SetHandler(JNIEnv* env, jobject, jstring protocol, jstring method,
++                jobject handler) {
++  EXPECT_EQ(Copy(env, protocol), kProtocol);
++  g_probe->handlers[Copy(env, method)] = handler;
++}
++
++void ClearHandler(JNIEnv* env, jobject, jstring protocol, jstring method) {
++  EXPECT_EQ(Copy(env, protocol), kProtocol);
++  g_probe->native_cleared.push_back(Copy(env, method));
++}
++
++jobject CreateHandler(void* context, std::shared_ptr<void> target,
++                      std::string (*run)(void*, JNIEnv*, jstring)) {
++  auto* probe = static_cast<Probe*>(context);
++  if (++probe->handlers_created == probe->fail_handler_at) return nullptr;
++  return probe->vm->CreateMessageBusRequestHandler(
++      std::move(target), jnivm::MessageBusRequestHandlerCallbacks{run});
++}
++
++void ClearHandlerObject(void* context, jobject handler) {
++  auto* probe = static_cast<Probe*>(context);
++  ++probe->handlers_cleared;
++  probe->vm->ClearMessageBusRequestHandler(handler);
++}
++
++RobloxAccountProtocolSymbols Symbols() {
++  return {ProtocolName, AvailableMethod, TokenMethod, SupportKey,
++          TokenKey,     ResultKey,       SetHandler,  ClearHandler};
++}
++
++class RobloxAccountBridgeTest : public testing::Test {
++ protected:
++  void SetUp() override {
++    probe.vm = &vm;
++    g_probe = &probe;
++    env = vm.GetJNIEnv();
++    jclass cls =
++        env->FindClass("com/roblox/universalapp/messagebus/MessageBus");
++    bus = env->AllocObject(cls);
++    env->DeleteLocalRef(cls);
++  }
++  void TearDown() override {
++    bridge.reset();
++    env->DeleteLocalRef(bus);
++    g_probe = nullptr;
++  }
++  Status Initialize(RobloxAccountProtocolSymbols symbols = Symbols()) {
++    bridge = std::make_unique<RobloxAccountBridge>(
++        JniEnvironmentProvider{vm.GetJavaVM(), &vm, Prepare}, symbols,
++        RobloxAccountProtocolObjects{bus, &probe, CreateHandler,
++                                     ClearHandlerObject});
++    return bridge->Initialize();
++  }
++  Json Request(const char* method, const char* payload) {
++    const auto found = probe.handlers.find(method);
++    EXPECT_NE(found, probe.handlers.end()) << method;
++    if (found == probe.handlers.end()) return nullptr;
++    jstring message = env->NewStringUTF(payload);
++    jstring response =
++        vm.DispatchMessageBusRequestHandler(found->second, env, message);
++    env->DeleteLocalRef(message);
++    const std::string body = Copy(env, response);
++    if (response) env->DeleteLocalRef(response);
++    return Json::parse(body, nullptr, false);
++  }
++
++  jnivm::VM vm;
++  Probe probe;
++  JNIEnv* env = nullptr;
++  jobject bus = nullptr;
++  std::unique_ptr<RobloxAccountBridge> bridge;
++};
++
++TEST_F(RobloxAccountBridgeTest, RegistersBothHandlersUnderEngineNames) {
++  ASSERT_TRUE(Initialize().ok());
++
++  EXPECT_EQ(probe.handlers.size(), 2u);
++  EXPECT_TRUE(probe.handlers.count(kAvailableMethod));
++  EXPECT_TRUE(probe.handlers.count(kTokenMethod));
++}
++
++TEST_F(RobloxAccountBridgeTest, ReportsDeviceIntegrityUnsupported) {
++  ASSERT_TRUE(Initialize().ok());
++
++  EXPECT_EQ(Request(kAvailableMethod, "{}"), (Json{{kSupportKey, false}}));
++}
++
++TEST_F(RobloxAccountBridgeTest, AnswersTokenRequestWithoutToken) {
++  ASSERT_TRUE(Initialize().ok());
++
++  EXPECT_EQ(Request(kTokenMethod, kTokenRequest),
++            (Json{{kTokenKey, ""}, {kResultKey, "TOKEN_PROVIDER_UNINITIALIZED"}}));
++}
++
++TEST_F(RobloxAccountBridgeTest, AnswersMalformedTokenRequestWithoutToken) {
++  ASSERT_TRUE(Initialize().ok());
++
++  EXPECT_EQ(Request(kTokenMethod, "not json"),
++            (Json{{kTokenKey, ""}, {kResultKey, "TOKEN_PROVIDER_UNINITIALIZED"}}));
++}
++
++TEST_F(RobloxAccountBridgeTest, RejectsIncompletePrerequisites) {
++  RobloxAccountProtocolSymbols symbols = Symbols();
++  symbols.get_token_key = nullptr;
++
++  EXPECT_FALSE(Initialize(symbols).ok());
++  EXPECT_TRUE(probe.handlers.empty());
++  EXPECT_EQ(probe.handlers_created, 0);
++}
++
++TEST_F(RobloxAccountBridgeTest, FailsWithoutRegisteringWhenEngineNameIsNull) {
++  probe.null_token_key = true;
++
++  EXPECT_FALSE(Initialize().ok());
++  EXPECT_TRUE(probe.handlers.empty());
++  EXPECT_EQ(probe.handlers_created, 0);
++}
++
++TEST_F(RobloxAccountBridgeTest, HandlerCreationFailureReleasesEarlierHandler) {
++  probe.fail_handler_at = 2;
++
++  EXPECT_FALSE(Initialize().ok());
++  EXPECT_EQ(probe.handlers_cleared, 1);
++  for (const auto& [method, handler] : probe.handlers) {
++    EXPECT_NE(std::find(probe.native_cleared.begin(),
++                        probe.native_cleared.end(), method),
++              probe.native_cleared.end())
++        << method;
++  }
++}
++
++TEST_F(RobloxAccountBridgeTest, InitializeTwiceFails) {
++  ASSERT_TRUE(Initialize().ok());
++
++  EXPECT_FALSE(bridge->Initialize().ok());
++  EXPECT_EQ(probe.handlers_created, 2);
++}
++
++TEST_F(RobloxAccountBridgeTest, ShutdownClearsBothHandlersOnce) {
++  ASSERT_TRUE(Initialize().ok());
++
++  EXPECT_TRUE(bridge->Shutdown().ok());
++  EXPECT_TRUE(bridge->Shutdown().ok());
++  EXPECT_EQ(probe.handlers_cleared, 2);
++  EXPECT_EQ(probe.native_cleared,
++            (std::vector<std::string>{kAvailableMethod, kTokenMethod}));
++}
++
++}  // namespace
++}  // namespace runtime
++}  // namespace mocktail
+diff --git a/tests/roblox_web_view_bridge_test.cc b/tests/roblox_web_view_bridge_test.cc
+index 8d96ba8..a568085 100644
+--- a/tests/roblox_web_view_bridge_test.cc
++++ b/tests/roblox_web_view_bridge_test.cc
+@@ -60,6 +60,7 @@ struct WebViewBridgeProbe {
+   std::string hybrid_callback_payload;
+   std::string cookie_header;
+   std::vector<std::string> data_model_focus_states;
++  std::vector<std::string> app_events;
+   std::vector<std::string> initialization_order;
+   int native_initializations = 0;
+   int close_publications = 0;
+@@ -162,6 +163,13 @@ void InitializeAndroidWebViewProtocol(JNIEnv *, jclass) {
+   g_web_view_probe->initialization_order.push_back("initialize");
+ }
+ 
++int g_fake_protocol_holder = 0;
++
++RobloxWebViewProtocolHandle AcquireWebViewProtocol() {
++  g_web_view_probe->initialization_order.push_back("acquire_protocol");
++  return RobloxWebViewProtocolHandle(&g_fake_protocol_holder);
++}
++
+ void SignalJavascriptCallback(JNIEnv* env, jclass, jstring payload) {
+   g_web_view_probe->hybrid_callback_payload = ReadJavaString(env, payload);
+ }
+@@ -208,6 +216,22 @@ void BroadcastDataModelFocus(JNIEnv *env, jclass, jstring event_namespace,
+       ReadJavaString(env, state));
+ }
+ 
++void SendAppEventOnGameLoaded(JNIEnv* env, jclass, jstring event_namespace,
++                              jstring detail, jstring detail_type) {
++  g_web_view_probe->app_events.push_back(
++      "loaded|" + ReadJavaString(env, event_namespace) + "|" +
++      ReadJavaString(env, detail) + "|" + ReadJavaString(env, detail_type));
++}
++
++void SendAppEventOnAppReady(JNIEnv* env, jclass, jstring event_namespace,
++                            jstring detail, jstring detail_type,
++                            jstring app_name) {
++  g_web_view_probe->app_events.push_back(
++      "ready|" + ReadJavaString(env, event_namespace) + "|" +
++      ReadJavaString(env, detail) + "|" + ReadJavaString(env, detail_type) +
++      "|" + ReadJavaString(env, app_name));
++}
++
+ jobject SubscribeRaw(JNIEnv *env, jobject, jstring subscription_id,
+                      jobject callback, jboolean) {
+   const int subscribe_index =
+@@ -336,15 +360,21 @@ Status DispatchCookie(void* context, std::string_view header) {
+ }
+ 
+ RobloxWebViewBridge MakeBridge(jnivm::VM* vm, jobject bus,
+-                               WebViewBridgeProbe* probe) {
++                               WebViewBridgeProbe* probe,
++                               bool app_event_symbols = true) {
++  RobloxWebViewMessageBusSymbols symbols{
++      &GetOpenWindowId, &GetHandleWindowCloseId, &GetProtocolName,
++      &GetIsAvailableId, &GetMessageId, &InitializeAndroidWebViewProtocol,
++      &SubscribeRaw, &DeleteConnection, &SetRequestHandler,
++      &ClearRequestHandler, &PublishRaw, &BroadcastDataModelFocus,
++      &GetMutateWindowId, &GetCloseWindowId, &SignalJavascriptCallback,
++      &UpdateCookieSetHandler};
++  if (app_event_symbols) {
++    symbols.send_app_event_on_game_loaded = &SendAppEventOnGameLoaded;
++    symbols.send_app_event_on_app_ready = &SendAppEventOnAppReady;
++  }
+   return RobloxWebViewBridge(
+-      {vm->GetJavaVM(), nullptr, nullptr},
+-      {&GetOpenWindowId, &GetHandleWindowCloseId, &GetProtocolName,
+-       &GetIsAvailableId, &GetMessageId, &InitializeAndroidWebViewProtocol,
+-       &SubscribeRaw, &DeleteConnection, &SetRequestHandler,
+-       &ClearRequestHandler, &PublishRaw, &BroadcastDataModelFocus,
+-       &GetMutateWindowId, &GetCloseWindowId, &SignalJavascriptCallback,
+-       &UpdateCookieSetHandler},
++      {vm->GetJavaVM(), nullptr, nullptr}, symbols,
+       {bus, vm, &CreateRawCallback, &ClearRawCallback, &CreateRequestHandler,
+        &ClearRequestHandlerObject, &SetPlatformWebCallbacks,
+        &ClearPlatformWebCallbacks},
+@@ -473,6 +503,34 @@ TEST(RobloxWebViewParserTest, BuildsExactCaptchaRoutesWithoutGuessingSuccess) {
+           .ok());
+ }
+ 
++TEST(RobloxWebViewParserTest, RecognizesOnlyChallengeSuccessNavigation) {
++  const auto navigation = [](const std::string& feature) {
++    return R"({"moduleID":"Navigation","functionName":"navigateToFeature",)"
++           R"("params":{"params":{"data":{"captchaData":{}},"feature":")" +
++           feature + R"("}},"callbackID":"challenge-1"})";
++  };
++  EXPECT_TRUE(IsRobloxWebViewChallengeSuccess(navigation("CaptchaSuccess")));
++  EXPECT_TRUE(
++      IsRobloxWebViewChallengeSuccess(navigation("challengeCompleted")));
++  EXPECT_TRUE(
++      IsRobloxWebViewChallengeSuccess(navigation("ChallengeCompleted")));
++
++  EXPECT_FALSE(IsRobloxWebViewChallengeSuccess(navigation("CaptchaShown")));
++  EXPECT_FALSE(
++      IsRobloxWebViewChallengeSuccess(navigation("ChallengeDisplayed")));
++  EXPECT_FALSE(IsRobloxWebViewChallengeSuccess(
++      R"({"moduleID":"Game","functionName":"navigateToFeature",)"
++      R"("params":{"params":{"feature":"CaptchaSuccess"}}})"));
++  EXPECT_FALSE(IsRobloxWebViewChallengeSuccess(
++      R"({"moduleID":"Navigation","functionName":"navigateToFeature",)"
++      R"("params":{"feature":"CaptchaSuccess"}})"));
++  EXPECT_FALSE(IsRobloxWebViewChallengeSuccess(
++      R"({"moduleID":7,"functionName":["navigateToFeature"],)"
++      R"("params":{"params":{"feature":{"CaptchaSuccess":true}}}})"));
++  EXPECT_FALSE(IsRobloxWebViewChallengeSuccess("CaptchaSuccess"));
++  EXPECT_FALSE(IsRobloxWebViewChallengeSuccess(""));
++}
++
+ TEST(RobloxWebViewParserTest, AcceptsOnlyCanonicalProfileRoutes) {
+   RobloxWebViewOpenRequest request;
+   Status status = ParseRobloxProfileViewUrl(
+@@ -656,6 +714,7 @@ TEST(RobloxWebViewBridgeTest,
+   ASSERT_EQ(probe.dispatches, 2);
+   EXPECT_EQ(probe.request.url,
+             "https://www.roblox.com/games/servers-section/10148749921");
++  EXPECT_FALSE(probe.request.close_when_challenge_solved);
+   ASSERT_TRUE(bridge.DrainHostWindowEvents().ok());
+   EXPECT_EQ(probe.data_model_focus_states,
+             (std::vector<std::string>{"Unfocused"}));
+@@ -677,6 +736,7 @@ TEST(RobloxWebViewBridgeTest,
+   ASSERT_EQ(probe.dispatches, 3);
+   EXPECT_EQ(probe.request.url, "https://www.roblox.com/login");
+   EXPECT_EQ(probe.request.title, "Roblox sign in");
++  EXPECT_TRUE(probe.request.close_when_challenge_solved);
+   EXPECT_TRUE(bridge.HandleCloseWindow().ok());
+   EXPECT_EQ(probe.close_dispatches, 1);
+   ASSERT_TRUE(bridge.DrainHostWindowEvents().ok());
+@@ -1056,6 +1116,95 @@ TEST(RobloxWebViewBridgeTest,
+   g_web_view_probe = nullptr;
+ }
+ 
++TEST(RobloxWebViewBridgeTest,
++     LaunchConversationOpensChatAndStartsTheConversationWithThatUser) {
++  jnivm::VM vm;
++  JNIEnv* env = vm.GetJNIEnv();
++  jclass bus_class =
++      env->FindClass("com/roblox/universalapp/messagebus/MessageBus");
++  jobject bus = env->AllocObject(bus_class);
++  WebViewBridgeProbe probe;
++  g_web_view_probe = &probe;
++  RobloxWebViewBridge bridge = MakeBridge(&vm, bus, &probe);
++  ASSERT_TRUE(bridge.Initialize().ok());
++
++  EXPECT_TRUE(vm.DispatchRobloxDataModelNotification(
++      env, env->NewStringUTF(kRobloxLaunchConversationNotification),
++      env->NewStringUTF("8406613906")));
++  // The engine is still inside its notification callback here.
++  EXPECT_TRUE(probe.app_events.empty());
++  EXPECT_EQ(probe.dispatches, 0);
++
++  ASSERT_TRUE(bridge.DrainHostWindowEvents().ok());
++  EXPECT_EQ(probe.app_events,
++            (std::vector<std::string>{
++                R"(loaded|Navigations|{"appName":"Chat"}|Destination)",
++                "ready|AppShellNotifications|8406613906|"
++                "StartConversationWithUserId|Chat"}));
++  EXPECT_TRUE(probe.data_model_focus_states.empty());
++
++  ASSERT_TRUE(bridge.DrainHostWindowEvents().ok());
++  EXPECT_EQ(probe.app_events.size(), 2U);
++
++  ASSERT_TRUE(bridge.Shutdown().ok());
++  g_web_view_probe = nullptr;
++}
++
++TEST(RobloxWebViewBridgeTest,
++     LaunchConversationRejectsPayloadsThatAreNotUserIds) {
++  jnivm::VM vm;
++  JNIEnv* env = vm.GetJNIEnv();
++  jclass bus_class =
++      env->FindClass("com/roblox/universalapp/messagebus/MessageBus");
++  jobject bus = env->AllocObject(bus_class);
++  WebViewBridgeProbe probe;
++  g_web_view_probe = &probe;
++  RobloxWebViewBridge bridge = MakeBridge(&vm, bus, &probe);
++  ASSERT_TRUE(bridge.Initialize().ok());
++
++  for (const char* data :
++       {"", "0", "-5", "abc", "12 34", "84066139060000000000",
++        R"({"userId":1})"}) {
++    SCOPED_TRACE(data);
++    EXPECT_FALSE(
++        bridge
++            .HandleDataModelNotification(
++                env, env->NewStringUTF(kRobloxLaunchConversationNotification),
++                env->NewStringUTF(data))
++            .ok());
++  }
++  ASSERT_TRUE(bridge.DrainHostWindowEvents().ok());
++  EXPECT_TRUE(probe.app_events.empty());
++
++  ASSERT_TRUE(bridge.Shutdown().ok());
++  g_web_view_probe = nullptr;
++}
++
++TEST(RobloxWebViewBridgeTest,
++     LaunchConversationIsUnavailableWithoutTheAppEventEntrypoints) {
++  jnivm::VM vm;
++  JNIEnv* env = vm.GetJNIEnv();
++  jclass bus_class =
++      env->FindClass("com/roblox/universalapp/messagebus/MessageBus");
++  jobject bus = env->AllocObject(bus_class);
++  WebViewBridgeProbe probe;
++  g_web_view_probe = &probe;
++  RobloxWebViewBridge bridge = MakeBridge(&vm, bus, &probe, false);
++  ASSERT_TRUE(bridge.Initialize().ok());
++
++  EXPECT_FALSE(
++      bridge
++          .HandleDataModelNotification(
++              env, env->NewStringUTF(kRobloxLaunchConversationNotification),
++              env->NewStringUTF("8406613906"))
++          .ok());
++  ASSERT_TRUE(bridge.DrainHostWindowEvents().ok());
++  EXPECT_TRUE(probe.app_events.empty());
++
++  ASSERT_TRUE(bridge.Shutdown().ok());
++  g_web_view_probe = nullptr;
++}
++
+ TEST(RobloxWebViewBridgeTest,
+      ReopenSupersedesThePreviousWindowAndIgnoresItsStaleExit) {
+   jnivm::VM vm;
+@@ -1218,6 +1367,45 @@ TEST(RobloxWebViewBridgeTest,
+   g_web_view_probe = nullptr;
+ }
+ 
++TEST(RobloxWebViewBridgeTest, HoldsWebViewProtocolFromBeforeNativeInitialization) {
++  const ScopedNativeLogin native_login(false);
++  jnivm::VM vm;
++  JNIEnv* env = vm.GetJNIEnv();
++  jclass bus_class =
++      env->FindClass("com/roblox/universalapp/messagebus/MessageBus");
++  jobject bus = env->AllocObject(bus_class);
++  WebViewBridgeProbe probe;
++  g_web_view_probe = &probe;
++  {
++    RobloxWebViewBridge bridge(
++        {vm.GetJavaVM(), nullptr, nullptr},
++        {&GetOpenWindowId, &GetHandleWindowCloseId, &GetProtocolName,
++         &GetIsAvailableId, &GetMessageId, &InitializeAndroidWebViewProtocol,
++         &SubscribeRaw, &DeleteConnection, &SetRequestHandler,
++         &ClearRequestHandler, &PublishRaw, &BroadcastDataModelFocus,
++         &GetMutateWindowId, &GetCloseWindowId, &SignalJavascriptCallback,
++         &UpdateCookieSetHandler, &AcquireWebViewProtocol},
++        {bus, &vm, &CreateRawCallback, &ClearRawCallback, &CreateRequestHandler,
++         &ClearRequestHandlerObject, &SetPlatformWebCallbacks,
++         &ClearPlatformWebCallbacks},
++        {&probe, &DispatchOpen, &DispatchMutate, &DispatchClose,
++         &DispatchCookie});
++
++    ASSERT_TRUE(bridge.Initialize().ok());
++    ASSERT_TRUE(bridge.Shutdown().ok());
++  }
++
++  // Roblox's own app start keeps this handle for the process lifetime.
++  // Releasing it deletes the protocol and its handleJavascriptCallback
++  // subscriber.
++  EXPECT_EQ(probe.initialization_order,
++            (std::vector<std::string>{
++                "message_id:openWindow", "message_id:mutateWindow",
++                "message_id:closeWindow", "availability", "subscribe",
++                "subscribe", "subscribe", "acquire_protocol", "initialize"}));
++  g_web_view_probe = nullptr;
++}
++
+ } // namespace
+ } // namespace runtime
+ } // namespace mocktail
+diff --git a/tests/web_view_protocol_contract_test.cc b/tests/web_view_protocol_contract_test.cc
+new file mode 100644
+index 0000000..2554586
+--- /dev/null
++++ b/tests/web_view_protocol_contract_test.cc
+@@ -0,0 +1,198 @@
++#include "compat/web_view_protocol_contract.h"
++
++#include <gtest/gtest.h>
++
++#include <cstddef>
++#include <cstdint>
++#include <optional>
++#include <string>
++#include <string_view>
++
++namespace mocktail::compat {
++namespace {
++
++std::string FromHex(std::string_view hex) {
++  std::string bytes;
++  for (std::size_t index = 0; index + 1 < hex.size(); index += 2) {
++    bytes += static_cast<char>(
++        std::stoi(std::string(hex.substr(index, 2)), nullptr, 16));
++  }
++  return bytes;
++}
++
++std::string Flipped(std::string code, std::size_t index) {
++  code[index] = static_cast<char>(code[index] ^ 0x01);
++  return code;
++}
++
++// Start of initializeAndroidWebViewProtocol and the getter it calls first,
++// from the x86_64 and arm64-v8a libroblox.so of each named Roblox release.
++struct KnownBuild {
++  const char* name;
++  std::uintptr_t initializer;
++  const char* initializer_code;
++  std::uintptr_t getter;
++  const char* getter_code;
++};
++
++constexpr KnownBuild kX86_64Builds[] = {
++    {"2.734.917", 0x2e7418f,
++     "554889e54157415641554154534883ec384c8b2599ce1004498b0424488945d0488d5da8"
++     "4889dfe8c9a355ff488b1b488b43184c",
++     0x23ce584,
++     "554889e553504889fb8a05ede9c10484c07419488d3dbae9c104e8590000004889034889"
++     "d84883c4085b5dc3"},
++    {"2.736.1408", 0x2e9d241,
++     "554889e54157415641554154534883ec484c8b25df291c04498b0424488945d0488d5d98"
++     "4889dfe8af2d56ff488b1b488b43184c",
++     0x240001c,
++     "554889e553504889fb8a05a5b9cc0484c07419488d3d72b9cc04e8590000004889034889"
++     "d84883c4085b5dc3"},
++    {"2.738.1397", 0x2e6c591,
++     "554889e54157415641554154534883ec184c8b2577d52704498b0424488945d0488d5dc0"
++     "4889dfe8fbf55cff488b1b488b43184c",
++     0x243bbb8,
++     "554889e553504889fb8a05f99dd10484c07419488d3dc69dd104e8590000004889034889"
++     "d84883c4085b5dc3"},
++};
++
++constexpr KnownBuild kArm64Builds[] = {
++    {"2.738.1397", 0x2bac4bc,
++     "ffc301d1fd7b02a9f91b00f9f85f04a9f65705a9f44f06a9fd83009137e101b0f77a43f9"
++     "e80240f9a8831ff8e8430091e82300915244de97f30740f9680e40f9",
++     0x233d638,
++     "fd7bbea9f30b00f9fd030091e92702f029e13391f30308aa29fddf0809010036e02702f0"
++     "0040339117000094600200f9f30b40f9fd7bc2a8c0035fd6"},
++    {"2.740.931", 0x2be87d8,
++     "ff0302d1fd7b03a9f92300f9f85f05a9f65706a9f44f07a9fdc3009157e801d0f7b244f9"
++     "e80240f9a8831ff8e84b0091e82300913a64de97f30740f9680e40f9",
++     0x23818f4,
++     "fd7bbea9f30b00f9fd030091492f02d029212a91f30308aa29fddf0809010036402f02d0"
++     "0080299117000094600200f9f30b40f9fd7bc2a8c0035fd6"},
++};
++
++TEST(WebViewProtocolContractTest, FindsX86_64GetterInKnownBuilds) {
++  for (const KnownBuild& build : kX86_64Builds) {
++    EXPECT_EQ(FindWebViewProtocolGetterCallX86_64(
++                  FromHex(build.initializer_code), build.initializer),
++              std::optional<std::uintptr_t>(build.getter))
++        << build.name;
++    const std::string getter = FromHex(build.getter_code);
++    ASSERT_EQ(getter.size(), kWebViewProtocolGetterBytesX86_64) << build.name;
++    EXPECT_TRUE(HasWebViewProtocolGetterContractX86_64(getter)) << build.name;
++  }
++}
++
++TEST(WebViewProtocolContractTest, RejectsChangedX86_64CallSite) {
++  const KnownBuild& build = kX86_64Builds[2];
++  const std::string code = FromHex(build.initializer_code);
++  // Frame setup, the handle slot's lea, the handle argument, the call, the
++  // handle load and the protocol field offset.
++  for (const std::size_t fixed : {0u, 3u, 32u, 34u, 36u, 39u, 44u, 50u}) {
++    EXPECT_FALSE(FindWebViewProtocolGetterCallX86_64(Flipped(code, fixed),
++                                                     build.initializer)
++                     .has_value())
++        << fixed;
++  }
++  EXPECT_FALSE(FindWebViewProtocolGetterCallX86_64(code.substr(0, 50),
++                                                   build.initializer)
++                   .has_value());
++}
++
++TEST(WebViewProtocolContractTest, RejectsAmbiguousX86_64CallSite) {
++  const KnownBuild& build = kX86_64Builds[2];
++  const std::string code = FromHex(build.initializer_code);
++  EXPECT_FALSE(FindWebViewProtocolGetterCallX86_64(code + code.substr(32, 19),
++                                                   build.initializer)
++                   .has_value());
++}
++
++TEST(WebViewProtocolContractTest, RejectsChangedX86_64Getter) {
++  const std::string getter = FromHex(kX86_64Builds[2].getter_code);
++  // Frame setup, the out-pointer save, the guard test, the holder lea, the
++  // local acquire call, the out-pointer store and the return.
++  for (const std::size_t fixed : {0u, 8u, 16u, 21u, 27u, 33u, 43u}) {
++    EXPECT_FALSE(HasWebViewProtocolGetterContractX86_64(Flipped(getter, fixed)))
++        << fixed;
++  }
++  EXPECT_FALSE(HasWebViewProtocolGetterContractX86_64(
++      getter.substr(0, getter.size() - 1)));
++}
++
++TEST(WebViewProtocolContractTest, FindsArm64GetterInKnownBuilds) {
++  for (const KnownBuild& build : kArm64Builds) {
++    EXPECT_EQ(FindWebViewProtocolGetterCallArm64(
++                  FromHex(build.initializer_code), build.initializer),
++              std::optional<std::uintptr_t>(build.getter))
++        << build.name;
++    const std::string getter = FromHex(build.getter_code);
++    ASSERT_EQ(getter.size(), kWebViewProtocolGetterBytesArm64) << build.name;
++    EXPECT_TRUE(HasWebViewProtocolGetterContractArm64(getter)) << build.name;
++  }
++}
++
++TEST(WebViewProtocolContractTest, RejectsChangedArm64CallSite) {
++  const KnownBuild& build = kArm64Builds[0];
++  const std::string code = FromHex(build.initializer_code);
++  // Words 12..15: add x8, sp, #8; bl getter; ldr x19, [sp, #8];
++  // ldr x8, [x19, #0x18]. Byte 0 of each word holds its low register field.
++  EXPECT_FALSE(
++      FindWebViewProtocolGetterCallArm64(Flipped(code, 48), build.initializer)
++          .has_value());
++  std::string not_a_call = code;
++  not_a_call[55] = static_cast<char>(not_a_call[55] ^ 0x80);  // bl -> b
++  EXPECT_FALSE(FindWebViewProtocolGetterCallArm64(not_a_call, build.initializer)
++                   .has_value());
++  EXPECT_FALSE(
++      FindWebViewProtocolGetterCallArm64(Flipped(code, 56), build.initializer)
++          .has_value());
++  EXPECT_FALSE(
++      FindWebViewProtocolGetterCallArm64(Flipped(code, 60), build.initializer)
++          .has_value());
++  // The handle is read back from a different stack slot than the one passed.
++  std::string other_slot = code;
++  other_slot[57] = static_cast<char>(other_slot[57] ^ 0x04);
++  EXPECT_FALSE(FindWebViewProtocolGetterCallArm64(other_slot, build.initializer)
++                   .has_value());
++  EXPECT_FALSE(FindWebViewProtocolGetterCallArm64(code.substr(0, 60),
++                                                  build.initializer)
++                   .has_value());
++}
++
++TEST(WebViewProtocolContractTest, RejectsAmbiguousArm64CallSite) {
++  const KnownBuild& build = kArm64Builds[0];
++  const std::string code = FromHex(build.initializer_code);
++  EXPECT_FALSE(FindWebViewProtocolGetterCallArm64(code + code.substr(48, 16),
++                                                  build.initializer)
++                   .has_value());
++}
++
++TEST(WebViewProtocolContractTest, RejectsChangedArm64Getter) {
++  const std::string getter = FromHex(kArm64Builds[0].getter_code);
++  // Frame setup, mov x19, x8 (the indirect result register), the guard
++  // branch, the local acquire call, the result store and the return.
++  for (const std::size_t fixed : {0u, 20u, 28u, 40u, 44u, 56u}) {
++    EXPECT_FALSE(HasWebViewProtocolGetterContractArm64(Flipped(getter, fixed)))
++        << fixed;
++  }
++  EXPECT_FALSE(HasWebViewProtocolGetterContractArm64(
++      getter.substr(0, getter.size() - 1)));
++}
++
++TEST(WebViewProtocolContractTest, RejectsOtherArchitectureCode) {
++  const KnownBuild& x86_64 = kX86_64Builds[2];
++  const KnownBuild& arm64 = kArm64Builds[0];
++  EXPECT_FALSE(FindWebViewProtocolGetterCallArm64(
++                   FromHex(x86_64.initializer_code), x86_64.initializer)
++                   .has_value());
++  EXPECT_FALSE(FindWebViewProtocolGetterCallX86_64(
++                   FromHex(arm64.initializer_code), arm64.initializer)
++                   .has_value());
++  EXPECT_FALSE(HasWebViewProtocolGetterContractArm64(
++      FromHex(x86_64.getter_code) + std::string(16, '\0')));
++  EXPECT_FALSE(HasWebViewProtocolGetterContractX86_64(
++      FromHex(arm64.getter_code)));
++}
++
++}  // namespace
++}  // namespace mocktail::compat
+diff --git a/tests/webview_helper_policy_test.cc b/tests/webview_helper_policy_test.cc
+index 31a2d92..26dcfde 100644
+--- a/tests/webview_helper_policy_test.cc
++++ b/tests/webview_helper_policy_test.cc
+@@ -134,6 +134,19 @@ TEST(WebViewHelperPolicyTest, HonorsExplicitCompositingEnvironment) {
+   }
+ }
+ 
++TEST(WebViewHelperPolicyTest, ForcesCairoRendererWithSoftwareCompositing) {
++  EXPECT_TRUE(ShouldForceSoftwareGtkRenderer(true, nullptr));
++  EXPECT_FALSE(ShouldForceSoftwareGtkRenderer(false, nullptr));
++}
++
++TEST(WebViewHelperPolicyTest, HonorsExplicitGtkRendererEnvironment) {
++  for (bool software_compositing : {false, true}) {
++    for (const char* value : {"gl", "vulkan", "cairo", ""}) {
++      EXPECT_FALSE(ShouldForceSoftwareGtkRenderer(software_compositing, value));
++    }
++  }
++}
++
+ TEST(WebViewHelperPolicyTest, AllowsOnlyTlsTopLevelNavigation) {
+   const UriPolicyResult roblox =
+       EvaluateNavigationUri("https://www.roblox.com/login");
+@@ -188,6 +201,12 @@ TEST(WebViewHelperPolicyTest, ParsesOnlyTypedCaptchaNavigationEvents) {
+   EXPECT_EQ(event.type, CaptchaEventType::kSuccess);
+   EXPECT_TRUE(event.callback_id.empty());
+ 
++  EXPECT_TRUE(ParseCaptchaEvent(
++      R"({"moduleID":"Navigation","functionName":"navigateToFeature","params":{"params":{"data":{"challengeType":"captcha"},"feature":"challengeCompleted"}},"callbackID":"challenge-complete-1"})",
++      &event));
++  EXPECT_EQ(event.type, CaptchaEventType::kSuccess);
++  EXPECT_EQ(event.callback_id, "challenge-complete-1");
++
+   for (
+       std::string_view rejected : {
+           R"({"moduleID":"Browser","functionName":"navigateToFeature","params":{"params":{"feature":"CaptchaSuccess"}}})",
