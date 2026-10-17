@@ -1446,6 +1446,12 @@ class TestGUI(unittest.TestCase):
             mock_user = {"id": 9999, "name": "AutoLoginTester", "displayName": "AutoTester"}
             with patch.object(self.api, "login_with_credentials", return_value=(True, "_|CAPTURED_COOKIE|_", mock_user, "OK")):
                 window._auto_login_account(acc)
+                # The API login runs off the GUI thread; wait for its result to come back
+                from PyQt6.QtTest import QTest
+                for _ in range(100):
+                    if "Auto Log In successful" in window.statusBar().currentMessage():
+                        break
+                    QTest.qWait(20)
                 updated = self.storage.get_account("acc_auto_login")
                 self.assertEqual(updated.cookie, "_|CAPTURED_COOKIE|_")
                 self.assertIn("Auto Log In successful", window.statusBar().currentMessage())
@@ -1466,6 +1472,25 @@ class TestGUI(unittest.TestCase):
                 self.assertIn("Auto Log In", dlg.btn_auto_login.text())
             finally:
                 dlg.close()
+        finally:
+            window.close()
+
+    def test_background_results_return_on_gui_thread(self):
+        """Worker results reach the GUI thread (PyQt6 invokeMethod rejects Python callables)."""
+        import threading
+        from PyQt6.QtTest import QTest
+        window = MainWindow(self.storage, self.api, self.runner)
+        try:
+            seen = []
+            window._run_in_background(lambda: threading.current_thread().name,
+                                      lambda worker: seen.append((worker, threading.current_thread() is threading.main_thread())))
+            for _ in range(100):
+                if seen:
+                    break
+                QTest.qWait(10)
+            self.assertEqual(len(seen), 1)
+            self.assertNotEqual(seen[0][0], threading.main_thread().name)
+            self.assertTrue(seen[0][1])
         finally:
             window.close()
 
@@ -1575,3 +1600,17 @@ if __name__ == "__main__":
 
 
 
+
+
+class TestRobloxOriginChecks(unittest.TestCase):
+    def test_only_roblox_pages_receive_credentials(self):
+        from PyQt6.QtCore import QUrl
+        from ui.web_login_dialog import is_roblox_url, is_roblox_login_url
+        for good in ("https://www.roblox.com/login", "https://roblox.com/login/", "https://www.roblox.com/Login?returnUrl=%2Fhome"):
+            self.assertTrue(is_roblox_login_url(QUrl(good)), good)
+        for bad in ("https://roblox.com.evil.net/login", "https://evil.com/?x=roblox.com/login",
+                    "http://www.roblox.com/login", "https://www.roblox.com/home",
+                    "https://evilroblox.com/login", "https://www.roblox.com.attacker.io/login"):
+            self.assertFalse(is_roblox_login_url(QUrl(bad)), bad)
+        self.assertTrue(is_roblox_url(QUrl("https://www.roblox.com/my/account#!/security")))
+        self.assertFalse(is_roblox_url(QUrl("https://notroblox.com/")))

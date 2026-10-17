@@ -153,6 +153,7 @@ class InstanceRunner:
         except AttributeError:
             return
 
+        candidates: Dict[str, Tuple[RobloxAccount, List[int]]] = {}
         try:
             with os.scandir("/proc") as it:
                 for entry in it:
@@ -182,19 +183,32 @@ class InstanceRunner:
                         for acc in accounts:
                             if fname == f"mocktail_{acc.account_id}":
                                 if acc.account_id not in self.active_instances:
-                                    profile_dir = self.storage.get_profile_dir(acc)
-                                    self.active_instances[acc.account_id] = RunningInstance(
-                                        account_id=acc.account_id,
-                                        username=acc.username,
-                                        pid=pid,
-                                        start_time=time.time(),
-                                        log_path=str(profile_dir / "instance.log"),
-                                    )
+                                    candidates.setdefault(acc.account_id, (acc, []))[1].append(pid)
                                 break
                     except Exception:
                         continue
         except Exception as e:
             log.warning(f"Failed to scan running instances: {e}")
+
+        # Mocktail forks a session-log writer with the same command line that ignores SIGTERM.
+        # Adopt the game itself: the process-group leader of its setsid launch, else the oldest.
+        for account_id, (acc, pids) in candidates.items():
+            pid = next((p for p in sorted(pids) if self._leads_process_group(p)), min(pids))
+            profile_dir = self.storage.get_profile_dir(acc)
+            self.active_instances[account_id] = RunningInstance(
+                account_id=account_id,
+                username=acc.username,
+                pid=pid,
+                start_time=time.time(),
+                log_path=str(profile_dir / "instance.log"),
+            )
+
+    @staticmethod
+    def _leads_process_group(pid: int) -> bool:
+        try:
+            return os.getpgid(pid) == pid
+        except OSError:
+            return False
 
     def get_instance_error(self, account_id: str) -> Optional[str]:
         """Returns the most recent exit or launch error message for the given account."""

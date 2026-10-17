@@ -157,6 +157,38 @@ class TestAppUpdater(unittest.TestCase):
         self.assertFalse(ok)
         self.assertIn("valid AERAM package structure", msg)
 
+    def test_archive_update_removes_patches_dropped_upstream(self):
+        from unittest.mock import patch
+        import io
+
+        patches = self.updater.app_root / "native" / "mocktail"
+        patches.mkdir(parents=True)
+        (patches / "0002-old-dropped.patch").write_text("stale")
+        (patches / "0001-kept.patch").write_text("old")
+        (self.updater.app_root / "manager.db").write_text("user data")
+
+        zip_buf = io.BytesIO()
+        with zipfile.ZipFile(zip_buf, "w") as zf:
+            zf.writestr("aeram-main/core/__init__.py", "")
+            zf.writestr("aeram-main/native/mocktail/0001-kept.patch", "new")
+            zf.writestr("aeram-main/native/mocktail/0002-replacement.patch", "new")
+        zip_bytes = zip_buf.getvalue()
+
+        class FakeResponse(io.BytesIO):
+            def __enter__(self):
+                return self
+            def __exit__(self, *args):
+                pass
+
+        with patch("core.updater.urllib.request.urlopen", return_value=FakeResponse(zip_bytes)), \
+                patch("core.updater.shutil.which", return_value=None):
+            ok, msg = self.updater.apply_update()
+
+        self.assertTrue(ok, msg)
+        self.assertEqual(sorted(p.name for p in patches.iterdir()), ["0001-kept.patch", "0002-replacement.patch"])
+        self.assertEqual((patches / "0001-kept.patch").read_text(), "new")
+        self.assertEqual((self.updater.app_root / "manager.db").read_text(), "user data")
+
 
 class TestUpdateDialog(unittest.TestCase):
     def test_dialog_init(self):
