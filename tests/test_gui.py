@@ -1539,12 +1539,10 @@ class TestGUI(unittest.TestCase):
                 self.assertFalse(hasattr(dlg, "btn_open_firefox"))
                 self.assertFalse(hasattr(dlg, "btn_open_webengine"))
 
-                # Verify status metric cycling covers all 3 slides (0 -> 1 -> 2 -> 0)
+                # Verify status metric cycling covers both slides (0 -> 1 -> 0)
                 window._status_metric_index = 0
                 window._cycle_status_metric()
                 self.assertEqual(window._status_metric_index, 1)
-                window._cycle_status_metric()
-                self.assertEqual(window._status_metric_index, 2)
                 window._cycle_status_metric()
                 self.assertEqual(window._status_metric_index, 0)
 

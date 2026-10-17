@@ -1329,8 +1329,8 @@ class MainWindow(QtWidgets.QMainWindow):
                 aid = item.data(QtCore.Qt.ItemDataRole.UserRole)
                 acc = self.account_map.get(aid)
                 if acc:
-                    running = self.runner.is_instance_running(acc.account_id)
-                    inst = self.runner.get_running_instance(acc.account_id) if running else None
+                    inst = self.runner.get_running_instance(acc.account_id)
+                    running = inst is not None
                     auth_info = self.runner.auth_state_manager.get_state_info(acc.account_id) if hasattr(self.runner, "auth_state_manager") else None
                     auth_state = auth_info.state if auth_info else AccountAuthState.STORED
                     pres = self._presence_map.get(acc.user_id) if (hasattr(self, "_presence_map") and acc.user_id) else None
@@ -1432,17 +1432,21 @@ class MainWindow(QtWidgets.QMainWindow):
                 visible_text = f"RAM: {avail_gb:.1f}G  •  Swap: {swap_gb:.1f}G  •  VRAM: {v_used:.1f}/{v_tot:.0f}G  •  {active_cnt}/{total_cnt} Active"
             else:
                 visible_text = f"RAM: {avail_gb:.1f}G  •  Swap: {swap_gb:.1f}G  •  {active_cnt}/{total_cnt} Active"
-            self.count_label.setStyleSheet("color: #888888; font-size: 10px; padding-right: 6px;")
+            label_style = "color: #888888; font-size: 10px; padding-right: 6px;"
         else:
             # Slide 1: Mocktail runtime & instances
             if "NOT FOUND" in runtime:
                 visible_text = f"[Mocktail Missing]  •  {active_cnt}/{total_cnt} Active"
-                self.count_label.setStyleSheet("color: #FFFFFF; font-size: 10px; font-weight: bold; padding-right: 6px;")
+                label_style = "color: #FFFFFF; font-size: 10px; font-weight: bold; padding-right: 6px;"
             else:
                 visible_text = f"{runtime}  •  {active_cnt}/{total_cnt} Active"
-                self.count_label.setStyleSheet("color: #A8A8A8; font-size: 10px; padding-right: 6px;")
+                label_style = "color: #A8A8A8; font-size: 10px; padding-right: 6px;"
 
-        self.count_label.setText(visible_text)
+        # Runs every poll tick; setStyleSheet re-polishes the label, so only touch what changed.
+        if self.count_label.styleSheet() != label_style:
+            self.count_label.setStyleSheet(label_style)
+        if self.count_label.text() != visible_text:
+            self.count_label.setText(visible_text)
 
         tip_lines = [
             f"Runtime: {runtime}",
@@ -1454,7 +1458,9 @@ class MainWindow(QtWidgets.QMainWindow):
         tip_lines.append(f"Accounts: {total_cnt} Total ({active_cnt} Active/Running)")
         tip_lines.append("")
         tip_lines.append("(Click to cycle displayed metrics)")
-        self.count_label.setToolTip("\n".join(tip_lines))
+        tooltip = "\n".join(tip_lines)
+        if self.count_label.toolTip() != tooltip:
+            self.count_label.setToolTip(tooltip)
 
         now = time.time()
         if avail_gb < 1.5 and (now - getattr(self, "_last_low_ram_notif", 0)) > 180:
@@ -1491,7 +1497,7 @@ class MainWindow(QtWidgets.QMainWindow):
         threading.Thread(target=_worker, daemon=True).start()
 
     def _cycle_status_metric(self):
-        self._status_metric_index = (getattr(self, "_status_metric_index", 0) + 1) % 3
+        self._status_metric_index = (getattr(self, "_status_metric_index", 0) + 1) % 2
         self._update_status_bar()
 
     def _on_metrics_clicked(self, event):

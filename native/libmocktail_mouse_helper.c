@@ -726,10 +726,12 @@ bool SDL_GL_SwapWindow(SDL_Window *window) {
         }
     }
 
-    maybe_unclamp_framerate();
+    if (helper_active) {
+        maybe_unclamp_framerate();
 
-    // Composite overlay directly into the current OpenGL backbuffer
-    render_text_overlay(window);
+        // Composite overlay directly into the current OpenGL backbuffer
+        render_text_overlay(window);
+    }
 
     return real_SDL_GL_SwapWindow ? real_SDL_GL_SwapWindow(window) : false;
 }
@@ -738,15 +740,6 @@ bool SDL_GL_SwapWindow(SDL_Window *window) {
 // SDL_PeepEvents hook on Mocktail's main thread, which both the OpenGL and the
 // Vulkan backends drive; the GL swap hook never runs on Vulkan.
 static void run_anti_afk(void) {
-    SDL_Window *window = last_window;
-    if (!window) {
-        int window_count = 0;
-        SDL_Window **windows = SDL_GetWindows(&window_count);
-        if (windows) {
-            if (window_count > 0) window = windows[0];
-            SDL_free(windows);
-        }
-    }
     uint64_t now_ms = get_time_ms();
     bool do_pulse = false;
 
@@ -776,6 +769,16 @@ static void run_anti_afk(void) {
     if (do_pulse) {
         last_user_input_time = now_ms;
         if (!this_instance_typing) {
+            // Looked up only when pulsing: this runs on every event pump call.
+            SDL_Window *window = last_window;
+            if (!window) {
+                int window_count = 0;
+                SDL_Window **windows = SDL_GetWindows(&window_count);
+                if (windows) {
+                    if (window_count > 0) window = windows[0];
+                    SDL_free(windows);
+                }
+            }
             inject_anti_afk_event(window);
         }
     }
@@ -784,7 +787,7 @@ static void run_anti_afk(void) {
 
 int SDL_PeepEvents(SDL_Event *events, int numevents, SDL_EventAction action, Uint32 minType, Uint32 maxType) {
     init_symbols();
-    maybe_unclamp_framerate();
+    if (helper_active) maybe_unclamp_framerate();
     int count = real_SDL_PeepEvents ? real_SDL_PeepEvents(events, numevents, action, minType, maxType) : 0;
     if (helper_active) run_anti_afk();
     if (events && count > 0 && (action == SDL_GETEVENT || action == SDL_PEEKEVENT)) {
