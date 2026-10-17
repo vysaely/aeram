@@ -507,6 +507,8 @@ class InstanceRunner:
             env["MOCKTAIL_FULLSCREEN_READINESS"] = "0"
             env["MOCKTAIL_MULTITHREADED_RENDERING"] = "1"  # Keep Luau script execution independent of rendering
             env["MOCKTAIL_PHYSICS_WORKER_MODE"] = "auto"
+            # Rest the main thread between engine polls instead of spinning a core per alt
+            env["MOCKTAIL_ENGINE_PUMP_REST"] = "sleep"
         else:
             env["MOCKTAIL_F11_FULLSCREEN"] = "1"
             env["MOCKTAIL_FULLSCREEN_READINESS"] = "1"

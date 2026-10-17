@@ -71,6 +71,10 @@ any are missing. AERAM uses this build automatically, even when a system Mocktai
   the mouse. Toggle under Settings → Client Engine & FastFlags → Main Cursor.
 - **1 ms input polling** instead of 4 ms.
 - **No 240 FPS cap:** the main account's FPS setting above 240 actually applies.
+- **Less CPU per instance:** Mocktail's main thread rests between engine polls instead of spinning a core
+  (ported from [Nightcap](https://github.com/CoderDayton/nightcap)); alts always rest.
+- **Login checks that finish:** "Verifying you're not a bot" answers right away and solved challenges close their
+  window (also from Nightcap).
 
 ## Usage
 
