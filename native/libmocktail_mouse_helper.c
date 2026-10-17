@@ -55,6 +55,10 @@ static Uint64 (*real_SDL_GetTicksNS)(void) = NULL;
 static SDL_WindowID (*real_SDL_GetWindowID)(SDL_Window *window) = NULL;
 
 static volatile sig_atomic_t g_afk_pulse_requested = 0;
+// LD_PRELOAD reaches every child of Mocktail (WebKit login windows, updater,
+// failure dialog). Only the game process itself owns SIGUSR1 and anti-AFK;
+// WebKit's JavaScriptCore uses SIGUSR1 for its own thread suspension.
+static bool helper_active = false;
 static uint64_t last_user_input_time = 0;
 static time_t last_shm_pulse_time = 0;
 
@@ -202,67 +206,112 @@ static int dbg_checked = 0;
 // =============================================================================
 // Framerate Uncapping (raises libroblox.so's hardcoded 240 FPS ceilings)
 // =============================================================================
-// Returns true once libroblox.so has been mapped and scanned. The scan result
-// is final either way: a Mocktail build that already raised the clamps leaves
-// no patterns behind, and rescanning ~100 MB of text every frame would stall.
-static bool unclamp_process_framerate(void) {
-    FILE *f = fopen("/proc/self/maps", "r");
-    if (!f) return false;
+// libroblox clamps DFIntTaskSchedulerTargetFps to 240 with
+// "mov ecx, 240; cmp eax, ecx; cmov". The same shape also clamps network send
+// rates (S2PhysicsSenderRate, ISRBandwidthSendLimiterHz), which must keep
+// Roblox's limits, so only clamps whose input is loaded from the FPS flag's
+// storage are raised. That storage is found from the flag's registration: the
+// address of its name string is stored 8 bytes after the value.
+typedef struct {
+    unsigned char *begin;
+    size_t length;
+    bool executable;
+} RobloxMapping;
 
-    char line[512];
-    static bool libroblox_patched = false;
-    bool libroblox_seen = false;
-    int patches_applied = 0;
+static int32_t read_disp32(const unsigned char *at) {
+    int32_t value;
+    memcpy(&value, at, sizeof(value));
+    return value;
+}
 
-    // Pattern 1 in libroblox.so (GetTaskSchedulerTargetFps & RenderScheduler clamps):
-    // mov ecx, 240; cmp eax, ecx; cmovl ecx, eax -> b9 f0 00 00 00 39 c8 0f 4c c8
-    const uint8_t pat_roblox1[] = { 0xb9, 0xf0, 0x00, 0x00, 0x00, 0x39, 0xc8, 0x0f, 0x4c, 0xc8 };
-    // Pattern 2 in libroblox.so (nativePostClientSettingsLoadedInitialization3):
-    // mov ecx, 240; cmp eax, ecx; cmovae eax, ecx -> b9 f0 00 00 00 39 c8 0f 43 c1
-    const uint8_t pat_roblox2[] = { 0xb9, 0xf0, 0x00, 0x00, 0x00, 0x39, 0xc8, 0x0f, 0x43, 0xc1 };
-
-    // Set engine ceiling to 10,000 FPS so any preset (60, 120, 144, 165, 240, 320, unlimited) runs uninhibited
-    const uint32_t uncapped_limit = 10000;
-    long page_size = sysconf(_SC_PAGESIZE);
-    if (page_size <= 0) page_size = 4096;
-
-    while (fgets(line, sizeof(line), f)) {
-        bool is_roblox = (!libroblox_patched && strstr(line, "libroblox.so"));
-
-        if (!is_roblox) continue;
-
-        uintptr_t start = 0, end = 0;
-        char perms[16];
-        if (sscanf(line, "%lx-%lx %15s", &start, &end, perms) != 3) continue;
-        if (!strchr(perms, 'r')) continue;
-
-        size_t len = end - start;
-        uint8_t *mem = (uint8_t *)start;
-
-        if (is_roblox && strchr(perms, 'x')) {
-            libroblox_seen = true;
-            for (size_t i = 0; i + 10 <= len; i++) {
-                if (memcmp(mem + i, pat_roblox1, sizeof(pat_roblox1)) == 0 ||
-                    memcmp(mem + i, pat_roblox2, sizeof(pat_roblox2)) == 0) {
-                    uintptr_t page_start = (uintptr_t)(mem + i) & ~(page_size - 1);
-                    uintptr_t page_end = ((uintptr_t)(mem + i + 10) + page_size - 1) & ~(page_size - 1);
-                    size_t psize = page_end - page_start;
-                    mprotect((void *)page_start, psize, PROT_READ | PROT_WRITE | PROT_EXEC);
-                    memcpy(mem + i + 1, &uncapped_limit, sizeof(uncapped_limit));
-                    if (!strchr(perms, 'w')) {
-                        mprotect((void *)page_start, psize, PROT_READ | PROT_EXEC);
-                    }
-                    patches_applied++;
-                    fprintf(stderr, "[AERAM-FPS] Unlocked libroblox.so 240 FPS clamp #%d at %p to %u FPS\n", patches_applied, (void *)(mem + i), uncapped_limit);
+static uintptr_t find_target_fps_value(const RobloxMapping *maps, int count) {
+    static const char name[] = "\0TaskSchedulerTargetFps";
+    uintptr_t name_addr = 0;
+    for (int m = 0; m < count && name_addr == 0; m++) {
+        const void *found = memmem(maps[m].begin, maps[m].length, name, sizeof(name));
+        if (found) name_addr = (uintptr_t)found + 1;
+    }
+    if (name_addr == 0) return 0;
+    for (int m = 0; m < count; m++) {
+        if (!maps[m].executable || maps[m].length < 64) continue;
+        for (size_t i = 0; i + 64 <= maps[m].length; i++) {
+            const unsigned char *lea = maps[m].begin + i;
+            // lea r64, [rip + disp32]
+            if ((lea[0] != 0x48 && lea[0] != 0x4c) || lea[1] != 0x8d || (lea[2] & 0xc7) != 0x05) continue;
+            if ((uintptr_t)lea + 7 + read_disp32(lea + 3) != name_addr) continue;
+            for (size_t k = 7; k < 40; k++) {
+                const unsigned char *st = lea + k;
+                // mov [rip + disp32], same r64
+                if (st[0] == lea[0] && st[1] == 0x89 && (st[2] & 0xc7) == 0x05 &&
+                    ((st[2] >> 3) & 7) == ((lea[2] >> 3) & 7)) {
+                    return (uintptr_t)st + 7 + read_disp32(st + 3) - 8;
                 }
             }
         }
     }
-    fclose(f);
-    if (libroblox_seen) {
-        libroblox_patched = true;
+    return 0;
+}
+
+static bool clamp_reads_value(const unsigned char *clamp, uintptr_t value) {
+    for (size_t back = 6; back <= 40; back++) {
+        const unsigned char *load = clamp - back;
+        // mov eax, [rip + disp32]
+        if (load[0] == 0x8b && load[1] == 0x05 && (uintptr_t)load + 6 + read_disp32(load + 2) == value) {
+            return true;
+        }
     }
-    return libroblox_patched;
+    return false;
+}
+
+// Returns true once libroblox.so has been mapped and scanned. The result is
+// final either way: a Mocktail build that already raised the clamp leaves no
+// match behind, and rescanning ~100 MB of text every frame would stall.
+static bool unclamp_process_framerate(void) {
+    FILE *f = fopen("/proc/self/maps", "r");
+    if (!f) return false;
+    RobloxMapping maps[32];
+    int count = 0;
+    char line[512];
+    while (fgets(line, sizeof(line), f) && count < 32) {
+        uintptr_t start = 0, end = 0;
+        char perms[16];
+        if (!strstr(line, "libroblox.so")) continue;
+        if (sscanf(line, "%lx-%lx %15s", &start, &end, perms) != 3 || perms[0] != 'r' || end <= start) continue;
+        maps[count].begin = (unsigned char *)start;
+        maps[count].length = end - start;
+        maps[count].executable = perms[2] == 'x';
+        count++;
+    }
+    fclose(f);
+    if (count == 0) return false;
+
+    const uintptr_t value = find_target_fps_value(maps, count);
+    if (value == 0) {
+        fprintf(stderr, "[AERAM-FPS] TaskSchedulerTargetFps not located; 240 FPS clamp left in place\n");
+        return true;
+    }
+    static const unsigned char clamp_prefix[] = { 0xb9, 0xf0, 0x00, 0x00, 0x00, 0x39, 0xc8 };
+    const uint32_t uncapped_limit = 10000;
+    long page_size = sysconf(_SC_PAGESIZE);
+    if (page_size <= 0) page_size = 4096;
+    int patched = 0;
+    for (int m = 0; m < count; m++) {
+        if (!maps[m].executable || maps[m].length < 64) continue;
+        for (size_t i = 40; i + 10 <= maps[m].length; i++) {
+            unsigned char *clamp = maps[m].begin + i;
+            if (clamp[0] != 0xb9 || memcmp(clamp, clamp_prefix, sizeof(clamp_prefix)) != 0 || clamp[7] != 0x0f) continue;
+            if (!((clamp[8] == 0x4c && clamp[9] == 0xc8) || (clamp[8] == 0x43 && clamp[9] == 0xc1))) continue;
+            if (!clamp_reads_value(clamp, value)) continue;
+            uintptr_t page_start = (uintptr_t)clamp & ~(uintptr_t)(page_size - 1);
+            uintptr_t page_end = ((uintptr_t)clamp + 5 + page_size - 1) & ~(uintptr_t)(page_size - 1);
+            if (mprotect((void *)page_start, page_end - page_start, PROT_READ | PROT_WRITE | PROT_EXEC) != 0) continue;
+            memcpy(clamp + 1, &uncapped_limit, sizeof(uncapped_limit));
+            mprotect((void *)page_start, page_end - page_start, PROT_READ | PROT_EXEC);
+            patched++;
+        }
+    }
+    fprintf(stderr, "[AERAM-FPS] Raised %d TaskSchedulerTargetFps 240 clamp(s) to %u\n", patched, uncapped_limit);
+    return true;
 }
 
 // Called from both the GL swap hook and the event pump hook, so the Vulkan
@@ -282,8 +331,20 @@ static void maybe_unclamp_framerate(void) {
     done = unclamp_process_framerate();
 }
 
+static bool is_mocktail_game_process(void) {
+    char exe[4096];
+    ssize_t n = readlink("/proc/self/exe", exe, sizeof(exe) - 1);
+    if (n <= 0) return false;
+    exe[n] = '\0';
+    const char *base = strrchr(exe, '/');
+    base = base ? base + 1 : exe;
+    return strcmp(base, "mocktail") == 0 || strncmp(base, "mocktail_acc_", 13) == 0;
+}
+
 __attribute__((constructor))
 static void ctor_init(void) {
+    helper_active = is_mocktail_game_process();
+    if (!helper_active) return;
     last_user_input_time = get_time_ms();
 
     struct sigaction sa;
@@ -670,7 +731,22 @@ bool SDL_GL_SwapWindow(SDL_Window *window) {
     // Composite overlay directly into the current OpenGL backbuffer
     render_text_overlay(window);
 
-    // Targeted Anti-AFK check (Zero focus stealing, affects only Mocktail)
+    return real_SDL_GL_SwapWindow ? real_SDL_GL_SwapWindow(window) : false;
+}
+
+// Anti-AFK (zero focus stealing, affects only this Mocktail). Runs from the
+// SDL_PeepEvents hook on Mocktail's main thread, which both the OpenGL and the
+// Vulkan backends drive; the GL swap hook never runs on Vulkan.
+static void run_anti_afk(void) {
+    SDL_Window *window = last_window;
+    if (!window) {
+        int window_count = 0;
+        SDL_Window **windows = SDL_GetWindows(&window_count);
+        if (windows) {
+            if (window_count > 0) window = windows[0];
+            SDL_free(windows);
+        }
+    }
     uint64_t now_ms = get_time_ms();
     bool do_pulse = false;
 
@@ -704,13 +780,13 @@ bool SDL_GL_SwapWindow(SDL_Window *window) {
         }
     }
 
-    return real_SDL_GL_SwapWindow ? real_SDL_GL_SwapWindow(window) : false;
 }
 
 int SDL_PeepEvents(SDL_Event *events, int numevents, SDL_EventAction action, Uint32 minType, Uint32 maxType) {
     init_symbols();
     maybe_unclamp_framerate();
     int count = real_SDL_PeepEvents ? real_SDL_PeepEvents(events, numevents, action, minType, maxType) : 0;
+    if (helper_active) run_anti_afk();
     if (events && count > 0 && (action == SDL_GETEVENT || action == SDL_PEEKEVENT)) {
         for (int i = 0; i < count; i++) {
             event_watcher(NULL, &events[i]);

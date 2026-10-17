@@ -47,6 +47,19 @@ class TestAntiAfkEngine(unittest.TestCase):
                 pids = self.engine.get_mocktail_pids()
                 self.assertEqual(pids, [12345])
 
+    def test_only_game_processes_are_signalled(self):
+        from core.anti_afk import is_mocktail_game_cmdline
+        for game in (b"/home/u/.local/lib/mocktail/mocktail_acc_50e3\x00--windowed\x00",
+                     b"/usr/bin/mocktail\x00", b"mocktail\x00roblox://x\x00"):
+            self.assertTrue(is_mocktail_game_cmdline(game), game)
+        for other in (b"/home/u/.local/lib/mocktail/mocktail_webview_helper\x00",
+                      b"/home/u/.local/lib/mocktail/mocktail_updater\x00",
+                      b"tail\x00-f\x00/home/u/.local/share/mocktail/log\x00",
+                      b"cmake\x00--build\x00/src/mocktail/build\x00",
+                      b"/bin/sh\x00/home/u/.local/bin/mocktail\x00",
+                      b"code\x00/home/u/mocktail_acc_notes.txt\x00"):
+            self.assertFalse(is_mocktail_game_cmdline(other), other)
+
     def test_trigger_ipc_pulse(self):
         """Triggers pulse file in /dev/shm and sends signal to target PIDs."""
         pulse_path = Path("/dev/shm/aeram_afk_pulse")

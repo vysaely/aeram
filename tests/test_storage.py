@@ -5,6 +5,7 @@ Unit tests for StorageManager and isolated container sandbox filesystem.
 import os
 import sys
 import tempfile
+import re
 import unittest
 from pathlib import Path
 
@@ -270,15 +271,45 @@ class TestStorageManager(unittest.TestCase):
         self.assertIn('<int name="GraphicsQualityLevel">1</int>', alt_content)
         self.assertIn('<token name="SavedQualityLevel">1</token>', alt_content)
 
-        # Now test apply_roblox_engine_preferences
-        self.storage.apply_roblox_engine_preferences(graphics_level=7)
+        # Roblox's own menu changes survive later launches; only the FPS cap is enforced on mains
+        def set_in_game(xml, gfx, sens, vol):
+            txt = xml.read_text(encoding="utf-8")
+            txt = re.sub(r'<int name="GraphicsQualityLevel">\d+</int>', f'<int name="GraphicsQualityLevel">{gfx}</int>', txt)
+            txt = re.sub(r'<float name="MouseSensitivity">[\d.]+</float>', f'<float name="MouseSensitivity">{sens}</float>', txt)
+            txt = re.sub(r'<float name="MasterVolume">[\d.]+</float>', f'<float name="MasterVolume">{vol}</float>', txt)
+            txt = re.sub(r'<int name="FramerateCap">\d+</int>', '<int name="FramerateCap">60</int>', txt)
+            xml.write_text(txt, encoding="utf-8")
 
-        main_content_after = main_xml.read_text(encoding="utf-8")
-        alt_content_after = alt_xml.read_text(encoding="utf-8")
-        self.assertIn('<token name="ControlMode">1</token>', main_content_after)
-        self.assertIn('<token name="ControlMode">1</token>', alt_content_after)
-        self.assertIn('<int name="GraphicsQualityLevel">7</int>', main_content_after)
-        self.assertIn('<int name="GraphicsQualityLevel">1</int>', alt_content_after)
+        set_in_game(main_xml, 3, 0.9, 0.5)
+        set_in_game(alt_xml, 9, 0.9, 0.5)
+        self.storage._provision_engine_settings(main_run, main_acc)
+        self.storage._provision_engine_settings(alt_run, alt_acc)
+        main_txt = main_xml.read_text(encoding="utf-8")
+        alt_txt = alt_xml.read_text(encoding="utf-8")
+        self.assertIn('<int name="GraphicsQualityLevel">3</int>', main_txt)
+        self.assertIn('<float name="MouseSensitivity">0.9</float>', main_txt)
+        self.assertIn('<float name="MasterVolume">0.5</float>', main_txt)
+        self.assertNotIn('<int name="FramerateCap">60</int>', main_txt)
+        # Alts stay low-power and muted every launch
+        self.assertIn('<int name="GraphicsQualityLevel">1</int>', alt_txt)
+        self.assertIn('<float name="MasterVolume">0</float>', alt_txt)
+
+        # Applying the preset writes it once at the next launch, then the player owns it again
+        self.storage.request_engine_preset(5, 0.4)
+        self.storage._provision_engine_settings(main_run, main_acc)
+        main_txt = main_xml.read_text(encoding="utf-8")
+        self.assertIn('<int name="GraphicsQualityLevel">5</int>', main_txt)
+        self.assertIn('<token name="SavedQualityLevel">5</token>', main_txt)
+        self.assertIn('<float name="MouseSensitivity">0.400000</float>', main_txt)
+        self.assertIn('<float name="MasterVolume">0.5</float>', main_txt)
+
+        set_in_game(main_xml, 8, 0.7, 0.5)
+        self.storage._provision_engine_settings(main_run, main_acc)
+        self.assertIn('<int name="GraphicsQualityLevel">8</int>', main_xml.read_text(encoding="utf-8"))
+
+        self.storage.request_engine_preset(5, 0.4)
+        self.storage._provision_engine_settings(main_run, main_acc)
+        self.assertIn('<int name="GraphicsQualityLevel">5</int>', main_xml.read_text(encoding="utf-8"))
 
     def test_get_effective_fflags(self):
         # Default flags for alt and main
@@ -297,9 +328,11 @@ class TestStorageManager(unittest.TestCase):
         self.assertNotIn("FFlagDebugGraphicsPreferOpenGL", vul_ff)
 
         # Test custom JSON override
-        self.storage.set_setting("custom_fastflags_json", '{"DFIntTaskSchedulerTargetFps": 165}')
+        self.storage.set_setting("custom_fastflags_json", '{"DFIntTaskSchedulerTargetFps": 165, "FIntDebugForceMSAASamples": 2}')
         custom_ff = self.storage.get_effective_fflags(is_alt=False)
-        self.assertEqual(custom_ff.get("DFIntTaskSchedulerTargetFps"), 165)
+        # The FPS flag would make Mocktail refuse to start next to AERAM's frame_rate_limit
+        self.assertNotIn("DFIntTaskSchedulerTargetFps", custom_ff)
+        self.assertEqual(custom_ff.get("FIntDebugForceMSAASamples"), 2)
 
     def test_save_accounts_batch(self):
         batch = [

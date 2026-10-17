@@ -1051,21 +1051,23 @@ class SettingsDialog(BorderlessDialog):
         grid_perf.setColumnStretch(0, 1)
         grid_perf.setColumnStretch(1, 0)
 
-        # Graphics quality
-        lbl_gfx = QtWidgets.QLabel("Graphics Quality:")
-        lbl_gfx.setToolTip("Roblox in-game rendering quality level (1-10, default: 7)")
-        self.spin_gfx = QtWidgets.QSpinBox()
-        self.spin_gfx.setRange(1, 10)
-        self.spin_gfx.setSuffix(" / 10")
-        self.spin_gfx.setFixedWidth(130)
-        self.spin_gfx.setFixedHeight(26)
+        # Graphics preset (applied once with "Apply Preset", then Roblox's own menu owns it)
+        lbl_gfx = QtWidgets.QLabel("Graphics Preset:")
+        lbl_gfx.setToolTip("Roblox in-game graphics level for main accounts, applied with Apply Preset")
+        self.combo_gfx = QtWidgets.QComboBox()
+        preset_names = {1: "Potato", 3: "Low", 5: "Balanced", 7: "High", 10: "Ultra"}
+        for level in range(1, 11):
+            name = preset_names.get(level)
+            self.combo_gfx.addItem(f"{level} - {name}" if name else str(level), level)
+        self.combo_gfx.setFixedWidth(130)
+        self.combo_gfx.setFixedHeight(26)
         try:
             saved_gfx = int(self.storage.get_setting("graphics_quality_level", "7"))
         except (ValueError, TypeError):
             saved_gfx = 7
-        self.spin_gfx.setValue(saved_gfx)
+        self.combo_gfx.setCurrentIndex(max(0, min(9, saved_gfx - 1)))
         grid_perf.addWidget(lbl_gfx, 0, 0)
-        grid_perf.addWidget(self.spin_gfx, 0, 1)
+        grid_perf.addWidget(self.combo_gfx, 0, 1)
 
         # Main Framerate Cap
         lbl_fps = QtWidgets.QLabel("Main Account FPS Cap:")
@@ -1121,7 +1123,7 @@ class SettingsDialog(BorderlessDialog):
 
         # Camera Sensitivity
         lbl_sens = QtWidgets.QLabel("Camera Sensitivity:")
-        lbl_sens.setToolTip("Directly synchronizes with Roblox engine settings (Escape -> Settings -> Camera Sensitivity)")
+        lbl_sens.setToolTip("Roblox camera sensitivity (Escape -> Settings), applied with Apply Preset")
         self.spin_sens = QtWidgets.QDoubleSpinBox()
         self.spin_sens.setRange(0.01, 5.0)
         self.spin_sens.setSingleStep(0.05)
@@ -1135,6 +1137,19 @@ class SettingsDialog(BorderlessDialog):
         grid_perf.addWidget(lbl_sens, 4, 0)
         grid_perf.addWidget(self.spin_sens, 4, 1)
 
+        # Apply the in-game preset once; Roblox's own menu changes persist afterwards
+        self.lbl_preset = QtWidgets.QLabel("In-Game Preset:")
+        self.lbl_preset.setToolTip(
+            "Writes the graphics preset, camera sensitivity and shift-lock switch into every account at its "
+            "next launch. Changes you make in Roblox's menu afterwards are kept; apply again to reset them."
+        )
+        btn_apply_preset = QtWidgets.QPushButton("Apply Preset")
+        btn_apply_preset.setFixedWidth(130)
+        btn_apply_preset.setFixedHeight(26)
+        btn_apply_preset.clicked.connect(self._apply_engine_preset)
+        grid_perf.addWidget(self.lbl_preset, 5, 0)
+        grid_perf.addWidget(btn_apply_preset, 5, 1)
+
         # In-Game Engine & FastFlags
         lbl_ff = QtWidgets.QLabel("Client Engine & FastFlags:")
         lbl_ff.setToolTip("Advanced in-game graphics overrides, Vulkan/OpenGL renderer toggles, and custom FastFlags")
@@ -1142,8 +1157,8 @@ class SettingsDialog(BorderlessDialog):
         self.btn_ff.setFixedWidth(130)
         self.btn_ff.setFixedHeight(26)
         self.btn_ff.clicked.connect(self._open_fastflags)
-        grid_perf.addWidget(lbl_ff, 5, 0)
-        grid_perf.addWidget(self.btn_ff, 5, 1)
+        grid_perf.addWidget(lbl_ff, 6, 0)
+        grid_perf.addWidget(self.btn_ff, 6, 1)
 
         layout.addWidget(grp_perf)
 
@@ -1280,8 +1295,11 @@ class SettingsDialog(BorderlessDialog):
         dlg = UpdateDialog(self)
         dlg.exec()
 
+    def _apply_engine_preset(self):
+        self.storage.request_engine_preset(self.combo_gfx.currentData(), self.spin_sens.value())
+        self.lbl_preset.setText("In-Game Preset: applied on next launch")
+
     def _save(self):
-        self.storage.set_setting("graphics_quality_level", str(self.spin_gfx.value()))
         selected_cap = self.combo_fps.currentText()
         self.storage.set_setting("fps_cap", selected_cap)
         if "330" in selected_cap:
@@ -1302,12 +1320,6 @@ class SettingsDialog(BorderlessDialog):
         # Synchronize sandbox profiles
         for acc in self.storage.list_accounts():
             self.storage.init_profile_sandbox(acc)
-
-        # Apply engine preferences across runtime instances
-        self.storage.apply_roblox_engine_preferences(
-            mouse_sensitivity=self.spin_sens.value(),
-            graphics_level=self.spin_gfx.value(),
-        )
 
         self.accept()
 
