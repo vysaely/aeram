@@ -1697,9 +1697,7 @@ class MainWindow(QtWidgets.QMainWindow):
                     "Mocktail Not Found",
                     "Mocktail Roblox client runtime was not found on your system.\n\n"
                     "AERAM is an account manager; it uses Mocktail to run Roblox on Linux.\n\n"
-                    "To install Mocktail on Arch/CachyOS:\n"
-                    "  yay -S mocktail\n\n"
-                    "Or download it from GitHub: https://github.com/vinegarhq/mocktail"
+                    + MocktailManager().get_installation_instructions()
                 )
                 return False
 
