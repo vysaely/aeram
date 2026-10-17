@@ -220,5 +220,47 @@ class TestAnnotationsResolve(unittest.TestCase):
                     typing.get_type_hints(obj)
 
 
+class TestDefaultBaseDirSelection(unittest.TestCase):
+    """An empty aeram/ directory must not hide accounts stored in the legacy ram-linux/ directory."""
+
+    def _make_db(self, base, n_accounts):
+        import sqlite3
+        base.mkdir(parents=True, exist_ok=True)
+        conn = sqlite3.connect(base / "manager.db")
+        conn.execute("CREATE TABLE accounts (account_id TEXT PRIMARY KEY)")
+        conn.executemany("INSERT INTO accounts VALUES (?)", [(f"acc_{i}",) for i in range(n_accounts)])
+        conn.commit()
+        conn.close()
+
+    def _base_dir(self, home):
+        from core.platform.linux import LinuxPlatformProvider
+        with patch("pathlib.Path.home", return_value=home):
+            return LinuxPlatformProvider().get_default_base_dir()
+
+    def test_empty_aeram_dir_does_not_hide_legacy_accounts(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            share = home / ".local" / "share"
+            self._make_db(share / "ram-linux", 3)
+            self._make_db(share / "aeram", 0)  # created by a repair step / first launch
+            self.assertEqual(self._base_dir(home), share / "ram-linux")
+
+    def test_aeram_dir_with_accounts_wins(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            share = home / ".local" / "share"
+            self._make_db(share / "ram-linux", 3)
+            self._make_db(share / "aeram", 1)
+            self.assertEqual(self._base_dir(home), share / "aeram")
+
+    def test_fresh_system_uses_aeram_dir(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            self.assertEqual(self._base_dir(home), home / ".local" / "share" / "aeram")
+
+
 if __name__ == "__main__":
     unittest.main()
