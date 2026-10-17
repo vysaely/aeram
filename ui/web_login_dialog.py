@@ -5,7 +5,6 @@ with native browser fidelity and hardware acceleration, capturing .ROBLOSECURITY
 cookies automatically without manual copy-pasting.
 """
 
-import sys
 import uuid
 import json
 import logging
@@ -14,12 +13,11 @@ import subprocess
 from typing import Optional, Dict, Any
 
 from PyQt6 import QtWidgets, QtCore, QtGui
-from PyQt6.QtCore import Qt, QUrl, pyqtSignal, QTimer, QDateTime
+from PyQt6.QtCore import QUrl, pyqtSignal, QTimer, QDateTime
 
 from core.models import RobloxAccount
 from core.storage import StorageManager, clean_cookie
 from core.roblox_api import RobloxAPI
-from ui.theme import DARK_THEME_QSS
 from ui.borderless_dialog import BorderlessDialog, BorderlessInputDialog, BorderlessMessageBox as QMessageBox
 
 log = logging.getLogger("WebLoginDialog")

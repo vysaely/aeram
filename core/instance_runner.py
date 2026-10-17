@@ -12,7 +12,6 @@ import logging
 import re
 import shutil
 import json
-import sys
 import atexit
 try:
     import resource
@@ -25,7 +24,7 @@ from urllib.parse import urlparse, parse_qs
 import urllib.request
 
 from .models import RobloxAccount, RunningInstance
-from .storage import StorageManager
+from .storage import StorageManager, DEFAULT_ALT_FPS
 from .auth_state import AccountAuthState, AccountAuthStateManager
 
 log = logging.getLogger("InstanceRunner")
@@ -455,9 +454,9 @@ class InstanceRunner:
             env["MOCKTAIL_TEXT_FONT"] = str(font_path)
 
         try:
-            alt_fps = int(self.storage.get_setting("alt_fps", "15"))
+            alt_fps = int(self.storage.get_setting("alt_fps", DEFAULT_ALT_FPS))
         except (ValueError, TypeError):
-            alt_fps = 15
+            alt_fps = int(DEFAULT_ALT_FPS)
 
         target_w = "1920" if is_main else "800"
         target_h = "1080" if is_main else "600"
@@ -738,33 +737,72 @@ class InstanceRunner:
             log.error(f"Failed to launch instance for '{account.username}': {e}")
             raise RuntimeError(f"Failed to launch Mocktail for {account.username}: {e}")
 
-    def terminate_instance(self, account_id: str) -> bool:
+    def _instance_pgid(self, pid: int) -> Optional[int]:
+        """The instance's process group when it leads its own (setsid launch), otherwise None."""
+        # An adopted instance started elsewhere may share a group with a shell or with AERAM.
+        try:
+            candidate = os.getpgid(pid)
+            if candidate == pid and candidate != os.getpgrp():
+                return candidate
+        except Exception:
+            pass
+        return None
+
+    @staticmethod
+    def _wait_for_exit(pid: int, timeout: float) -> bool:
+        """Polls until pid has exited (reaping it when it is our child); True when it is gone."""
+        deadline = time.monotonic() + timeout
+        while True:
+            try:
+                if os.waitpid(pid, os.WNOHANG)[0] == pid:
+                    return True
+            except ChildProcessError:
+                pass
+            except OSError:
+                return True
+            try:
+                os.kill(pid, 0)
+            except ProcessLookupError:
+                return True
+            except PermissionError:
+                pass
+            if time.monotonic() >= deadline:
+                return False
+            time.sleep(0.05)
+
+    def terminate_instance(self, account_id: str, grace: float = 1.5) -> bool:
         """Terminates an active instance owned by this manager."""
         if not self.is_instance_running(account_id):
             return False
-
         inst = self.active_instances[account_id]
-        log.info(f"Terminating instance {account_id} (PID {inst.pid})")
+        pgid, signalled = self._send_terminate(account_id, inst)
+        self._finish_termination(account_id, inst, pgid, signalled, grace)
+        return True
 
+    def _send_terminate(self, account_id: str, inst: RunningInstance) -> Tuple[Optional[int], bool]:
+        """SIGTERMs the instance; returns (process group, whether it was signalled at all)."""
+        log.info(f"Terminating instance {account_id} (PID {inst.pid})")
         if not self._is_mocktail_process(inst.pid):
             # The tracked PID exited and was recycled, or never was Mocktail: signalling it
             # (or its process group) could kill an unrelated program, so only drop the record.
             log.warning(f"PID {inst.pid} tracked for {account_id} is no longer a Mocktail process; not signalling it")
-        else:
-            # Only signal the whole group when the instance leads its own (setsid launch). An
-            # adopted instance started elsewhere may share a group with a shell or with AERAM.
-            pgid = None
-            try:
-                candidate = os.getpgid(inst.pid)
-                if candidate == inst.pid and candidate != os.getpgrp():
-                    pgid = candidate
-            except Exception:
-                pass
+            return None, False
+        pgid = self._instance_pgid(inst.pid)
+        self._signal_instance(inst.pid, pgid, signal.SIGTERM)
+        return pgid, True
 
-            self._signal_instance(inst.pid, pgid, signal.SIGTERM)
-            # Allow grace period then force kill if needed
-            time.sleep(0.3)
-            self._signal_instance(inst.pid, pgid, signal.SIGKILL)
+    def _finish_termination(
+        self, account_id: str, inst: RunningInstance, pgid: Optional[int], signalled: bool, grace: float
+    ) -> None:
+        if signalled:
+            # Force kill only if the client is still alive after the grace period; the group
+            # kill also takes down helpers (session-log tee, webview) that ignore SIGTERM.
+            exited = self._wait_for_exit(inst.pid, grace)
+            if pgid is not None or not exited:
+                self._signal_instance(inst.pid, pgid, signal.SIGKILL)
+                if not exited:
+                    # Reap it, or a launched child lingers as a zombie until AERAM exits.
+                    self._wait_for_exit(inst.pid, 0.5)
 
         # Clean up instance runtime lock directory
         try:
@@ -789,7 +827,6 @@ class InstanceRunner:
             del self.active_instances[account_id]
         if hasattr(self, "auth_state_manager") and self.auth_state_manager.get_state(account_id) == AccountAuthState.RUNNING:
             self.auth_state_manager.mark_ready(account_id)
-        return True
 
     @staticmethod
     def _is_mocktail_process(pid: int) -> bool:
@@ -814,12 +851,17 @@ class InstanceRunner:
 
     def terminate_all_instances(self) -> int:
         """Terminates all instances actively tracked by this manager."""
-        count = 0
-        active_ids = list(self.active_instances.keys())
-        for aid in active_ids:
-            if self.terminate_instance(aid):
-                count += 1
-        return count
+        # SIGTERM everything first so the instances shut down in parallel instead of
+        # each one waiting out its own grace period in turn.
+        pending = []
+        for aid in list(self.active_instances.keys()):
+            if self.is_instance_running(aid):
+                inst = self.active_instances[aid]
+                pending.append((aid, inst, *self._send_terminate(aid, inst)))
+        deadline = time.monotonic() + 1.5
+        for aid, inst, pgid, signalled in pending:
+            self._finish_termination(aid, inst, pgid, signalled, max(0.0, deadline - time.monotonic()))
+        return len(pending)
 
     @staticmethod
     def get_available_memory_mb() -> int:
@@ -860,6 +902,20 @@ class InstanceRunner:
             pass
         return stats
 
+    def memory_launch_check(self, username: str) -> Tuple[bool, Optional[str]]:
+        """
+        Decides whether another instance may start given current RAM and swap.
+        Returns (may_launch, warning); warning is None when memory is comfortable.
+        """
+        stats = self.get_memory_stats()
+        avail_mb = stats["mem_avail_mb"]
+        swap_free_mb = stats["swap_free_mb"]
+        if avail_mb < 1500 and swap_free_mb > 1000:
+            return True, f"System RAM low ({avail_mb} MB available). Virtual memory paging active (Swap free: {swap_free_mb} MB)."
+        if (avail_mb + swap_free_mb) < 500:
+            return False, f"Critical memory threshold reached ({avail_mb + swap_free_mb} MB total virtual memory left). Paused launch of {username} to protect stability."
+        return True, None
+
     def launch_multi(
         self,
         accounts: List[RobloxAccount],
@@ -889,22 +945,8 @@ class InstanceRunner:
                         pass
                 continue
 
-            stats = self.get_memory_stats()
-            avail_mb = stats["mem_avail_mb"]
-            swap_free_mb = stats["swap_free_mb"]
-
-            # If RAM is low but swap is available, give kernel a moment to page out and notify
-            if avail_mb < 1500 and swap_free_mb > 1000:
-                warn_msg = f"System RAM low ({avail_mb} MB available). Virtual memory paging active (Swap free: {swap_free_mb} MB)."
-                log.info(warn_msg)
-                if on_progress:
-                    try:
-                        on_progress(i, len(accounts), acc, warn_msg)
-                    except Exception:
-                        pass
-                time.sleep(1.0)
-            elif (avail_mb + swap_free_mb) < 500:
-                warn_msg = f"Critical memory threshold reached ({avail_mb + swap_free_mb} MB total virtual memory left). Paused launch of {acc.username} to protect stability."
+            may_launch, warn_msg = self.memory_launch_check(acc.username)
+            if not may_launch:
                 log.warning(warn_msg)
                 if on_progress:
                     try:
@@ -912,6 +954,15 @@ class InstanceRunner:
                     except Exception:
                         pass
                 break
+            if warn_msg:
+                # RAM is low but swap is available: give the kernel a moment to page out
+                log.info(warn_msg)
+                if on_progress:
+                    try:
+                        on_progress(i, len(accounts), acc, warn_msg)
+                    except Exception:
+                        pass
+                time.sleep(1.0)
             elif on_progress:
                 try:
                     on_progress(i, len(accounts), acc, None)

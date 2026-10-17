@@ -476,6 +476,29 @@ class TestGUI(unittest.TestCase):
         worker.cancel()
         self.assertTrue(worker._cancelled)
 
+    def test_multi_launch_worker_stops_when_memory_is_critical(self):
+        from ui.main_window import MultiLaunchWorker
+        from unittest.mock import MagicMock
+
+        accs = [
+            RobloxAccount(account_id=f"acc_m{i}", username=f"MemUser{i}", display_name="M", user_id=200 + i, cookie="c")
+            for i in range(2)
+        ]
+        mock_runner = MagicMock()
+        mock_runner.auth_state_manager.can_launch.return_value = (True, "")
+        mock_runner.memory_launch_check.return_value = (False, "Critical memory threshold reached")
+        worker = MultiLaunchWorker(runner=mock_runner, accounts=accs, stagger_delay=0.0)
+        warnings, results = [], []
+        worker.memory_warning.connect(warnings.append)
+        worker.finished_queue.connect(lambda launched, failed: results.append((launched, failed)))
+
+        worker.run()
+
+        mock_runner.launch_instance.assert_not_called()
+        self.assertEqual(warnings, ["Critical memory threshold reached"])
+        self.assertEqual(results[0][0], 0)
+        self.assertEqual([u for u, _ in results[0][1]], ["MemUser0", "MemUser1"])
+
     def test_server_finder_dialog(self):
         from ui.server_finder_dialog import ServerFinderDialog
         from unittest.mock import MagicMock

@@ -23,17 +23,16 @@ _project_root = os.path.dirname(_script_dir)
 if _project_root not in sys.path:
     sys.path.insert(0, _project_root)
 
-import platform  # Pre-import standard library platform before evdev uses it
+import platform  # noqa: F401 -- pre-import standard library platform before evdev uses it
 import glob
 import time
-import json
 import tempfile
 import signal
 import select
 import logging
 import argparse
 from pathlib import Path
-from typing import Optional, List
+from typing import List
 
 
 from core.compositor import get_compositor

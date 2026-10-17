@@ -16,16 +16,14 @@ from datetime import datetime, timezone
 from PyQt6 import QtWidgets, QtCore, QtGui
 
 from core.models import RobloxAccount, FavoriteGame
-from core.storage import StorageManager
+from core.storage import StorageManager, DEFAULT_ALT_FPS
 from core.roblox_api import RobloxAPI
 from core.instance_runner import InstanceRunner
 from core.auth_state import AccountAuthState
 from ui.dialogs import (
     AddAccountDialog, ImportRAMDialog, MultiLaunchDialog, EditAccountDialog,
-    SettingsDialog, GroupManagerDialog, WebLoginDialog, UnblockEveryoneDialog,
-    FastFlagsDialog, BatchSignOutDialog, GoogleAuthImportDialog,
-    DiagnosticsDialog, UpdateDialog, ChangePasswordDialog, BatchPasswordChangeDialog,
-    BatchUnblockDialog, BatchLogoutDialog, BatchFriendsDialog, BatchPrivacyDialog,
+    SettingsDialog, GroupManagerDialog, WebLoginDialog, FastFlagsDialog, BatchSignOutDialog, GoogleAuthImportDialog,
+    DiagnosticsDialog, UpdateDialog, BatchLogoutDialog, BatchFriendsDialog, BatchPrivacyDialog,
     Live2FAHubDialog, BatchAutoLoginDialog
 )
 from ui.server_finder_dialog import ServerFinderDialog
@@ -216,6 +214,7 @@ class MultiLaunchWorker(QtCore.QThread):
     stagger delay, providing live second-by-second countdown and responsive cancellation.
     """
     progress = QtCore.pyqtSignal(int, int, str, str)   # (current_idx, total, username, status_msg)
+    memory_warning = QtCore.pyqtSignal(str)            # (warning)
     countdown_tick = QtCore.pyqtSignal(int, str)       # (seconds_left, next_username)
     account_launched = QtCore.pyqtSignal(object)       # (account)
     finished_queue = QtCore.pyqtSignal(int, list)      # (launched_count, failed_list)
@@ -235,7 +234,7 @@ class MultiLaunchWorker(QtCore.QThread):
         self.place_id = place_id
         self.job_id = job_id
         self.follow_user_id = follow_user_id
-        self.stagger_delay = max(1.0, float(stagger_delay))
+        self.stagger_delay = max(0.0, float(stagger_delay))
         self._cancelled = False
 
     def cancel(self):
@@ -255,6 +254,14 @@ class MultiLaunchWorker(QtCore.QThread):
                 failed.append((acc.username, reason))
                 self.progress.emit(idx + 1, total, acc.username, f"Skipped: {reason}")
                 continue
+
+            if hasattr(self.runner, "memory_launch_check"):
+                may_launch, warning = self.runner.memory_launch_check(acc.username)
+                if warning:
+                    self.memory_warning.emit(warning)
+                if not may_launch:
+                    failed.extend((a.username, "Not launched: memory critically low") for a in self.accounts[idx:])
+                    break
 
             self.progress.emit(idx + 1, total, acc.username, f"Launching @{acc.username} ({idx + 1}/{total})...")
 
@@ -1795,6 +1802,7 @@ class MainWindow(QtWidgets.QMainWindow):
         place_id: Optional[int] = None,
         job_id: Optional[str] = None,
         follow_user_id: Optional[int] = None,
+        stagger_delay: Optional[float] = None,
     ):
         if not targets:
             return
@@ -1813,7 +1821,7 @@ class MainWindow(QtWidgets.QMainWindow):
             QMessageBox.warning(self, "Queue Active", "A launch queue is already running. Please cancel or wait for it to finish.")
             return
 
-        stagger = float(self.storage.get_setting("stagger_delay", "15.0"))
+        stagger = stagger_delay if stagger_delay is not None else float(self.storage.get_setting("stagger_delay", "15.0"))
         self._launch_worker = MultiLaunchWorker(
             runner=self.runner,
             accounts=targets,
@@ -1825,6 +1833,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.btn_cancel_queue.setVisible(True)
 
         self._launch_worker.progress.connect(self._on_queue_progress)
+        self._launch_worker.memory_warning.connect(self._on_queue_memory_warning)
         self._launch_worker.countdown_tick.connect(self._on_queue_countdown)
         self._launch_worker.account_launched.connect(lambda acc: self._poll_instances())
         self._launch_worker.finished_queue.connect(self._on_queue_finished)
@@ -1832,6 +1841,14 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _on_queue_progress(self, current: int, total: int, username: str, msg: str):
         self.statusBar().showMessage(f"[{current}/{total}] {msg}", 0)
+
+    def _on_queue_memory_warning(self, warning: str):
+        self.statusBar().showMessage(f"Warning: {warning}", 8000)
+        if shutil.which("notify-send"):
+            try:
+                subprocess.Popen(["notify-send", "-a", "AERAM", "-u", "normal", "AERAM Memory", warning])
+            except Exception:
+                pass
 
     def _on_queue_countdown(self, seconds_left: int, next_username: str):
         self.statusBar().showMessage(f"Staggering @{next_username} ({seconds_left}s)...", 0)
@@ -1967,29 +1984,13 @@ class MainWindow(QtWidgets.QMainWindow):
         default_stagger = float(self.storage.get_setting("stagger_delay", "3.0"))
         dlg = MultiLaunchDialog(targets, self.storage.list_favorites(), self, default_delay=default_stagger)
         if dlg.exec():
-            try:
-                def _progress(idx, total, acc, warning=None):
-                    if warning:
-                        self.statusBar().showMessage(f"Warning: {warning}", 8000)
-                        if shutil.which("notify-send"):
-                            try:
-                                subprocess.Popen(["notify-send", "-a", "AERAM", "-u", "normal", "AERAM Memory", warning])
-                            except Exception:
-                                pass
-                    else:
-                        self.statusBar().showMessage(f"Launching @{acc.username} ({idx + 1}/{total})...", 5000)
-                    QtWidgets.QApplication.processEvents()
-
-                self.runner.launch_multi(
-                    accounts=targets,
-                    place_id=dlg.place_id,
-                    job_id=dlg.job_id,
-                    stagger_delay=dlg.stagger_delay,
-                    on_progress=_progress,
-                )
-                self._poll_instances()
-            except Exception as e:
-                QMessageBox.critical(self, "Multi-Launch Error", str(e))
+            # Runs on the queue worker: launching inline froze the window for the whole stagger.
+            self._start_staggered_queue(
+                targets=targets,
+                place_id=dlg.place_id,
+                job_id=dlg.job_id,
+                stagger_delay=dlg.stagger_delay,
+            )
 
     def _kill_selected(self):
         for acc in self._selected_accounts():
@@ -2325,7 +2326,7 @@ class MainWindow(QtWidgets.QMainWindow):
         targets = self._selected_accounts()
         if not targets:
             return
-        alt_fps = self.storage.get_setting("alt_fps", "6")
+        alt_fps = self.storage.get_setting("alt_fps", DEFAULT_ALT_FPS)
         main_fps = self.storage.get_setting("main_target_fps", "330")
         label = f"High ({main_fps} FPS)" if mode == "main" else f"Low ({alt_fps} FPS)"
         for acc in targets:

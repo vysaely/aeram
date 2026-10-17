@@ -15,7 +15,6 @@ import urllib.parse
 from dataclasses import dataclass
 from typing import Optional, Dict, Any, Tuple, List, Callable
 
-import sys
 
 log = logging.getLogger("RobloxAPI")
 

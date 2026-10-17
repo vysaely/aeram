@@ -13,9 +13,9 @@ from typing import Optional, List, Dict, Any
 from PyQt6 import QtWidgets, QtCore, QtGui
 
 from core.models import RobloxAccount, FavoriteGame
-from core.storage import StorageManager, clean_cookie
+from core.storage import StorageManager, clean_cookie, DEFAULT_ALT_FPS
 from core.roblox_api import RobloxAPI
-from core.ram_importer import import_from_file_or_text, is_ram_encrypted
+from core.ram_importer import import_from_file_or_text
 from core.diagnostics import DiagnosticsRunner
 from core.updater import AppUpdater
 from ui.theme import DARK_THEME_QSS
@@ -1044,9 +1044,9 @@ class SettingsDialog(BorderlessDialog):
         self.spin_alt_fps.setFixedWidth(130)
         self.spin_alt_fps.setFixedHeight(26)
         try:
-            saved_alt_fps = int(self.storage.get_setting("alt_fps", "15"))
+            saved_alt_fps = int(self.storage.get_setting("alt_fps", DEFAULT_ALT_FPS))
         except (ValueError, TypeError):
-            saved_alt_fps = 15
+            saved_alt_fps = int(DEFAULT_ALT_FPS)
         self.spin_alt_fps.setValue(saved_alt_fps)
         grid_perf.addWidget(lbl_alt_fps, 2, 0)
         grid_perf.addWidget(self.spin_alt_fps, 2, 1)
