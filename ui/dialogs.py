@@ -249,41 +249,48 @@ class ImportRAMDialog(BorderlessDialog):
             self.btn_import_all.setEnabled(False)
 
     def _import_all(self):
-        if not self.parsed_accounts:
+        if not self.parsed_accounts or getattr(self, "_import_worker", None) is not None:
             return
 
+        self.btn_import_all.setEnabled(False)
+        self.btn_parse.setEnabled(False)
+        self._import_progress = QtWidgets.QProgressDialog(
+            "Importing accounts and enriching metadata...", "Cancel", 0, len(self.parsed_accounts), self
+        )
+        self._import_progress.setWindowFlags(QtCore.Qt.WindowType.FramelessWindowHint | QtCore.Qt.WindowType.Dialog)
+        self._import_progress.setStyleSheet(DARK_THEME_QSS + "QProgressDialog { background-color: #000000; border: 1px solid #1a1a1a; }")
+        self._import_progress.setWindowModality(QtCore.Qt.WindowModality.NonModal)
+        self._import_progress.setMinimumDuration(0)
+        self._import_progress.setValue(0)
+
+        # Each account costs several Roblox requests; doing them here froze the window.
+        worker = ImportEnrichWorker(self.api, list(self.parsed_accounts), self)
+        worker.progress.connect(self._import_progress.setValue)
+        worker.done.connect(self._finish_import)
+        self._import_progress.canceled.connect(worker.cancel)
+        self.finished.connect(worker.cancel)  # closing the window stops further lookups
+        self._import_worker = worker
+        worker.start()
+
+    def _finish_import(self, results: list):
+        self._import_worker = None
         imported_count = 0
         accounts_to_save = []
-        progress = QtWidgets.QProgressDialog("Importing accounts and enriching metadata...", "Cancel", 0, len(self.parsed_accounts), self)
-        progress.setWindowFlags(QtCore.Qt.WindowType.FramelessWindowHint | QtCore.Qt.WindowType.Dialog)
-        progress.setStyleSheet(DARK_THEME_QSS + "QProgressDialog { background-color: #000000; border: 1px solid #1a1a1a; }")
-        progress.setWindowModality(QtCore.Qt.WindowModality.NonModal)
-
-        for i, item in enumerate(self.parsed_accounts):
-            if progress.wasCanceled():
-                break
-            progress.setValue(i)
-
+        for i, item, data in results:
             cookie = clean_cookie(item["cookie"])
             username = item.get("username") or f"Account_{i+1}"
             display_name = item.get("display_name") or username
             user_id = item.get("user_id") or 0
             group = item.get("group") or "Imported"
             notes = item.get("notes") or ""
-
-            # Try quick enrichment if user_id missing
             avatar_url = ""
             robux = 0
-            try:
-                data = self.api.enrich_account(cookie)
-                if data:
-                    username = data["username"]
-                    display_name = data["display_name"]
-                    user_id = data["user_id"]
-                    avatar_url = data["avatar_url"]
-                    robux = data["robux_balance"]
-            except Exception:
-                pass
+            if data:
+                username = data["username"]
+                display_name = data["display_name"]
+                user_id = data["user_id"]
+                avatar_url = data["avatar_url"]
+                robux = data["robux_balance"]
 
             existing = self.storage.find_account_by_username(username)
             account_id = existing.account_id if existing else f"acc_{uuid.uuid4().hex[:12]}"
@@ -307,17 +314,52 @@ class ImportRAMDialog(BorderlessDialog):
             imported_count += 1
 
         if accounts_to_save:
-            if hasattr(self.storage, "save_accounts_batch"):
-                self.storage.save_accounts_batch(accounts_to_save)
-            else:
-                for a in accounts_to_save:
-                    self.storage.save_account(a)
+            self.storage.save_accounts_batch(accounts_to_save)
 
-        progress.setValue(len(self.parsed_accounts))
+        self._import_progress.setValue(len(self.parsed_accounts))
+        self._import_progress.close()
         QMessageBox.information(
             self, "Import Complete", f"Successfully imported {imported_count} accounts into the local vault."
         )
         self.accept()
+
+
+class ImportEnrichWorker(QtCore.QThread):
+    """Looks up each imported cookie's profile off the GUI thread, a few accounts at a time."""
+    progress = QtCore.pyqtSignal(int)
+    done = QtCore.pyqtSignal(list)  # [(index, item, enrichment or None)] in input order
+
+    PARALLEL = 4
+
+    def __init__(self, api: RobloxAPI, items: List[Dict[str, Any]], parent=None):
+        super().__init__(parent)
+        self.api = api
+        self.items = items
+        self._cancelled = threading.Event()
+
+    def cancel(self):
+        self._cancelled.set()
+
+    def _enrich(self, item):
+        if self._cancelled.is_set():
+            return None
+        try:
+            return self.api.enrich_account(clean_cookie(item["cookie"]))
+        except Exception:
+            return None
+
+    def run(self):
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+
+        results = {}
+        with ThreadPoolExecutor(max_workers=self.PARALLEL) as pool:
+            futures = {pool.submit(self._enrich, item): i for i, item in enumerate(self.items)}
+            for future in as_completed(futures):
+                if not self._cancelled.is_set():
+                    results[futures[future]] = future.result()
+                    self.progress.emit(len(results))
+        # Cancel keeps the accounts finished so far, like the old one-by-one loop.
+        self.done.emit([(i, self.items[i], results[i]) for i in sorted(results)])
 
 
 class EditAccountDialog(BorderlessDialog):

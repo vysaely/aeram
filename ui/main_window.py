@@ -20,6 +20,7 @@ from core.storage import StorageManager, DEFAULT_ALT_FPS
 from core.roblox_api import RobloxAPI
 from core.instance_runner import InstanceRunner
 from core.auth_state import AccountAuthState
+from ui.thread_keeper import dispose_window, retire_thread
 from ui.dialogs import (
     AddAccountDialog, ImportRAMDialog, EditAccountDialog,
     SettingsDialog, GroupManagerDialog, WebLoginDialog, BatchSignOutDialog, GoogleAuthImportDialog,
@@ -459,6 +460,7 @@ class AuthValidatorWorker(QtCore.QThread):
                 self.account_checked.emit(acc_id, is_valid, status_reason)
             except Exception as e:
                 self.account_checked.emit(acc_id, False, f"ERROR_{e}")
+            time.sleep(0.08)  # 80ms spacing to prevent rate limits
         self.finished_all.emit(valid_cnt, expired_cnt)
 
     def stop(self):
@@ -1053,7 +1055,10 @@ class MainWindow(QtWidgets.QMainWindow):
 
         # Stop existing background worker if active
         if getattr(self, "_auth_validator_worker", None) and self._auth_validator_worker.isRunning():
-            self._auth_validator_worker.stop()
+            # Let the old pass end on its own; waiting here would freeze the UI and
+            # dropping a running QThread aborts the process.
+            self._auth_validator_worker.running = False
+            retire_thread(self._auth_validator_worker)
 
         worker = AuthValidatorWorker(acc_payload, self.api)
         worker.account_checked.connect(self._on_background_auth_checked)
@@ -1481,6 +1486,12 @@ class MainWindow(QtWidgets.QMainWindow):
     def _run_on_ui(self, fn: Callable[[], None]) -> None:
         """Runs fn on the GUI thread; safe to call from any thread."""
         self._ui_call.emit(fn)
+
+    def _release_worker(self, attr: str, worker: QtCore.QThread) -> None:
+        """Frees a finished worker; each sync or check run creates a new one parented to us."""
+        if getattr(self, attr, None) is worker:
+            setattr(self, attr, None)
+        worker.deleteLater()
 
     def _run_in_background(self, work: Callable[[], Any], on_done: Callable[[Any], None]) -> None:
         """Runs work() on a daemon thread, then on_done(result) on the GUI thread."""
@@ -1925,6 +1936,8 @@ class MainWindow(QtWidgets.QMainWindow):
             self._active_modeless_windows.pop(key, None)
             if on_finished:
                 on_finished()
+            # Closed dialogs stay parented to the main window until deleted.
+            dispose_window(dlg)
 
         dlg.finished.connect(_cleanup)
         dlg.show()
@@ -2376,6 +2389,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self._active_web_dialogs = []
         self._active_web_dialogs.append(dialog)
         dialog.finished.connect(lambda: self._active_web_dialogs.remove(dialog) if dialog in self._active_web_dialogs else None)
+        dialog.finished.connect(lambda *_: dispose_window(dialog))
 
         dialog.show()
         dialog.raise_()
@@ -2510,6 +2524,7 @@ class MainWindow(QtWidgets.QMainWindow):
             parent=self,
         )
         dialog.setWindowModality(QtCore.Qt.WindowModality.NonModal)
+        dialog.finished.connect(lambda *_: dispose_window(dialog))
         dialog.show()
         dialog.raise_()
         dialog.activateWindow()
@@ -2876,6 +2891,7 @@ class MainWindow(QtWidgets.QMainWindow):
         worker.account_checked.connect(self._on_account_cookie_checked)
         worker.all_finished.connect(self._on_cookie_check_finished)
         self._cookie_validator_worker = worker
+        worker.finished.connect(lambda: self._release_worker("_cookie_validator_worker", worker))
         worker.start()
 
     def _on_account_cookie_checked(self, account_id: str, is_valid: bool, robux: int, status_reason: str):
@@ -3083,6 +3099,7 @@ class MainWindow(QtWidgets.QMainWindow):
         worker.account_synced.connect(self._on_account_synced)
         worker.all_finished.connect(self._on_account_sync_finished)
         self._account_sync_worker = worker
+        worker.finished.connect(lambda: self._release_worker("_account_sync_worker", worker))
         worker.start()
 
     def _on_account_synced(self, account_id: str, display_name: str, avatar_url: str, robux: int):

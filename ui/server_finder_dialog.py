@@ -17,6 +17,7 @@ from core.models import RobloxAccount
 from core.storage import StorageManager
 from core.roblox_api import RobloxAPI
 from ui.borderless_dialog import BorderlessDialog, BorderlessMessageBox as QMessageBox
+from ui.thread_keeper import retire_thread
 
 log = logging.getLogger("ServerMonitor")
 
@@ -320,6 +321,7 @@ class ServerFinderDialog(BorderlessDialog):
         self.btn_refresh.setEnabled(False)
 
         cookie = self._get_active_cookie()
+        retire_thread(getattr(self, "_worker", None))  # an auto-refresh can overlap a slow fetch
         self._worker = ServerFetchWorker(
             api=self.api,
             place_id=self.current_place_id,
