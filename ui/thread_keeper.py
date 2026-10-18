@@ -22,6 +22,21 @@ def retire_thread(thread) -> None:
         thread.setParent(None)
     except RuntimeError:  # C++ object already gone
         return
+    # Nobody wants its results any more (the owner is closing or has started a
+    # replacement), and its slots may touch widgets that are about to be deleted:
+    # a slot raising in PyQt6 aborts the process.
+    # Only the worker's own signals and QThread's: QObject.destroyed carries
+    # PyQt's internal bookkeeping connections and must stay.
+    names = {"started", "finished"}
+    for cls in type(thread).__mro__:
+        if cls is QtCore.QThread:
+            break
+        names.update(n for n, v in vars(cls).items() if isinstance(v, QtCore.pyqtSignal))
+    for name in names:
+        try:
+            getattr(thread, name).disconnect()
+        except (TypeError, RuntimeError):  # nothing connected
+            pass
     _retired.add(thread)
     # Release on the next loop pass, not inside the thread's own finished signal.
     thread.finished.connect(lambda t=thread: QtCore.QTimer.singleShot(0, lambda: _retired.discard(t)))
@@ -47,8 +62,8 @@ def dispose_window(window) -> None:
 class _CallWorker(QtCore.QThread):
     result = QtCore.pyqtSignal(object)
 
-    def __init__(self, fn, parent):
-        super().__init__(parent)
+    def __init__(self, fn):
+        super().__init__()
         self._fn = fn
 
     def run(self):
@@ -62,11 +77,14 @@ class _CallWorker(QtCore.QThread):
 def run_in_thread(owner: QtCore.QObject, fn, on_done) -> QtCore.QThread:
     """Runs fn() off the GUI thread and calls on_done(result) on it.
 
-    on_done should be a method of owner: if owner is deleted first, Qt drops the
-    connection and the result is discarded. An exception is passed as the result.
+    on_done should be a method of owner: if owner is deleted first, PyQt drops
+    the connection and the result is discarded. An exception is passed as the
+    result. The thread has no Qt parent, so closing owner never destroys it
+    mid-run; it is released one loop pass after it finishes.
     """
-    worker = _CallWorker(fn, owner)
+    worker = _CallWorker(fn)
     worker.result.connect(on_done)
-    worker.finished.connect(worker.deleteLater)
+    _retired.add(worker)
+    worker.finished.connect(lambda w=worker: QtCore.QTimer.singleShot(0, lambda: _retired.discard(w)))
     worker.start()
     return worker
