@@ -16,6 +16,8 @@
 #   - login checks: solved generic challenges close, web windows get 5 s
 #   - faster CPU texture conversion (used where the GPU driver lacks ETC2,
 #     e.g. NVIDIA): streaming reads from GPU-mapped memory, parallel writes
+#   - Enter that sends a chat message also reaches the game, so custom chats
+#     need one press instead of two
 # ==============================================================================
 
 set -euo pipefail

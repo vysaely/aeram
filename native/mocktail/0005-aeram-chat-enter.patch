@@ -1,0 +1,53 @@
+diff --git a/src/runtime/roblox_input_router.cc b/src/runtime/roblox_input_router.cc
+index 1b0eb8f..d8f80f0 100644
+--- a/src/runtime/roblox_input_router.cc
++++ b/src/runtime/roblox_input_router.cc
+@@ -490,6 +490,15 @@ RobloxInputDispatchResult RobloxInputRouter::HandleEvent(
+       if (text_result.dispatched) {
+         ++snapshot_.text_events;
+       }
++      // Enter that submits a TextBox also reaches the game as a key press,
++      // like on desktop Roblox, so chats that watch the Enter key itself
++      // don't need a second press. The key release follows on its own once
++      // the editor has let go of focus.
++      if (text_result.session_ended && key->pressed &&
++          (key->scancode == SDL_SCANCODE_RETURN ||
++           key->scancode == SDL_SCANCODE_KP_ENTER)) {
++        (void)HandleKeyLocked(*key);
++      }
+       return Result(text_result.dispatched
+                         ? RobloxInputDispatchState::kDispatched
+                         : RobloxInputDispatchState::kStateUpdated,
+diff --git a/tests/roblox_input_router_test.cc b/tests/roblox_input_router_test.cc
+index 8e33684..c736080 100644
+--- a/tests/roblox_input_router_test.cc
++++ b/tests/roblox_input_router_test.cc
+@@ -546,6 +546,28 @@ TEST_F(RobloxInputRouterTest, ReportsHostTextFocusCompletion) {
+   EXPECT_EQ(router_.Snapshot().text_focus_generation, 4U);
+ }
+ 
++TEST_F(RobloxInputRouterTest, SubmittingEnterAlsoReachesTheGame) {
++  ASSERT_TRUE(router_.BeginTextFocusSession({42, 1, "hi", false, false}).ok());
++  ASSERT_TRUE(router_.HandleEvent(Event(platform::KeyEvent{
++      true, false, SDL_SCANCODE_RETURN, SDLK_RETURN, 0})).status.ok());
++  ASSERT_TRUE(router_.HandleEvent(Event(platform::KeyEvent{
++      false, false, SDL_SCANCODE_RETURN, SDLK_RETURN, 0})).status.ok());
++  ASSERT_EQ(probe_.keys.size(), 2U);
++  EXPECT_TRUE(probe_.keys[0].pressed);
++  EXPECT_FALSE(probe_.keys[1].pressed);
++  EXPECT_EQ(probe_.keys[0].key_code, 66);
++  EXPECT_EQ(router_.Snapshot().active_keys, 0U);
++
++  // A multiline box keeps focus: Enter is a newline and stays in the editor.
++  probe_.keys.clear();
++  ASSERT_TRUE(router_.BeginTextFocusSession({43, 2, "", false, true}).ok());
++  ASSERT_TRUE(router_.HandleEvent(Event(platform::KeyEvent{
++      true, false, SDL_SCANCODE_RETURN, SDLK_RETURN, 0})).status.ok());
++  ASSERT_TRUE(router_.HandleEvent(Event(platform::KeyEvent{
++      false, false, SDL_SCANCODE_RETURN, SDLK_RETURN, 0})).status.ok());
++  EXPECT_TRUE(probe_.keys.empty());
++}
++
+ TEST_F(RobloxInputRouterTest, MouseClicksKeepTextFocusUntilEngineReleasesIt) {
+   RobloxTextFocusSession session{42, 1, "draft", false, false};
+   session.area_x = 40;

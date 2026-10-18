@@ -33,7 +33,8 @@ cd aeram
 ./install.sh
 ```
 
-The installer builds Mocktail with AERAM's patches (hardware cursor, 1 ms input, no 240 FPS cap, lower CPU use)
+The installer builds Mocktail with AERAM's patches (hardware cursor, 1 ms input, no 240 FPS cap, lower CPU use,
+one Enter to send chat)
 and adds AERAM to your app launcher. Run it again to update.
 
 Already have Mocktail from the AUR (`mocktail-bin`) or a `.deb`/`.rpm`? Use `./install.sh --no-mocktail`.
