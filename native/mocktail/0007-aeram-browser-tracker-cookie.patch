@@ -1,0 +1,168 @@
+diff --git a/src/jnivm/jnivm.cc b/src/jnivm/jnivm.cc
+index eee4d33..520a495 100644
+--- a/src/jnivm/jnivm.cc
++++ b/src/jnivm/jnivm.cc
+@@ -112,6 +112,8 @@ std::unordered_map<std::string, std::string> g_local_storage_values;
+ std::unordered_set<jlong> g_local_storage_users;
+ jlong g_local_storage_current_user = kLocalStorageUninitializedUser;
+ bool g_cookie_store_loaded = false;
++std::string g_browser_tracker_cookie;
++bool g_browser_tracker_loaded = false;
+ std::string g_cookie_header;
+ 
+ bool EnvironmentTraceEnabled(const char* name) {
+@@ -653,6 +655,8 @@ void ClearLegacyCookieStore() {
+   std::lock_guard<std::recursive_mutex> lock(g_jni_state_mutex);
+   ClearCookieString(&g_cookie_header);
+   g_cookie_store_loaded = false;
++  g_browser_tracker_cookie.clear();
++  g_browser_tracker_loaded = false;
+ }
+ 
+ std::string MocktailConfigRoot() {
+@@ -719,6 +723,52 @@ std::string CookieHeaderForJava() {
+   return g_cookie_header;
+ }
+ 
++// The Android CookieManager also holds RBXEventTrackerV2, the device identity
++// Mocktail's BrowserTracker bootstrap obtains. Roblox rejects some requests
++// (blocking a player, for one) from sessions without it, so the cookie getters
++// hand it to the engine next to the session cookie.
++std::string BrowserTrackerCookieForJava() {
++  std::lock_guard<std::recursive_mutex> lock(g_jni_state_mutex);
++  if (!g_browser_tracker_loaded) {
++    g_browser_tracker_loaded = true;
++    std::string text;
++    const char* env_cookie = std::getenv("MOCKTAIL_ROBLOX_COOKIES");
++    const char* cookie_file = std::getenv("MOCKTAIL_COOKIE_FILE");
++    if (env_cookie && env_cookie[0] != '\0') {
++      text = env_cookie;
++    } else if (cookie_file && cookie_file[0] != '\0') {
++      text = ReadTextFile(cookie_file);
++    } else {
++      text = ReadTextFile(MocktailConfigRoot() + "/cookie");
++    }
++    constexpr const char* kTrackerPrefix = "RBXEventTrackerV2=";
++    const std::size_t pos = text.find(kTrackerPrefix);
++    if (pos != std::string::npos &&
++        (pos == 0 || text[pos - 1] == ';' ||
++         std::isspace(static_cast<unsigned char>(text[pos - 1])))) {
++      std::string value = CookieValueAfterEquals(text, pos);
++      const bool printable = std::all_of(
++          value.begin(), value.end(), [](unsigned char ch) {
++            return ch >= 0x20 && ch < 0x7f && ch != ';' && ch != ',';
++          });
++      if (printable && value.find("browserid=") != std::string::npos) {
++        g_browser_tracker_cookie = std::move(value);
++      }
++    }
++    ClearCookieString(&text);
++  }
++  return g_browser_tracker_cookie;
++}
++
++std::string CookieHeaderWithTrackerForJava() {
++  std::string header = CookieHeaderForJava();
++  const std::string tracker = BrowserTrackerCookieForJava();
++  if (!header.empty() && !tracker.empty()) {
++    header.append("; RBXEventTrackerV2=").append(tracker);
++  }
++  return header;
++}
++
+ std::string CookieNetscapeForJava(const std::string& domain_or_url) {
+   std::string header = CookieHeaderForJava();
+   std::string value = CookieValueFromHeader(header);
+@@ -744,6 +794,11 @@ std::string CookieNetscapeForJava(const std::string& domain_or_url) {
+   std::string result =
+       domain + "\tTRUE\t/\tTRUE\t2147483647\t.ROBLOSECURITY\t" + value;
+   ClearCookieString(&value);
++  const std::string tracker = BrowserTrackerCookieForJava();
++  if (!tracker.empty()) {
++    result += "\n" + domain +
++              "\tTRUE\t/\tFALSE\t2147483647\tRBXEventTrackerV2\t" + tracker;
++  }
+   return result;
+ }
+ 
+@@ -795,7 +850,7 @@ bool CookieObjectResultForMethodV(const char* name, va_list args,
+   if (std::strcmp(name, "getCookie") == 0 ||
+       std::strcmp(name, "nativeGetCookiesForDomain") == 0) {
+     (void)va_arg(args, jstring);
+-    *result = MakeCookieStringForJava(CookieHeaderForJava());
++    *result = MakeCookieStringForJava(CookieHeaderWithTrackerForJava());
+     return true;
+   }
+   if (std::strcmp(name, "nativeGetCookiesInNetscapeFormat") == 0) {
+@@ -814,7 +869,7 @@ bool CookieObjectResultForMethodA(const char* name, const jvalue* args,
+   }
+   if (std::strcmp(name, "getCookie") == 0 ||
+       std::strcmp(name, "nativeGetCookiesForDomain") == 0) {
+-    *result = MakeCookieStringForJava(CookieHeaderForJava());
++    *result = MakeCookieStringForJava(CookieHeaderWithTrackerForJava());
+     return true;
+   }
+   if (std::strcmp(name, "nativeGetCookiesInNetscapeFormat") == 0) {
+diff --git a/tests/jnivm_test.cc b/tests/jnivm_test.cc
+index 183676f..2f399fc 100644
+--- a/tests/jnivm_test.cc
++++ b/tests/jnivm_test.cc
+@@ -855,6 +855,58 @@ TEST_F(JniVmTest, NativeSettingsCookieNetscapeFormatUsesConfiguredCookie) {
+   env->ReleaseStringUTFChars(result, chars);
+ }
+ 
++TEST_F(JniVmTest, CookieGettersIncludeBrowserTrackerIdentity) {
++  // Installing a provider drops the process-wide cookie cache.
++  const std::string reset;
++  vm_->SetRobloxCredentialProvider(&reset, &TestCredentialProvider);
++  vm_->ClearRobloxCredentialProvider();
++  setenv("MOCKTAIL_ROBLOX_COOKIES",
++         ".ROBLOSECURITY=test-cookie-value\n"
++         "RBXEventTrackerV2=CreateDate=10/18/2026 5:26:22 PM&rbxid=&browserid=707",
++         1);
++  JNIEnv *env = vm_->GetJNIEnv();
++  jclass manager =
++      env->FindClass("com/roblox/universalapp/cookie/JNICookieManager");
++  jmethodID get_cookie = env->GetStaticMethodID(
++      manager, "getCookie", "(Ljava/lang/String;)Ljava/lang/String;");
++  ASSERT_NE(get_cookie, nullptr);
++  auto header = static_cast<jstring>(env->CallStaticObjectMethod(
++      manager, get_cookie, env->NewStringUTF("roblox.com")));
++  EXPECT_EQ(ReadJavaString(env, header),
++            ".ROBLOSECURITY=test-cookie-value; RBXEventTrackerV2="
++            "CreateDate=10/18/2026 5:26:22 PM&rbxid=&browserid=707");
++
++  jclass settings =
++      env->FindClass("com/roblox/engine/jni/NativeSettingsInterface");
++  jmethodID netscape =
++      env->GetStaticMethodID(settings, "nativeGetCookiesInNetscapeFormat",
++                             "(Ljava/lang/String;)Ljava/lang/String;");
++  ASSERT_NE(netscape, nullptr);
++  auto jar = static_cast<jstring>(env->CallStaticObjectMethod(
++      settings, netscape, env->NewStringUTF("https://apis.roblox.com/")));
++  EXPECT_EQ(ReadJavaString(env, jar),
++            ".apis.roblox.com\tTRUE\t/\tTRUE\t2147483647\t.ROBLOSECURITY\t"
++            "test-cookie-value\n"
++            ".apis.roblox.com\tTRUE\t/\tFALSE\t2147483647\tRBXEventTrackerV2\t"
++            "CreateDate=10/18/2026 5:26:22 PM&rbxid=&browserid=707");
++}
++
++TEST_F(JniVmTest, GuestCookieGetterCarriesNoBrowserTracker) {
++  // Installing a provider drops the process-wide cookie cache.
++  const std::string reset;
++  vm_->SetRobloxCredentialProvider(&reset, &TestCredentialProvider);
++  vm_->ClearRobloxCredentialProvider();
++  setenv("MOCKTAIL_ROBLOX_COOKIES", "RBXEventTrackerV2=browserid=707", 1);
++  JNIEnv *env = vm_->GetJNIEnv();
++  jclass manager =
++      env->FindClass("com/roblox/universalapp/cookie/JNICookieManager");
++  jmethodID get_cookie = env->GetStaticMethodID(
++      manager, "getCookie", "(Ljava/lang/String;)Ljava/lang/String;");
++  auto header = static_cast<jstring>(env->CallStaticObjectMethod(
++      manager, get_cookie, env->NewStringUTF("roblox.com")));
++  EXPECT_TRUE(ReadJavaString(env, header).empty());
++}
++
+ TEST_F(JniVmTest, TypedCredentialProviderOverridesFallbackAndJavaSetter) {
+   setenv("MOCKTAIL_ROBLOX_COOKIES", ".ROBLOSECURITY=_|untrusted-fallback-b", 1);
+   std::string credential = ".ROBLOSECURITY=_|typed-credential-a";
