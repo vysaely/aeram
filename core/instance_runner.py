@@ -934,7 +934,6 @@ class InstanceRunner:
         Maintains process continuity, forcing alts into virtual memory
         and notifying the user rather than terminating or aborting.
         """
-        import random
         launched = []
         for i, acc in enumerate(accounts):
             can_launch, reason = self.auth_state_manager.can_launch(acc.account_id)
@@ -973,9 +972,7 @@ class InstanceRunner:
 
 
             if i > 0 and stagger_delay > 0:
-                # Add natural jitter (+0.2s - 1.2s) when delay is > 3s to break metronomic robotic timing
-                jitter = random.uniform(0.2, 1.2) if stagger_delay >= 3.0 else 0.0
-                time.sleep(stagger_delay + jitter)
+                time.sleep(stagger_delay)
             try:
                 inst = self.launch_instance(
                     account=acc,

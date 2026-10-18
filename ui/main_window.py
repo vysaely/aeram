@@ -2550,10 +2550,9 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _auto_login_account(self, account: Optional[RobloxAccount] = None):
         """
-        Performs automated end-to-end login for the target account.
-        Tries direct API login with 2FA first. If Roblox requests a visual captcha,
-        seamlessly launches WebLoginDialog in auto-login mode with credentials and
-        TOTP automated injection active.
+        Logs the account in through the login window, filled in with its saved
+        username, password and 2FA code. (Posting credentials straight to the
+        auth API from a script looks like an account-checker bot.)
         """
         acc = account or self.current_account
         if not acc:
@@ -2576,43 +2575,7 @@ class MainWindow(QtWidgets.QMainWindow):
             acc.password = pwd.strip()
             self.storage.save_account(acc)
 
-        self.statusBar().showMessage(f"Auto logging in @{acc.username} (API)...", 4000)
-        username, password, totp_secret = acc.username, acc.password, acc.totp_secret
-
-        def _login():
-            return self.api.login_with_credentials(username, password, totp_secret)
-
-        def _done(result):
-            if isinstance(result, Exception):
-                result = (False, None, None, str(result))
-            self._auto_login_finished(acc, *result)
-
-        self._run_in_background(_login, _done)
-
-    def _auto_login_finished(self, acc: RobloxAccount, ok: bool, cookie: Optional[str],
-                             user_data: Optional[Dict[str, Any]], msg: str):
-        msg = msg or ""
-        if ok and cookie:
-            acc.cookie = cookie
-            if user_data:
-                acc.user_id = user_data.get("id", acc.user_id)
-                acc.display_name = user_data.get("displayName", acc.display_name)
-            self.storage.save_account(acc)
-            if hasattr(self.runner, "auth_state_manager"):
-                self.runner.auth_state_manager.mark_ready(acc.account_id)
-            self._load_accounts()
-            self.statusBar().showMessage(f"Auto Log In successful for @{acc.username}! Session updated.", 6000)
-            return
-
-        # If API login required captcha or encountered a browser challenge, seamlessly launch in-browser auto login
-        is_challenge = (
-            msg == "CAPTCHA_REQUIRED"
-            or "challenge" in msg.lower()
-            or "captcha" in msg.lower()
-            or "verification" in msg.lower()
-        )
-        reason = "Roblox requires visual verification (Captcha)" if is_challenge else msg
-        self.statusBar().showMessage(f"Launching in-browser auto login ({reason})...", 5000)
+        self.statusBar().showMessage(f"Opening login window for @{acc.username}...", 4000)
         self._open_web_login(target_account=acc, auto_login=True)
 
     def _open_browser_verification(self, *args, force_engine: Optional[str] = None):

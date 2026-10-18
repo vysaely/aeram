@@ -258,7 +258,6 @@ ROBLOX_2FA_DOM_FIX_JS = """
                 var btn = buttons[i];
                 var txt = (btn.innerText || btn.textContent || btn.value || '').trim().toLowerCase();
                 if (txt.indexOf('create new password') !== -1 || txt.indexOf('create a new password') !== -1 || txt.indexOf('new password') !== -1) {
-                    btn.removeAttribute('disabled');
                     btn.style.pointerEvents = 'auto';
                     btn.style.zIndex = '2147483647';
                     btn.style.opacity = '1';
@@ -487,21 +486,6 @@ class WebLoginDialog(BorderlessDialog):
             self.btn_auto_login.clicked.connect(self._perform_auto_login)
             top_bar_layout.addWidget(self.btn_auto_login)
 
-        # Rich Environment Indicator Badge
-        self.badge_rich = QtWidgets.QLabel("RICH ENVIRONMENT")
-        self.badge_rich.setToolTip(
-            "Hardware-accelerated environment hardening active:\n"
-            "- WebGL native GPU (AMD Radeon RADV Mesa OpenGL 4.6)\n"
-            "- Chrome 133 runtime, csi, and app polyfills\n"
-            "- Standard Linux Chromium PluginArray populated\n"
-            "- Automation indicators (navigator.webdriver) suppressed\n"
-            "- Coherent platform (Linux x86_64) & 8-core / 8GB memory biometrics"
-        )
-        self.badge_rich.setStyleSheet(
-            "color: #cccccc; font-size: 10px; font-weight: bold; font-family: monospace; "
-            "background-color: #0d0d0d; border: 1px solid #2a2a2a; padding: 4px 8px; border-radius: 0px;"
-        )
-        top_bar_layout.addWidget(self.badge_rich)
 
         # Keyboard shortcuts for quick 2FA code dialog
         self._shortcut_f2 = QtGui.QShortcut(QtGui.QKeySequence("F2"), self)
@@ -821,7 +805,10 @@ class WebLoginDialog(BorderlessDialog):
 
         # Trigger auto-login if requested or account credentials are present
         if getattr(self, "auto_login", False) and self.target_account and self.target_account.username and self.target_account.password:
-            if hasattr(self, "view") and is_roblox_login_url(self.view.url()):
+            # Once per window: if the login page comes back (failed attempt,
+            # challenge reload), retrying by itself would hammer the login.
+            if hasattr(self, "view") and is_roblox_login_url(self.view.url()) and not getattr(self, "_auto_login_attempted", False):
+                self._auto_login_attempted = True
                 QTimer.singleShot(700, self._perform_auto_login)
 
     def _perform_auto_login(self):
@@ -885,8 +872,8 @@ class WebLoginDialog(BorderlessDialog):
                     var loginBtn = document.getElementById('login-button') || 
                                    document.querySelector('button[type="submit"]') || 
                                    document.querySelector('.login-button');
-                    if (loginBtn) {{
-                        loginBtn.removeAttribute('disabled');
+                    // Only an enabled button: Roblox keeps it disabled until it accepts the input.
+                    if (loginBtn && !loginBtn.disabled) {{
                         loginBtn.click();
                     }}
                 }}, 350);
@@ -1115,7 +1102,9 @@ class WebLoginDialog(BorderlessDialog):
                 return { status: "none" };
             }
 
-            // 6. Find and click Verify button with full synthetic mouse/pointer event chain
+            // 6. Press Verify once per code, like a person would: one ordinary
+            //    click on an enabled button. No forced enabling, no synthetic
+            //    pointer/keyboard bursts, no repeated presses.
             function findVerifyButtons() {
                 var root = inp.closest('[role="dialog"], .modal-dialog, .modal-content, [class*="modal" i]') || modal || document;
                 var btns = root.querySelectorAll('button, input[type="submit"], [role="button"], a');
@@ -1140,41 +1129,17 @@ class WebLoginDialog(BorderlessDialog):
                 return results;
             }
 
-            function triggerVerifyClick(btn) {
-                if (!btn) return;
-                try {
-                    btn.removeAttribute('disabled');
-                    btn.disabled = false;
-                    btn.focus();
-                    var opts = { bubbles: true, cancelable: true, view: window, buttons: 1 };
-                    try { btn.dispatchEvent(new PointerEvent('pointerdown', opts)); } catch(e) {}
-                    try { btn.dispatchEvent(new MouseEvent('mousedown', opts)); } catch(e) {}
-                    try { btn.dispatchEvent(new PointerEvent('pointerup', opts)); } catch(e) {}
-                    try { btn.dispatchEvent(new MouseEvent('mouseup', opts)); } catch(e) {}
-                    try { btn.dispatchEvent(new MouseEvent('click', opts)); } catch(e) {}
-                    btn.click();
-                } catch(e) {}
-            }
-
             function submit2FA() {
-                // Dispatch Enter on input
-                try {
-                    inp.focus();
-                    var kOpts = { bubbles: true, cancelable: true, key: 'Enter', code: 'Enter', keyCode: 13, which: 13, view: window };
-                    inp.dispatchEvent(new KeyboardEvent('keydown', kOpts));
-                    inp.dispatchEvent(new KeyboardEvent('keypress', kOpts));
-                    inp.dispatchEvent(new KeyboardEvent('keyup', kOpts));
-                    if (inp.form) inp.form.requestSubmit();
-                } catch(e) {}
-
-                // Trigger Verify button clicks
+                if (window._aeram_2fa_submitted === code) return false;
                 var buttons = findVerifyButtons();
-                var clickedAny = false;
                 for (var i = 0; i < buttons.length; i++) {
-                    triggerVerifyClick(buttons[i]);
-                    clickedAny = true;
+                    if (!buttons[i].disabled) {
+                        window._aeram_2fa_submitted = code;
+                        buttons[i].click();
+                        return true;
+                    }
                 }
-                return clickedAny;
+                return false;
             }
 
             // 7. Inject code if not filled
@@ -1203,14 +1168,13 @@ class WebLoginDialog(BorderlessDialog):
                     }
                 } catch(e) {}
 
-                // Trigger submission after brief delays
-                setTimeout(submit2FA, 100);
+                // Give the page a moment to enable Verify for the new value.
                 setTimeout(submit2FA, 300);
 
                 return { status: "injected" };
             }
 
-            // Code is already filled: continue submitting until page advances or errors
+            // Code already filled: press Verify if that hasn't happened for this code yet.
             var clicked = submit2FA();
             return { status: "already_injected", clicked: clicked };
         })(__CODE_JSON__);
@@ -1302,7 +1266,6 @@ class WebLoginDialog(BorderlessDialog):
                             }}
                             inp.dispatchEvent(new Event('input', {{ bubbles: true }}));
                             inp.dispatchEvent(new Event('change', {{ bubbles: true }}));
-                            inp.dispatchEvent(new KeyboardEvent('keyup', {{ bubbles: true, key: 'Enter', keyCode: 13 }}));
 
                             setTimeout(function() {{
                                 var container = inp.closest('form, [role="dialog"], .modal-content, .two-step-verification, [class*="verification" i]') || inp.parentElement || doc;
@@ -1316,8 +1279,7 @@ class WebLoginDialog(BorderlessDialog):
                                         txt.indexOf('another') !== -1 || txt.indexOf('help') !== -1) {{
                                         continue;
                                     }}
-                                    if (txt === 'verify' || txt === 'submit' || txt === 'continue' || txt === 'ok') {{
-                                        btn.removeAttribute('disabled');
+                                    if ((txt === 'verify' || txt === 'submit' || txt === 'continue' || txt === 'ok') && !btn.disabled) {{
                                         btn.click();
                                         break;
                                     }}

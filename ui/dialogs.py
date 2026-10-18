@@ -9,7 +9,6 @@ import json
 import secrets
 import string
 import threading
-import random
 from typing import Optional, List, Dict, Any
 from PyQt6 import QtWidgets, QtCore, QtGui
 
@@ -4911,8 +4910,6 @@ class BatchAutoLoginWorker(QtCore.QThread):
         storage: StorageManager,
         runner=None,
         pacing_delay: float = 3.5,
-        use_jitter: bool = True,
-        auto_browser_captcha: bool = True,
         parent=None,
     ):
         super().__init__(parent)
@@ -4921,17 +4918,17 @@ class BatchAutoLoginWorker(QtCore.QThread):
         self.storage = storage
         self.runner = runner
         self.pacing_delay = max(0.5, float(pacing_delay))
-        self.use_jitter = use_jitter
-        self.auto_browser_captcha = auto_browser_captcha
         self.stopped = False
         self._browser_event = threading.Event()
         self._skip_current_account = False
+        self._browser_signed_in = False
 
     def stop(self):
         self.stopped = True
         self._browser_event.set()
 
-    def notify_browser_finished(self):
+    def notify_browser_finished(self, signed_in: bool = False):
+        self._browser_signed_in = self._browser_signed_in or signed_in
         self._browser_event.set()
 
     def skip_current_account(self):
@@ -4939,24 +4936,23 @@ class BatchAutoLoginWorker(QtCore.QThread):
         self._browser_event.set()
 
     def run(self):
+        # Every login goes through the login window (Roblox's own page, filled in
+        # with the saved details). Sending credentials straight to the auth API
+        # from a script is what account-checker bots do.
         total = len(self.accounts)
         success_cnt = 0
         fail_cnt = 0
-        captcha_cnt = 0
 
         for idx, acc in enumerate(self.accounts):
             if self.stopped:
                 break
 
-            # Pacing cooldown between sequential accounts to prevent Arkose burst detection
+            # A steady pause between logins keeps them from arriving in a burst.
             if idx > 0 and not self.stopped:
-                jitter = random.uniform(0.5, 2.5) if self.use_jitter else 0.0
-                delay = self.pacing_delay + jitter
                 self.account_status_update.emit(
-                    acc, f"Pacing cooldown ({delay:.1f}s) to avoid Arkose detection...", "#888888"
+                    acc, f"Waiting {self.pacing_delay:.1f}s between logins...", "#888888"
                 )
-                slices = int(delay * 10)
-                for _ in range(slices):
+                for _ in range(int(self.pacing_delay * 10)):
                     if self.stopped:
                         break
                     time.sleep(0.1)
@@ -4966,105 +4962,37 @@ class BatchAutoLoginWorker(QtCore.QThread):
 
             self.account_started.emit(idx + 1, total, acc)
 
-            # Check required credentials
             if not acc.username or not acc.password:
                 fail_cnt += 1
                 self.account_finished.emit(acc, False, "Missing password in vault")
                 continue
 
-            self.account_status_update.emit(acc, "Authenticating with credentials & 2FA...", "#CCCCCC")
+            self.account_status_update.emit(acc, "Logging in through the login window...", "#CCCCCC")
+            self._browser_event.clear()
+            self._skip_current_account = False
+            self._browser_signed_in = False
+            self.request_browser_login.emit(acc, "Log in")
 
-            # Perform direct API login
-            ok, cookie, user_data, msg = self.api.login_with_credentials(
-                acc.username, acc.password, acc.totp_secret
-            )
+            while not self._browser_event.is_set() and not self.stopped:
+                time.sleep(0.2)
 
-            # Rate limit backoff (HTTP 429)
-            if "RATE_LIMITED" in msg or "429" in msg or "too many requests" in msg.lower():
-                retry_sec = 20
-                if "RATE_LIMITED:" in msg:
-                    try:
-                        retry_sec = int(msg.split(":")[1])
-                    except Exception:
-                        pass
-                self.account_status_update.emit(
-                    acc, f"Rate limited (HTTP 429). Cooling down {retry_sec}s for Arkose...", "#A8A8A8"
-                )
-                for _ in range(retry_sec * 10):
-                    if self.stopped:
-                        break
-                    time.sleep(0.1)
-
-                if not self.stopped:
-                    self.account_status_update.emit(acc, "Retrying authentication...", "#CCCCCC")
-                    ok, cookie, user_data, msg = self.api.login_with_credentials(
-                        acc.username, acc.password, acc.totp_secret
-                    )
-
-            # Roblox security challenge / Arkose challenge
-            is_challenge = (
-                not ok
-                and (
-                    msg == "CAPTCHA_REQUIRED"
-                    or "captcha" in msg.lower()
-                    or "challenge" in msg.lower()
-                    or "verification" in msg.lower()
-                )
-            )
-            if is_challenge:
-                if self.auto_browser_captcha and not self.stopped:
-                    self.account_status_update.emit(
-                        acc, "Security challenge required. Verifying in browser...", "#A8A8A8"
-                    )
-                    self._browser_event.clear()
-                    self._skip_current_account = False
-                    self.request_browser_login.emit(acc, "Security challenge / browser verification required")
-
-                    while not self._browser_event.is_set() and not self.stopped:
-                        time.sleep(0.2)
-
-                    if self._skip_current_account:
-                        fail_cnt += 1
-                        self.account_finished.emit(acc, False, "Skipped by user")
-                        continue
-
-                    refreshed = self.storage.get_account(acc.account_id)
-                    if refreshed and refreshed.cookie:
-                        acc.cookie = refreshed.cookie
-                        success_cnt += 1
-                        captcha_cnt += 1
-                        self.account_finished.emit(acc, True, "Success (Web verified)")
-                        continue
-                    else:
-                        fail_cnt += 1
-                        self.account_finished.emit(acc, False, "Verification required (Click 'Verify Selected in Browser')")
-                        continue
-                else:
-                    fail_cnt += 1
-                    self.account_finished.emit(acc, False, "Verification required (Click 'Verify Selected in Browser')")
-                    continue
-
-            if ok and cookie:
-                acc.cookie = cookie
-                if user_data:
-                    acc.user_id = user_data.get("id", acc.user_id)
-                    acc.display_name = user_data.get("displayName", acc.display_name)
-                self.storage.save_account(acc)
-                if self.runner and hasattr(self.runner, "auth_state_manager"):
-                    self.runner.auth_state_manager.mark_ready(acc.account_id)
+            if self._skip_current_account:
+                fail_cnt += 1
+                self.account_finished.emit(acc, False, "Skipped by user")
+            elif self._browser_signed_in:
                 success_cnt += 1
                 self.account_finished.emit(acc, True, "Success")
             else:
                 fail_cnt += 1
-                self.account_finished.emit(acc, False, msg or "Failed")
+                self.account_finished.emit(acc, False, "Login window closed before signing in")
 
-        self.batch_complete.emit(success_cnt, fail_cnt, captcha_cnt)
+        self.batch_complete.emit(success_cnt, fail_cnt, success_cnt)
 
 
 class BatchAutoLoginDialog(BorderlessDialog):
     """
-    Dedicated dialog for sequential automated authentication across multiple accounts
-    with Arkose anti-bot pacing, randomized jitter, and 429 rate-limit backoff.
+    Logs several accounts in one after another through the login window, with a
+    fixed pause between logins.
     """
     def __init__(
         self,
@@ -5096,8 +5024,8 @@ class BatchAutoLoginDialog(BorderlessDialog):
         layout.addWidget(hdr)
 
         desc = QtWidgets.QLabel(
-            "Sequential automated login pipeline. Authenticates credentials and solves 2FA challenges\n"
-            "with anti-bot pacing jitter and automatic HTTP 429 rate-limit backoff to avoid Arkose penalties."
+            "Opens the login window for each account in turn, filled in with its saved username,\n"
+            "password and 2FA code. Solve any verification puzzle in the window; a fixed pause separates logins."
         )
         desc.setStyleSheet("color: #888888; font-size: 10px; font-family: monospace;")
         desc.setWordWrap(True)
@@ -5125,17 +5053,8 @@ class BatchAutoLoginDialog(BorderlessDialog):
         row1.addWidget(self.delay_spin)
         row1.addSpacing(16)
 
-        self.cb_jitter = QtWidgets.QCheckBox("Anti-Arkose Jitter (+0.5s - 2.5s randomized intervals)")
-        self.cb_jitter.setChecked(True)
-        self.cb_jitter.setStyleSheet("color: #CCCCCC; font-size: 11px; font-family: monospace;")
-        row1.addWidget(self.cb_jitter)
         row1.addStretch()
         opts_layout.addLayout(row1)
-
-        self.cb_auto_browser = QtWidgets.QCheckBox("Launch browser automatically if verification / Captcha is required")
-        self.cb_auto_browser.setChecked(True)
-        self.cb_auto_browser.setStyleSheet("color: #CCCCCC; font-size: 11px; font-family: monospace;")
-        opts_layout.addWidget(self.cb_auto_browser)
 
         layout.addWidget(opts_box)
 
@@ -5284,8 +5203,6 @@ class BatchAutoLoginDialog(BorderlessDialog):
     def _start_batch(self):
         self.btn_start.setEnabled(False)
         self.delay_spin.setEnabled(False)
-        self.cb_jitter.setEnabled(False)
-        self.cb_auto_browser.setEnabled(False)
         self.btn_close.setText("Stop")
         self.btn_skip.setEnabled(False)
         self.status_lbl.setText("Starting sequential auto login...")
@@ -5296,8 +5213,6 @@ class BatchAutoLoginDialog(BorderlessDialog):
             storage=self.storage,
             runner=self.runner,
             pacing_delay=self.delay_spin.value(),
-            use_jitter=self.cb_jitter.isChecked(),
-            auto_browser_captcha=self.cb_auto_browser.isChecked(),
             parent=self,
         )
         self.worker.account_started.connect(self._on_account_started)
@@ -5346,14 +5261,14 @@ class BatchAutoLoginDialog(BorderlessDialog):
         )
         self._current_browser_dlg = browser_dlg
 
-        def _on_browser_closed():
+        def _on_browser_closed(signed_in: bool):
             self._current_browser_dlg = None
             self.btn_skip.setEnabled(False)
             if self.worker:
-                self.worker.notify_browser_finished()
+                self.worker.notify_browser_finished(signed_in)
 
-        browser_dlg.account_authenticated.connect(lambda saved_acc: _on_browser_closed())
-        browser_dlg.finished.connect(lambda result: _on_browser_closed())
+        browser_dlg.account_authenticated.connect(lambda saved_acc: _on_browser_closed(True))
+        browser_dlg.finished.connect(lambda result: _on_browser_closed(False))
         browser_dlg.show()
         browser_dlg.raise_()
         browser_dlg.activateWindow()
@@ -5405,21 +5320,12 @@ class BatchAutoLoginDialog(BorderlessDialog):
         self.progress_bar.setValue(len(self.accounts))
         self.btn_start.setEnabled(True)
         self.delay_spin.setEnabled(True)
-        self.cb_jitter.setEnabled(True)
-        self.cb_auto_browser.setEnabled(True)
         self.btn_skip.setEnabled(False)
         self.btn_close.setText("Close")
 
-        direct_cnt = max(0, success_cnt - web_verified_cnt)
-        self.status_lbl.setText(
-            f"Batch complete: {success_cnt} succeeded ({direct_cnt} direct API, {web_verified_cnt} web verified), {fail_cnt} failed."
-        )
+        self.status_lbl.setText(f"Batch complete: {success_cnt} succeeded, {fail_cnt} failed.")
 
-        breakdown = [f"• Succeeded: {success_cnt}"]
-        if web_verified_cnt > 0:
-            breakdown.append(f"  - Direct API logins: {direct_cnt}")
-            breakdown.append(f"  - Web browser verifications: {web_verified_cnt}")
-        breakdown.append(f"• Failed: {fail_cnt}")
+        breakdown = [f"• Succeeded: {success_cnt}", f"• Failed: {fail_cnt}"]
 
         msg_body = (
             f"Completed sequential auto log in across {len(self.accounts)} accounts:\n\n"

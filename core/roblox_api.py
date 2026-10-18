@@ -18,7 +18,11 @@ from typing import Optional, Dict, Any, Tuple, List, Callable
 log = logging.getLogger("RobloxAPI")
 
 
-USER_AGENT = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36"
+# Requests come from Python, not a browser: say so instead of claiming to be
+# Chrome, and don't forge browser-only headers (sec-ch-ua, sec-fetch-*) or the
+# roblox.com Origin/Referer. A browser identity that the connection itself
+# contradicts is a classic bot signal.
+USER_AGENT = "AERAM/1.0 (Roblox account manager for Linux; +https://github.com/vysaely/aeram)"
 
 
 class RobloxAPI:
@@ -213,8 +217,6 @@ class RobloxAPI:
         url = "https://auth.roblox.com/v1/authentication-ticket"
         headers = {
             "User-Agent": USER_AGENT,
-            "Referer": "https://www.roblox.com/",
-            "Origin": "https://www.roblox.com/",
             "Cookie": f".ROBLOSECURITY={cookie}",
             "Content-Type": "application/json",
         }
@@ -248,8 +250,6 @@ class RobloxAPI:
         url = "https://auth.roblox.com/v1/logoutfromallsessionsandreauthenticate"
         headers = {
             "User-Agent": USER_AGENT,
-            "Referer": "https://www.roblox.com/my/account",
-            "Origin": "https://www.roblox.com",
             "Cookie": f".ROBLOSECURITY={cookie}",
             "Content-Type": "application/json",
         }
@@ -405,8 +405,6 @@ class RobloxAPI:
         url = "https://auth.roblox.com/v2/user/passwords/change"
         headers = {
             "User-Agent": USER_AGENT,
-            "Referer": "https://www.roblox.com/my/account",
-            "Origin": "https://www.roblox.com",
             "Cookie": f".ROBLOSECURITY={cookie}",
             "Content-Type": "application/json",
             "Accept": "application/json",
@@ -559,8 +557,6 @@ class RobloxAPI:
         """
         headers = {
             "User-Agent": USER_AGENT,
-            "Origin": "https://www.roblox.com",
-            "Referer": "https://www.roblox.com/my/account",
             "Cookie": f".ROBLOSECURITY={cookie}",
             "Content-Type": "application/json",
             "X-CSRF-TOKEN": csrf_token,
@@ -639,8 +635,6 @@ class RobloxAPI:
         url = "https://apis.roblox.com/challenge/v1/continue"
         headers = {
             "User-Agent": USER_AGENT,
-            "Origin": "https://www.roblox.com",
-            "Referer": "https://www.roblox.com/my/account",
             "Cookie": f".ROBLOSECURITY={cookie}",
             "Content-Type": "application/json",
             "X-CSRF-TOKEN": csrf_token,
@@ -694,8 +688,6 @@ class RobloxAPI:
 
         headers = {
             "User-Agent": USER_AGENT,
-            "Origin": "https://www.roblox.com",
-            "Referer": "https://www.roblox.com/my/account",
             "Cookie": f".ROBLOSECURITY={cookie}",
             "Content-Type": "application/json",
             "X-CSRF-TOKEN": csrf_token,
@@ -750,8 +742,6 @@ class RobloxAPI:
 
         headers = {
             "User-Agent": USER_AGENT,
-            "Origin": "https://www.roblox.com",
-            "Referer": "https://www.roblox.com/my/account",
             "Cookie": f".ROBLOSECURITY={cookie}",
             "Content-Type": "application/json",
             "Accept": "application/json",
@@ -914,8 +904,6 @@ class RobloxAPI:
                 "User-Agent": USER_AGENT,
                 "Accept": "application/json",
                 "Cookie": f".ROBLOSECURITY={clean_cookie}; RBXEventTrackerV2=browserid={browser_id}",
-                "Referer": "https://www.roblox.com/my/account",
-                "Origin": "https://www.roblox.com",
             }
 
             req = urllib.request.Request(url, headers=headers, method="GET")
@@ -965,8 +953,6 @@ class RobloxAPI:
             "Accept": "application/json",
             "Content-Type": "application/json",
             "Cookie": f".ROBLOSECURITY={clean_cookie}; RBXEventTrackerV2=browserid={browser_id}",
-            "Referer": "https://www.roblox.com/my/account",
-            "Origin": "https://www.roblox.com",
         }
         if csrf_token:
             headers["X-CSRF-TOKEN"] = csrf_token
@@ -1014,8 +1000,6 @@ class RobloxAPI:
             "Accept": "application/json",
             "Content-Type": "application/json",
             "Cookie": f".ROBLOSECURITY={clean_cookie}",
-            "Referer": "https://www.roblox.com",
-            "Origin": "https://www.roblox.com",
         }
         csrf_token = self.get_csrf_token(clean_cookie)
         if csrf_token:
@@ -1059,8 +1043,6 @@ class RobloxAPI:
             "Accept": "application/json",
             "Content-Type": "application/json",
             "Cookie": f".ROBLOSECURITY={clean_cookie}",
-            "Referer": "https://www.roblox.com/users/friends#!/friend-requests",
-            "Origin": "https://www.roblox.com",
         }
         csrf = self.get_csrf_token(clean_cookie)
         if csrf:
@@ -1098,7 +1080,6 @@ class RobloxAPI:
             "User-Agent": USER_AGENT,
             "Accept": "application/json",
             "Cookie": f".ROBLOSECURITY={clean_cookie}",
-            "Referer": "https://www.roblox.com",
         }
         req = urllib.request.Request(url, headers=headers, method="GET")
         try:
@@ -1128,8 +1109,6 @@ class RobloxAPI:
             "Accept": "application/json",
             "Content-Type": "application/json",
             "Cookie": f".ROBLOSECURITY={clean_cookie}",
-            "Referer": "https://www.roblox.com",
-            "Origin": "https://www.roblox.com",
         }
         if csrf_token:
             headers["X-CSRF-TOKEN"] = csrf_token
@@ -1195,8 +1174,6 @@ class RobloxAPI:
             "Accept": "application/json",
             "Content-Type": "application/json",
             "Cookie": f".ROBLOSECURITY={clean_cookie}",
-            "Referer": "https://www.roblox.com",
-            "Origin": "https://www.roblox.com",
         }
         if csrf_token:
             headers["X-CSRF-TOKEN"] = csrf_token
@@ -1247,15 +1224,13 @@ class RobloxAPI:
 
         csrf = self.get_csrf_token(clean_cookie)
 
-        def _do_post(url: str, data: bytes, content_type: str, referer: str) -> Tuple[bool, str]:
+        def _do_post(url: str, data: bytes, content_type: str) -> Tuple[bool, str]:
             nonlocal csrf
             headers = {
                 "User-Agent": USER_AGENT,
                 "Accept": "application/json",
                 "Content-Type": content_type,
                 "Cookie": f".ROBLOSECURITY={clean_cookie}",
-                "Referer": referer,
-                "Origin": "https://www.roblox.com",
             }
             if csrf:
                 headers["X-CSRF-TOKEN"] = csrf
@@ -1289,7 +1264,6 @@ class RobloxAPI:
             "https://apis.roblox.com/user-settings-api/v1/user-settings",
             payload1,
             "application/json",
-            "https://www.roblox.com/my/account#!/privacy",
         )
         if ok:
             return True, msg
@@ -1300,7 +1274,6 @@ class RobloxAPI:
             "https://apis.roblox.com/user-settings-api/v1/user-settings",
             payload2,
             "application/json",
-            "https://www.roblox.com/my/account#!/privacy",
         )
         if ok:
             return True, msg
@@ -1310,7 +1283,6 @@ class RobloxAPI:
             "https://accountsettings.roblox.com/v1/privacy",
             payload2,
             "application/json",
-            "https://www.roblox.com/my/account#!/privacy",
         )
         if ok:
             return True, msg
@@ -1321,211 +1293,8 @@ class RobloxAPI:
             "https://www.roblox.com/account/settings/follow-me-privacy",
             form_data,
             "application/x-www-form-urlencoded",
-            "https://www.roblox.com/my/account",
         )
         if ok:
             return True, msg
 
         return False, msg
-
-    def login_with_credentials(
-        self,
-        username: str,
-        password: str,
-        totp_secret: Optional[str] = None,
-    ) -> Tuple[bool, Optional[str], Optional[Dict[str, Any]], str]:
-        """
-        Attempts direct automated login to Roblox auth servers using username,
-        password, and optional 2FA TOTP authenticator secret.
-        Returns: (success, cookie, user_data, message)
-        """
-        if not username or not password:
-            return False, None, None, "Username and password are required"
-
-        url = "https://auth.roblox.com/v2/login"
-        payload = json.dumps({"ctype": "Username", "cvalue": username, "password": password}).encode("utf-8")
-
-        headers = {
-            "User-Agent": USER_AGENT,
-            "Origin": "https://www.roblox.com",
-            "Referer": "https://www.roblox.com/login",
-            "Content-Type": "application/json",
-            "Accept": "application/json, text/plain, */*",
-            "Accept-Language": "en-US,en;q=0.9",
-            "sec-ch-ua": '"Chromium";v="133", "Not(A:Brand";v="99", "Google Chrome";v="133"',
-            "sec-ch-ua-mobile": "?0",
-            "sec-ch-ua-platform": '"Linux"',
-            "sec-fetch-dest": "empty",
-            "sec-fetch-mode": "cors",
-            "sec-fetch-site": "same-site",
-        }
-
-        # Step 1: Obtain CSRF token
-        csrf_token = ""
-        init_req = urllib.request.Request(url, data=payload, headers=headers, method="POST")
-        try:
-            with urllib.request.urlopen(init_req, timeout=self.timeout) as resp:
-                cookie = self._extract_roblosecurity_cookie(resp)
-                if cookie:
-                    user_data = self.validate_cookie_and_get_user(cookie)
-                    return True, cookie, user_data, "Successfully authenticated directly."
-        except urllib.error.HTTPError as e:
-            if e.code == 429:
-                retry_after = int(e.headers.get("Retry-After", "15"))
-                return False, None, None, f"RATE_LIMITED:{retry_after}"
-            if e.code == 403 and "x-csrf-token" in e.headers:
-                csrf_token = e.headers["x-csrf-token"]
-            else:
-                try:
-                    err_json = json.loads(e.read().decode("utf-8"))
-                    msg = err_json.get("errors", [{}])[0].get("message", "")
-                    if msg:
-                        return False, None, None, msg
-                except Exception:
-                    pass
-                return False, None, None, f"Login initial probe failed (HTTP {e.code})"
-        except Exception as ex:
-            return False, None, None, f"Network error during login: {ex}"
-
-        if not csrf_token:
-            return False, None, None, "Could not acquire CSRF token from Roblox auth server"
-
-        headers["X-CSRF-TOKEN"] = csrf_token
-
-        # Step 2: Post login with CSRF
-        req = urllib.request.Request(url, data=payload, headers=headers, method="POST")
-        try:
-            with urllib.request.urlopen(req, timeout=self.timeout) as resp:
-                cookie = self._extract_roblosecurity_cookie(resp)
-                if cookie:
-                    user_data = self.validate_cookie_and_get_user(cookie)
-                    return True, cookie, user_data, "Successfully logged in."
-                return False, None, None, "Login accepted but no session cookie received"
-        except urllib.error.HTTPError as e:
-            if e.code == 429:
-                retry_after = int(e.headers.get("Retry-After", "15"))
-                return False, None, None, f"RATE_LIMITED:{retry_after}"
-            if e.code == 403:
-                c_type = e.headers.get("rblx-challenge-type", "").lower()
-                c_id = e.headers.get("rblx-challenge-id", "")
-                c_meta_raw = e.headers.get("rblx-challenge-metadata", "")
-
-                try:
-                    decoded_ctype = base64.b64decode(c_type).decode("utf-8", errors="ignore").lower()
-                    if decoded_ctype:
-                        c_type = decoded_ctype
-                except Exception:
-                    pass
-
-                if "captcha" in c_type or "arkose" in c_type:
-                    return False, None, None, "CAPTCHA_REQUIRED"
-
-                if "twostepverification" in c_type or "step" in c_type:
-                    if not totp_secret:
-                        return False, None, None, "2FA_REQUIRED"
-
-                    # Parse challenge metadata
-                    meta: Dict[str, Any] = {}
-                    if c_meta_raw:
-                        try:
-                            meta = json.loads(base64.b64decode(c_meta_raw).decode("utf-8"))
-                        except Exception:
-                            try:
-                                meta = json.loads(c_meta_raw)
-                            except Exception:
-                                pass
-
-                    sub_id = meta.get("challengeId", "")
-                    user_id = str(meta.get("userId", ""))
-                    action_type = meta.get("actionType", "Login")
-
-                    # Generate TOTP code
-                    from core.totp import generate_totp
-                    totp_code = generate_totp(totp_secret)
-                    if not totp_code:
-                        return False, None, None, "Failed to generate TOTP code from secret key"
-
-                    # Verify 2FA
-                    v_ok, token, v_err = self._verify_two_step_code(
-                        user_id=user_id,
-                        challenge_id=sub_id,
-                        action_type=action_type,
-                        code=totp_code,
-                        cookie="",
-                        csrf_token=csrf_token,
-                    )
-                    if not v_ok or not token:
-                        return False, None, None, f"2FA verification failed: {v_err}"
-
-                    # Continue challenge
-                    self._continue_challenge(
-                        generic_id=c_id,
-                        token=token,
-                        cookie="",
-                        csrf_token=csrf_token,
-                        sub_challenge_id=sub_id,
-                        action_type=action_type,
-                    )
-
-                    # Retry login with challenge token
-                    meta_payload = dict(meta)
-                    meta_payload["verificationToken"] = token
-                    meta_payload["rememberDevice"] = False
-                    raw_b64 = base64.b64encode(json.dumps(meta_payload).encode("utf-8")).decode("utf-8")
-
-                    headers["rblx-challenge-id"] = c_id
-                    headers["rblx-challenge-type"] = "twostepverification"
-                    headers["rblx-challenge-metadata"] = raw_b64
-
-                    retry_req = urllib.request.Request(url, data=payload, headers=headers, method="POST")
-                    try:
-                        with urllib.request.urlopen(retry_req, timeout=self.timeout) as retry_resp:
-                            cookie = self._extract_roblosecurity_cookie(retry_resp)
-                            if cookie:
-                                user_data = self.validate_cookie_and_get_user(cookie)
-                                return True, cookie, user_data, "Successfully logged in via 2FA."
-                            return False, None, None, "2FA succeeded but no session cookie received"
-                    except urllib.error.HTTPError as retry_e:
-                        if retry_e.code == 429:
-                            retry_after = int(retry_e.headers.get("Retry-After", "15"))
-                            return False, None, None, f"RATE_LIMITED:{retry_after}"
-                        retry_ctype = retry_e.headers.get("rblx-challenge-type", "").lower()
-                        try:
-                            decoded_rc = base64.b64decode(retry_ctype).decode("utf-8", errors="ignore").lower()
-                            if decoded_rc:
-                                retry_ctype = decoded_rc
-                        except Exception:
-                            pass
-                        if retry_e.code == 403:
-                            if "captcha" in retry_ctype or "arkose" in retry_ctype or retry_e.headers.get("rblx-challenge-id"):
-                                return False, None, None, "CAPTCHA_REQUIRED"
-                        try:
-                            err_data = json.loads(retry_e.read().decode("utf-8"))
-                            msg = err_data.get("errors", [{}])[0].get("message", f"HTTP {retry_e.code}")
-                            if any(k in msg.lower() for k in ("challenge", "captcha", "verification")):
-                                return False, None, None, "CAPTCHA_REQUIRED"
-                            return False, None, None, msg
-                        except Exception:
-                            return False, None, None, f"2FA retry failed: HTTP {retry_e.code}"
-
-                # If challenge ID or challenge header present and not 2FA, it's a captcha/visual challenge
-                if c_id or "challenge" in c_type:
-                    return False, None, None, "CAPTCHA_REQUIRED"
-
-            # Fallback error extraction
-            try:
-                err_data = json.loads(e.read().decode("utf-8"))
-                errors = err_data.get("errors", [])
-                if errors and "message" in errors[0]:
-                    msg = errors[0]["message"]
-                    if any(k in msg.lower() for k in ("challenge", "captcha", "verification")):
-                        return False, None, None, "CAPTCHA_REQUIRED"
-                    return False, None, None, msg
-            except Exception:
-                pass
-            return False, None, None, f"HTTP {e.code}: {e.reason}"
-        except Exception as ex:
-            return False, None, None, str(ex)
-
-
-
