@@ -1,0 +1,49 @@
+diff --git a/src/runtime/roblox_input_router.cc b/src/runtime/roblox_input_router.cc
+--- a/src/runtime/roblox_input_router.cc
++++ b/src/runtime/roblox_input_router.cc
+@@ -624,13 +624,24 @@
+   }
+   const platform::SurfaceCoordinateTransform transform =
+       CoordinateTransform(snapshot_.viewport);
+-  if (!event.relative_mode) {
++  const float max_x = std::max(0.0F, transform.guest_width() - 1.0F);
++  const float max_y = std::max(0.0F, transform.guest_height() - 1.0F);
++  float wheel_x = 0.0F;
++  float wheel_y = 0.0F;
++  if (event.relative_mode) {
++    // The captured-pointer position is unclipped and drifts off-screen as the
++    // camera turns; Roblox drops wheel events outside the viewport, which
++    // broke zoom in shift lock. The locked cursor sits at the centre.
++    wheel_x = max_x * 0.5F;
++    wheel_y = max_y * 0.5F;
++  } else {
+     mouse_x_ = transform.HostLogicalToGuestX(std::max(0.0f, event.mouse_x));
+     mouse_y_ = transform.HostLogicalToGuestY(std::max(0.0f, event.mouse_y));
++    wheel_x = std::clamp(mouse_x_, 0.0f, max_x);
++    wheel_y = std::clamp(mouse_y_, 0.0f, max_y);
+   }
+   return NativeResultLocked(
+-      sink_.mouse_wheel(sink_.context, std::max(0.0f, mouse_x_),
+-                        std::max(0.0f, mouse_y_), event.delta_y),
++      sink_.mouse_wheel(sink_.context, wheel_x, wheel_y, event.delta_y),
+       RobloxInputEventKind::kMouseWheel);
+ }
+ 
+diff --git a/tests/roblox_input_router_test.cc b/tests/roblox_input_router_test.cc
+--- a/tests/roblox_input_router_test.cc
++++ b/tests/roblox_input_router_test.cc
+@@ -313,10 +313,12 @@
+   EXPECT_FLOAT_EQ(probe_.mouse_buttons.back().x, 1279.0F);
+   EXPECT_FLOAT_EQ(probe_.mouse_buttons.back().y, 0.0F);
+ 
++  // Captured wheel goes to the viewport centre (off-screen wheel is dropped
++  // by Roblox) without moving the virtual pointer.
+   ASSERT_TRUE(router_.HandleEvent(Event(platform::MouseWheelEvent{
+       0.0F, -1.0F, 640.0F, 360.0F, true})).dispatched());
+-  EXPECT_FLOAT_EQ(probe_.mouse_wheels.back().x, 1600.0F);
+-  EXPECT_FLOAT_EQ(probe_.mouse_wheels.back().y, 0.0F);
++  EXPECT_FLOAT_EQ(probe_.mouse_wheels.back().x, 639.5F);
++  EXPECT_FLOAT_EQ(probe_.mouse_wheels.back().y, 359.5F);
+   EXPECT_FLOAT_EQ(probe_.mouse_wheels.back().delta_y, -1.0F);
+ 
+   ASSERT_TRUE(router_.HandleEvent(Event(platform::MouseMotionEvent{

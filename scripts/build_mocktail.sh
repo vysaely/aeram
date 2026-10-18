@@ -18,6 +18,7 @@
 #     e.g. NVIDIA): streaming reads from GPU-mapped memory, parallel writes
 #   - Enter that sends a chat message also reaches the game, so custom chats
 #     need one press instead of two
+#   - scroll-wheel zoom works in shift lock (wheel aimed at the screen centre)
 # ==============================================================================
 
 set -euo pipefail
