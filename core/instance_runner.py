@@ -363,6 +363,13 @@ class InstanceRunner:
 
 
         profile_dir = self.storage.init_profile_sandbox(account)
+        if account.cookie and self.api and not self.storage.get_browser_tracker(account):
+            try:
+                tracker = self.api.initialize_browser_tracker()
+                if tracker:
+                    self.storage.save_browser_tracker(account, tracker)
+            except Exception as e:  # the game still runs without one
+                log.warning(f"Could not set up a device identity for '{account.username}': {e}")
         try:
             self.storage.write_runtime_cookie(account)
         except Exception as e:

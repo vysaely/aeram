@@ -52,6 +52,9 @@ def clean_cookie(raw: str) -> str:
     return raw.strip('"').strip("'")
 
 
+BROWSER_TRACKER_FILE = "browser_tracker"
+
+
 class StorageManager:
     def __init__(
         self,
@@ -1210,6 +1213,11 @@ class StorageManager:
         if not cleaned:
             return []
         cookie_line = cleaned if cleaned.startswith(".ROBLOSECURITY=") else f".ROBLOSECURITY={cleaned}"
+        # Mocktail copies the device identity into appStorage before the engine
+        # starts; without one, Roblox rejects requests such as blocking a player.
+        tracker = self.get_browser_tracker(account)
+        if tracker:
+            cookie_line += f"\nRBXEventTrackerV2={tracker}"
 
         written_paths = []
         for c_path in (profile_dir / "roblox.cookie", data_dir / "roblox.cookie"):
@@ -1232,6 +1240,22 @@ class StorageManager:
                 log.warning(f"Could not write runtime cookie to {c_path}: {e}")
 
         return written_paths
+
+    def get_browser_tracker(self, account: RobloxAccount) -> Optional[str]:
+        """The account's saved RBXEventTrackerV2 value (its device identity), if any."""
+        try:
+            value = (self.get_profile_dir(account) / BROWSER_TRACKER_FILE).read_text(encoding="utf-8").strip()
+        except OSError:
+            return None
+        return value if value and "\n" not in value and ";" not in value else None
+
+    def save_browser_tracker(self, account: RobloxAccount, tracker: str) -> None:
+        """Keeps the device identity across launches, like the app's own storage would."""
+        path = self.get_profile_dir(account) / BROWSER_TRACKER_FILE
+        path.parent.mkdir(parents=True, exist_ok=True)
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with open(fd, "w", encoding="utf-8") as f:
+            f.write(tracker.strip() + "\n")
 
     def cleanup_runtime_cookie(self, account_or_id: Union[RobloxAccount, str]) -> int:
         """

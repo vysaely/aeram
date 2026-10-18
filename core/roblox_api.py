@@ -7,7 +7,6 @@ Fetches authenticated user identity, Robux balances, avatar headshots, and game 
 import json
 import logging
 import time
-import random
 import base64
 import urllib.request
 import urllib.error
@@ -22,12 +21,61 @@ log = logging.getLogger("RobloxAPI")
 # Chrome, and don't forge browser-only headers (sec-ch-ua, sec-fetch-*) or the
 # roblox.com Origin/Referer. A browser identity that the connection itself
 # contradicts is a classic bot signal.
+BROWSER_TRACKER_URL = "https://apis.roblox.com/browser-tracker-api/device/initialize"
 USER_AGENT = "AERAM/1.0 (Roblox account manager for Linux; +https://github.com/vysaely/aeram)"
+
+
+def browser_id_from_tracker(tracker: str) -> Optional[str]:
+    """Returns the numeric browserid inside an RBXEventTrackerV2 value, if valid."""
+    for field in (tracker or "").split("&"):
+        name, _, value = field.partition("=")
+        if name == "browserid" and value.isdigit() and not value.startswith("0") and len(value) <= 20:
+            return value
+    return None
 
 
 class RobloxAPI:
     def __init__(self, timeout: float = 6.0):
         self.timeout = timeout
+        self._browser_tracker: Optional[str] = None
+
+    def initialize_browser_tracker(self) -> Optional[str]:
+        """
+        Asks Roblox for a new device identity, as the official app does on first start.
+        Returns the RBXEventTrackerV2 cookie value ("CreateDate=...&browserid=<id>"),
+        or None on failure. Roblox rejects some requests (blocking a user, for one)
+        from sessions that have no such identity.
+        """
+        req = urllib.request.Request(
+            BROWSER_TRACKER_URL,
+            data=b"{}",
+            headers={
+                "User-Agent": USER_AGENT,
+                "Accept": "application/json",
+                "Content-Type": "application/json",
+            },
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=self.timeout) as resp:
+                for header in resp.headers.get_all("Set-Cookie") or []:
+                    name, _, rest = header.partition("=")
+                    if name.strip() != "RBXEventTrackerV2":
+                        continue
+                    value = rest.split(";", 1)[0].strip()
+                    if browser_id_from_tracker(value):
+                        return value
+        except Exception as e:
+            log.warning(f"Could not initialize a browser tracker: {e}")
+        return None
+
+    def _session_cookies(self, clean_cookie: str) -> str:
+        """Cookie header for AERAM's own requests, with one device identity per run."""
+        if self._browser_tracker is None:
+            self._browser_tracker = self.initialize_browser_tracker() or ""
+        if self._browser_tracker:
+            return f".ROBLOSECURITY={clean_cookie}; RBXEventTrackerV2={self._browser_tracker}"
+        return f".ROBLOSECURITY={clean_cookie}"
 
     @staticmethod
     def _format_cookie_header(cookie: Optional[str]) -> Optional[str]:
@@ -893,7 +941,6 @@ class RobloxAPI:
 
         blocked_list = []
         cursor = None
-        browser_id = str(random.randint(1000000000000000000, 9999999999999999999))
 
         while True:
             url = "https://apis.roblox.com/user-blocking-api/v1/users/get-blocked-users?count=50"
@@ -903,7 +950,7 @@ class RobloxAPI:
             headers = {
                 "User-Agent": USER_AGENT,
                 "Accept": "application/json",
-                "Cookie": f".ROBLOSECURITY={clean_cookie}; RBXEventTrackerV2=browserid={browser_id}",
+                "Cookie": self._session_cookies(clean_cookie),
             }
 
             req = urllib.request.Request(url, headers=headers, method="GET")
@@ -945,14 +992,13 @@ class RobloxAPI:
         if clean_cookie.startswith(".ROBLOSECURITY="):
             clean_cookie = clean_cookie[len(".ROBLOSECURITY="):]
 
-        browser_id = str(random.randint(1000000000000000000, 9999999999999999999))
         url = f"https://apis.roblox.com/user-blocking-api/v1/users/{target_user_id}/unblock-user"
 
         headers = {
             "User-Agent": USER_AGENT,
             "Accept": "application/json",
             "Content-Type": "application/json",
-            "Cookie": f".ROBLOSECURITY={clean_cookie}; RBXEventTrackerV2=browserid={browser_id}",
+            "Cookie": self._session_cookies(clean_cookie),
         }
         if csrf_token:
             headers["X-CSRF-TOKEN"] = csrf_token
