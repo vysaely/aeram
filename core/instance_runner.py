@@ -23,7 +23,7 @@ from pathlib import Path
 from urllib.parse import urlparse, parse_qs
 
 from .models import RobloxAccount, RunningInstance
-from .storage import StorageManager, DEFAULT_ALT_FPS
+from .storage import StorageManager, DEFAULT_ALT_FPS, DEFAULT_ALT_MEMORY_HIGH_MB, FRM_QUALITY_FOR_LEVEL
 from .auth_state import AccountAuthState, AccountAuthStateManager
 
 log = logging.getLogger("InstanceRunner")
@@ -482,8 +482,7 @@ class InstanceRunner:
             main_gfx = int(self.storage.get_setting("graphics_quality_level", "7"))
         except (ValueError, TypeError):
             main_gfx = 7
-        frm_scale_map = {1: 1, 2: 3, 3: 5, 4: 7, 5: 9, 6: 11, 7: 14, 8: 16, 9: 18, 10: 21}
-        frm_quality = frm_scale_map.get(main_gfx, 14) if is_main else 1
+        frm_quality = FRM_QUALITY_FOR_LEVEL.get(main_gfx, 14) if is_main else 1
         graphics_quality = "manual" if is_main else str(frm_quality)
         texture_quality = 3 if is_main else 1
 
@@ -644,9 +643,9 @@ class InstanceRunner:
         # and regulate CPU/IO weight so foreground apps are prioritized while keeping input and network responsive.
         if is_alt and shutil.which("systemd-run"):
             try:
-                alt_mem_high = int(self.storage.get_setting("alt_memory_high_mb", "900"))
+                alt_mem_high = int(self.storage.get_setting("alt_memory_high_mb", DEFAULT_ALT_MEMORY_HIGH_MB))
             except (ValueError, TypeError):
-                alt_mem_high = 900
+                alt_mem_high = int(DEFAULT_ALT_MEMORY_HIGH_MB)
             scope_cmd = [
                 "systemd-run",
                 "--user",

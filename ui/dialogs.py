@@ -13,7 +13,7 @@ from typing import Optional, List, Dict, Any
 from PyQt6 import QtWidgets, QtCore, QtGui
 
 from core.models import RobloxAccount
-from core.storage import StorageManager, clean_cookie, DEFAULT_ALT_FPS
+from core.storage import StorageManager, clean_cookie, DEFAULT_ALT_FPS, DEFAULT_ALT_MEMORY_HIGH_MB
 from core.roblox_api import RobloxAPI
 from core.ram_importer import import_from_file_or_text
 from core.diagnostics import DiagnosticsRunner
@@ -542,10 +542,15 @@ class FastFlagsDialog(BorderlessDialog):
         self.combo_preset = QtWidgets.QComboBox()
         self.combo_preset.addItems([
             "Competitive Potato (Maximum FPS & Minimum VRAM)",
-            "Balanced (Recommended Default)",
+            "Balanced",
             "High Fidelity (Maximum Visual Quality)",
             "Custom",
+            "Roblox Defaults (no overrides)",
         ])
+        self.combo_preset.setToolTip(
+            "Applies to the main account; alts always use minimal graphics. "
+            "Roblox Defaults leaves rendering to Roblox and its in-game graphics slider."
+        )
         self.combo_preset.setFixedHeight(28)
         self.combo_preset.currentIndexChanged.connect(self._on_preset_changed)
         h_preset.addWidget(self.combo_preset, stretch=1)
@@ -674,7 +679,6 @@ class FastFlagsDialog(BorderlessDialog):
             "Vulkan runs the Main account on Mocktail's direct-vulkan backend for the lowest input latency "
             "(experimental: the chat text overlay and in-game Anti-AFK need OpenGL). Alts always use OpenGL."
         )
-        self.combo_api.currentIndexChanged.connect(self._on_control_changed)
         grid_eng.addWidget(self.combo_api, 0, 1)
 
         # Dynamic Resolution Scaling
@@ -683,7 +687,6 @@ class FastFlagsDialog(BorderlessDialog):
         self.combo_drs.addItems(["Disabled (Crisp Native)", "Enabled (Roblox Auto)"])
         self.combo_drs.setFixedWidth(240)
         self.combo_drs.setFixedHeight(26)
-        self.combo_drs.currentIndexChanged.connect(self._on_control_changed)
         grid_eng.addWidget(self.combo_drs, 1, 1)
 
         # Telemetry & Crash Reporting
@@ -692,7 +695,6 @@ class FastFlagsDialog(BorderlessDialog):
         self.combo_telemetry.addItems(["Blocked (Private & Lean)", "Enabled"])
         self.combo_telemetry.setFixedWidth(240)
         self.combo_telemetry.setFixedHeight(26)
-        self.combo_telemetry.currentIndexChanged.connect(self._on_control_changed)
         grid_eng.addWidget(self.combo_telemetry, 2, 1)
 
         # Main account cursor
@@ -759,11 +761,14 @@ class FastFlagsDialog(BorderlessDialog):
         self._load_saved_settings()
 
     def _load_saved_settings(self):
-        saved_preset = self.storage.get_setting("fflag_preset", "Balanced")
+        # Nothing saved yet means no overrides are applied at launch: show that.
+        saved_preset = self.storage.get_setting("fflag_preset", "Default")
         if saved_preset == "Potato":
             self.combo_preset.setCurrentIndex(0)
         elif saved_preset == "High":
             self.combo_preset.setCurrentIndex(2)
+        elif saved_preset == "Default":
+            self.combo_preset.setCurrentIndex(self.PRESET_DEFAULT)
         elif saved_preset == "Custom":
             self.combo_preset.setCurrentIndex(3)
             # Load individual custom options
@@ -790,8 +795,9 @@ class FastFlagsDialog(BorderlessDialog):
 
             msaa = self.storage.get_setting("fflag_msaa", "0")
             self.combo_msaa.setCurrentIndex(0 if msaa == "0" else (1 if msaa == "2" else 2))
-        else:
+        elif saved_preset == "Balanced":
             self.combo_preset.setCurrentIndex(1)
+        self._set_video_controls_enabled(self.combo_preset.currentIndex() != self.PRESET_DEFAULT)
 
         saved_api = self.storage.get_setting("fflag_graphics_api", "Auto")
         for i in range(self.combo_api.count()):
@@ -807,8 +813,16 @@ class FastFlagsDialog(BorderlessDialog):
             self.combo_cursor.setCurrentIndex(1)
         self._set_shiftlock_cursor(self.storage.get_setting("shiftlock_cursor_path", "") or "")
 
+    PRESET_DEFAULT = 4
+
+    def _set_video_controls_enabled(self, enabled: bool):
+        for combo in (self.combo_texture, self.combo_level, self.combo_shadows,
+                      self.combo_postfx, self.combo_particles, self.combo_msaa):
+            combo.setEnabled(enabled)
+
     def _on_preset_changed(self, index: int):
-        if self._updating_preset or index == 3:  # Custom
+        self._set_video_controls_enabled(index != self.PRESET_DEFAULT)
+        if self._updating_preset or index in (3, self.PRESET_DEFAULT):  # Custom / Roblox Defaults
             return
         self._updating_preset = True
         try:
@@ -848,7 +862,7 @@ class FastFlagsDialog(BorderlessDialog):
                 self._updating_preset = False
 
     def _reset_defaults(self):
-        self.combo_preset.setCurrentIndex(1)  # Balanced
+        self.combo_preset.setCurrentIndex(self.PRESET_DEFAULT)
         self.combo_api.setCurrentIndex(0)
         self.combo_drs.setCurrentIndex(0)
         self.combo_telemetry.setCurrentIndex(0)
@@ -867,25 +881,30 @@ class FastFlagsDialog(BorderlessDialog):
 
     def _save(self):
         preset_idx = self.combo_preset.currentIndex()
-        preset_name = "Potato" if preset_idx == 0 else ("Balanced" if preset_idx == 1 else ("High" if preset_idx == 2 else "Custom"))
+        preset_name = {0: "Potato", 1: "Balanced", 2: "High", 3: "Custom"}.get(preset_idx, "Default")
         self.storage.set_setting("fflag_preset", preset_name)
+        if preset_name == "Default":
+            # Empty values mean "don't override" to get_effective_fflags.
+            for key in ("fflag_texture_quality", "fflag_graphics_level", "fflag_shadows",
+                        "fflag_postfx", "fflag_particles", "fflag_msaa"):
+                self.storage.set_setting(key, "")
+        else:
+            tex_val = str(self.combo_texture.currentIndex() + 1)
+            self.storage.set_setting("fflag_texture_quality", tex_val)
 
-        tex_val = str(self.combo_texture.currentIndex() + 1)
-        self.storage.set_setting("fflag_texture_quality", tex_val)
+            lvl_val = str(self.combo_level.currentIndex() + 1)
+            self.storage.set_setting("fflag_graphics_level", lvl_val)
 
-        lvl_val = str(self.combo_level.currentIndex() + 1)
-        self.storage.set_setting("fflag_graphics_level", lvl_val)
+            sh_idx = self.combo_shadows.currentIndex()
+            self.storage.set_setting("fflag_shadows", "off" if sh_idx == 0 else ("low" if sh_idx == 1 else "full"))
 
-        sh_idx = self.combo_shadows.currentIndex()
-        self.storage.set_setting("fflag_shadows", "off" if sh_idx == 0 else ("low" if sh_idx == 1 else "full"))
+            self.storage.set_setting("fflag_postfx", "off" if self.combo_postfx.currentIndex() == 0 else "on")
 
-        self.storage.set_setting("fflag_postfx", "off" if self.combo_postfx.currentIndex() == 0 else "on")
+            p_idx = self.combo_particles.currentIndex()
+            self.storage.set_setting("fflag_particles", "disabled" if p_idx == 0 else ("reduced" if p_idx == 1 else "full"))
 
-        p_idx = self.combo_particles.currentIndex()
-        self.storage.set_setting("fflag_particles", "disabled" if p_idx == 0 else ("reduced" if p_idx == 1 else "full"))
-
-        m_idx = self.combo_msaa.currentIndex()
-        self.storage.set_setting("fflag_msaa", "0" if m_idx == 0 else ("2" if m_idx == 1 else "4"))
+            m_idx = self.combo_msaa.currentIndex()
+            self.storage.set_setting("fflag_msaa", "0" if m_idx == 0 else ("2" if m_idx == 1 else "4"))
 
         api_text = self.combo_api.currentText()
         if "Vulkan" in api_text:
@@ -987,9 +1006,9 @@ class SettingsDialog(BorderlessDialog):
         self.spin_alt_mem.setFixedWidth(130)
         self.spin_alt_mem.setFixedHeight(26)
         try:
-            saved_alt_mem = int(self.storage.get_setting("alt_memory_high_mb", "350"))
+            saved_alt_mem = int(self.storage.get_setting("alt_memory_high_mb", DEFAULT_ALT_MEMORY_HIGH_MB))
         except (ValueError, TypeError):
-            saved_alt_mem = 350
+            saved_alt_mem = int(DEFAULT_ALT_MEMORY_HIGH_MB)
         self.spin_alt_mem.setValue(saved_alt_mem)
         grid_perf.addWidget(lbl_alt_mem, 3, 0)
         grid_perf.addWidget(self.spin_alt_mem, 3, 1)
@@ -1061,16 +1080,6 @@ class SettingsDialog(BorderlessDialog):
         grid_launch.addWidget(lbl_stagger, 0, 0)
         grid_launch.addWidget(self.spin_stagger, 0, 1)
 
-        # Trusted Friends
-        lbl_friends = QtWidgets.QLabel("Trusted Friends (Auto-Follow):")
-        lbl_friends.setToolTip("Comma-separated list of trusted friends. Self-Heal will automatically rejoin them if an alt disconnects.")
-        self.input_trusted_friends = QtWidgets.QLineEdit()
-        self.input_trusted_friends.setPlaceholderText("e.g. friend1, friend2, friend3")
-        self.input_trusted_friends.setText(self.storage.get_setting("trusted_friends", ""))
-        self.input_trusted_friends.setFixedHeight(26)
-        grid_launch.addWidget(lbl_friends, 1, 0, 1, 2)
-        grid_launch.addWidget(self.input_trusted_friends, 2, 0, 1, 2)
-
         # Check cookies on startup
         self.chk_startup_cookies = QtWidgets.QCheckBox("Validate account cookies on startup (background)")
         self.chk_startup_cookies.setToolTip("Automatically check if cookies are active and fetch updated Robux balances on launch")
@@ -1079,30 +1088,6 @@ class SettingsDialog(BorderlessDialog):
         grid_launch.addWidget(self.chk_startup_cookies, 3, 0, 1, 2)
 
         layout.addWidget(grp_launch)
-
-        # ── 3. Web Browser Integration ──
-        grp_browser = QtWidgets.QGroupBox("WEB BROWSER INTEGRATION")
-        grid_browser = QtWidgets.QGridLayout(grp_browser)
-        grid_browser.setContentsMargins(12, 14, 12, 10)
-        grid_browser.setHorizontalSpacing(14)
-        grid_browser.setVerticalSpacing(8)
-        grid_browser.setColumnStretch(0, 1)
-        grid_browser.setColumnStretch(1, 0)
-
-        lbl_engine = QtWidgets.QLabel("Browser Engine:")
-        lbl_engine.setToolTip("Select the browser used for Web Login, Captcha verification, and account web sessions")
-        self.combo_browser = QtWidgets.QComboBox()
-        self.combo_browser.addItem("Embedded Chromium (WebEngine)", "internal")
-        self.combo_browser.addItem("Default System Browser (Firefox)", "external")
-        self.combo_browser.setFixedWidth(240)
-        self.combo_browser.setFixedHeight(26)
-        saved_engine = self.storage.get_setting("browser_engine", "internal")
-        idx = self.combo_browser.findData(saved_engine)
-        if idx >= 0:
-            self.combo_browser.setCurrentIndex(idx)
-        grid_browser.addWidget(lbl_engine, 0, 0)
-        grid_browser.addWidget(self.combo_browser, 0, 1)
-        layout.addWidget(grp_browser)
 
         # ── 4. System Diagnostics ──
         grp_diag = QtWidgets.QGroupBox("SYSTEM DIAGNOSTICS")
@@ -1186,9 +1171,10 @@ class SettingsDialog(BorderlessDialog):
         self.storage.set_setting("stagger_delay", str(self.spin_stagger.value()))
         self.storage.set_setting("alt_fps", str(self.spin_alt_fps.value()))
         self.storage.set_setting("alt_memory_high_mb", str(self.spin_alt_mem.value()))
-        self.storage.set_setting("trusted_friends", self.input_trusted_friends.text().strip())
+        # Remembered here; "Apply Preset" is what writes them into each account's Roblox settings.
+        self.storage.set_setting("graphics_quality_level", str(self.combo_gfx.currentData()))
+        self.storage.set_setting("mouse_sensitivity", f"{self.spin_sens.value():.2f}")
         self.storage.set_setting("check_cookies_on_startup", "true" if self.chk_startup_cookies.isChecked() else "false")
-        self.storage.set_setting("browser_engine", self.combo_browser.currentData() or "external")
 
         # Synchronize sandbox profiles
         for acc in self.storage.list_accounts():

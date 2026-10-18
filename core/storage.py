@@ -25,6 +25,10 @@ DEFAULT_SHARED_MOCKTAIL = Path.home() / ".local" / "share" / "mocktail"
 
 # Frame cap for alt accounts when the user has not chosen one in Settings.
 DEFAULT_ALT_FPS = "6"
+# cgroup MemoryHigh per alt; much lower makes Roblox page constantly
+DEFAULT_ALT_MEMORY_HIGH_MB = "900"
+# AERAM's 1-10 graphics level -> Roblox's 1-21 FRM quality scale
+FRM_QUALITY_FOR_LEVEL = {1: 1, 2: 3, 3: 5, 4: 7, 5: 9, 6: 11, 7: 14, 8: 16, 9: 18, 10: 21}
 
 
 def get_default_mocktail_bin() -> Path:
@@ -896,7 +900,15 @@ class StorageManager:
                 "DFIntCanHideGuiGroupId": 32380007,
             }
 
-        # Apply user graphical/engine preferences
+        if self.get_setting("fflag_disable_telemetry", "true").lower() == "true":
+            ff["FFlagDebugDisableCrashReporting"] = True
+            ff["FStringRobloxAnalyticsURL"] = ""
+
+        # Graphics choices are for the main account: alts keep the minimal baseline
+        # above (they run at a few FPS in the background) and always use OpenGL.
+        if is_alt:
+            return self._merge_custom_fastflags(ff)
+
         api_pref = self.get_setting("fflag_graphics_api", "Auto")
         if api_pref == "Vulkan":
             ff["FFlagDebugGraphicsPreferVulkan"] = True
@@ -909,10 +921,6 @@ class StorageManager:
             ff["FFlagDebugDisableDRS"] = True
             ff["FFlagAutomaticDRS"] = False
 
-        if self.get_setting("fflag_disable_telemetry", "true").lower() == "true":
-            ff["FFlagDebugDisableCrashReporting"] = True
-            ff["FStringRobloxAnalyticsURL"] = ""
-
         # Graphical quality overrides from videogame settings menu
         tex_pref = self.get_setting("fflag_texture_quality", "")
         if tex_pref:
@@ -924,8 +932,8 @@ class StorageManager:
         gfx_lvl = self.get_setting("fflag_graphics_level", "")
         if gfx_lvl:
             try:
-                lvl = int(gfx_lvl)
-                ff["DFIntDebugFRMQualityLevelOverride"] = lvl
+                lvl = max(1, min(10, int(gfx_lvl)))
+                ff["DFIntDebugFRMQualityLevelOverride"] = FRM_QUALITY_FOR_LEVEL[lvl]
                 ff["FIntRomarkStartWithGraphicQualityLevel"] = lvl
             except ValueError:
                 pass
@@ -960,7 +968,10 @@ class StorageManager:
             except ValueError:
                 pass
 
-        # Merge custom JSON flags if provided (for backwards compatibility)
+        return self._merge_custom_fastflags(ff)
+
+    def _merge_custom_fastflags(self, ff: dict) -> dict:
+        """Merges the advanced custom_fastflags_json setting (no UI) into ff."""
         custom_raw = self.get_setting("custom_fastflags_json", "")
         if custom_raw.strip():
             try:
