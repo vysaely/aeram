@@ -15,6 +15,8 @@ from pathlib import Path
 import re
 from typing import Dict, Set, Optional
 
+from .instance_runner import LAUNCH_LOG_MARKER
+
 log = logging.getLogger("SelfHeal")
 
 ROBLOX_ERROR_CODES = {
@@ -82,6 +84,11 @@ class SelfHealEngine:
                 size = f.tell()
                 f.seek(max(0, size - 8192))
                 tail = f.read().decode("utf-8", errors="ignore")
+                # Only the current session counts: errors before the newest launch marker
+                # belong to a run that has already been restarted.
+                marker = tail.rfind(LAUNCH_LOG_MARKER)
+                if marker != -1:
+                    tail = tail[marker:]
 
                 # 1. Match explicit Error Code patterns (e.g., Error Code: 277, Error 273)
                 m = re.search(r"Error\s*(?:Code)?:?\s*(\d{3})", tail, re.IGNORECASE)
@@ -208,7 +215,9 @@ class SelfHealEngine:
                 # 2. Retrieve destination Place ID, Job ID, and Follow Target
                 place_id = self.storage.get_setting("SavedPlaceId", "")
                 job_id = self.storage.get_setting("SavedJobId", "")
-                follow_target = self.storage.get_setting("SavedFollowTarget", "").strip()
+                # The main window's Follow box saves as SavedFollowUser.
+                follow_target = (self.storage.get_setting("SavedFollowUser", "")
+                                 or self.storage.get_setting("SavedFollowTarget", "")).strip()
 
                 follow_user_id = None
                 follow_name = None
@@ -257,14 +266,7 @@ class SelfHealEngine:
                                 follow_user_id = t_id
                                 follow_name = follow_target
 
-                # 3. Clean up log so error pattern does not immediately re-trigger
-                try:
-                    if log_path.exists():
-                        with open(log_path, "a", encoding="utf-8") as f:
-                            f.write(f"\n[AERAM Self-Heal] Auto-reconnecting at {time.strftime('%X')}...\n")
-                except Exception:
-                    pass
-
+                # 3. launch_instance writes a new launch marker, which retires the old error.
                 # 4. Relaunch instance seamlessly (via follow if target specified/found, or job_id / place_id)
                 try:
                     self.runner.launch_instance(

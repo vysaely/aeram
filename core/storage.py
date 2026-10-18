@@ -181,7 +181,11 @@ class StorageManager:
         if not acc:
             return
 
-        tags = [t for t in (acc.tags or []) if t.lower() not in ("main", "alt", "165fps", "320fps", "330fps", "24fps")]
+        # Switching High/Low also drops a per-account FPS, so the account runs at the
+        # mode's FPS (what the UI reports); the FPS menu can set one again afterwards.
+        tags = [t for t in (acc.tags or [])
+                if t.lower() not in ("main", "alt", "165fps", "320fps", "330fps", "24fps")
+                and not t.lower().startswith("fps:")]
         if mode == "main":
             tags.append("main")
         else:

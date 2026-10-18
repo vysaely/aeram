@@ -11,6 +11,7 @@ Supports both:
 
 import os
 import shutil
+import time
 import logging
 import subprocess
 import tempfile
@@ -181,9 +182,21 @@ class AppUpdater:
                     timeout=20,
                 )
                 if pull_res.returncode != 0:
-                    err_detail = (pull_res.stderr or pull_res.stdout or "non-fast-forward or uncommitted local changes").strip()
-                    report("Update aborted to preserve local changes.", 100)
-                    return False, f"Git fast-forward update declined to preserve local changes: {err_detail}"
+                    # The GitHub history was rewritten once (personal data scrubbed), so clones
+                    # from before that can't fast-forward. With no uncommitted edits, keep the
+                    # old commits on a backup branch and move to the published main.
+                    dirty = subprocess.run(
+                        ["git", "status", "--porcelain", "--untracked-files=no"],
+                        cwd=str(self.app_root), capture_output=True, text=True, timeout=10,
+                    ).stdout.strip()
+                    if dirty:
+                        err_detail = (pull_res.stderr or pull_res.stdout or "uncommitted local changes").strip()
+                        report("Update aborted to preserve local changes.", 100)
+                        return False, f"Git fast-forward update declined to preserve local changes: {err_detail}"
+                    backup = f"aeram-backup-{time.strftime('%Y%m%d-%H%M%S')}"
+                    report(f"History changed on GitHub; saving current version as branch {backup}...", 75)
+                    subprocess.run(["git", "branch", backup, "HEAD"], cwd=str(self.app_root), check=True, timeout=10)
+                    subprocess.run(["git", "reset", "--hard", "origin/main"], cwd=str(self.app_root), check=True, timeout=20)
 
                 native_dir = self.app_root / "native"
                 build_warn = ""

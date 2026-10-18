@@ -24,6 +24,10 @@ from urllib.parse import urlparse, parse_qs
 
 from .models import RobloxAccount, RunningInstance
 from .storage import StorageManager, DEFAULT_ALT_FPS, DEFAULT_ALT_MEMORY_HIGH_MB, FRM_QUALITY_FOR_LEVEL
+
+# Written to instance.log at every launch; see SelfHealEngine.get_disconnect_reason.
+LAUNCH_LOG_MARKER = "=== AERAM launch"
+INSTANCE_LOG_ROTATE_BYTES = 8 * 1024 * 1024
 from .auth_state import AccountAuthState, AccountAuthStateManager
 
 log = logging.getLogger("InstanceRunner")
@@ -708,8 +712,18 @@ class InstanceRunner:
                     pass
 
         self.auth_state_manager.set_state(account.account_id, AccountAuthState.LAUNCHING)
+        # Each launch appends to instance.log; keep one older generation so it can't grow forever.
+        try:
+            if log_path.stat().st_size > INSTANCE_LOG_ROTATE_BYTES:
+                os.replace(log_path, log_path.with_name(log_path.name + ".1"))
+        except OSError:
+            pass
         try:
             with open(log_path, "a", encoding="utf-8") as log_fd:
+                # Self-Heal only reads what follows the newest marker, so an error from an
+                # earlier session can't make it kill and relaunch this one.
+                log_fd.write(f"\n{LAUNCH_LOG_MARKER} {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
+                log_fd.flush()
                 proc = subprocess.Popen(
                     cmd,
                     env=env,

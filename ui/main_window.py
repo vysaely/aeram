@@ -1373,13 +1373,17 @@ class MainWindow(QtWidgets.QMainWindow):
         self._heal_tick_counter += 1
         if self._heal_tick_counter >= 8:
             self._heal_tick_counter = 0
-            if getattr(self, "self_heal_engine", None) and self.self_heal_engine.running:
-                try:
-                    healed = self.self_heal_engine.check_and_heal()
-                    if healed > 0:
-                        self.statusBar().showMessage(f"Self-Heal: Reconnected {healed} account(s)", 5000)
-                except Exception:
-                    pass
+            if (getattr(self, "self_heal_engine", None) and self.self_heal_engine.running
+                    and not getattr(self, "_self_heal_busy", False)):
+                # Off the GUI thread: a reconnect waits, looks up presence and launches.
+                self._self_heal_busy = True
+
+                def _healed(result):
+                    self._self_heal_busy = False
+                    if isinstance(result, int) and result > 0:
+                        self.statusBar().showMessage(f"Self-Heal: Reconnected {result} account(s)", 5000)
+
+                self._run_in_background(self.self_heal_engine.check_and_heal, _healed)
 
     def _update_status_bar(self):
         now = time.time()

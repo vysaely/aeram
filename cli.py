@@ -125,7 +125,7 @@ def run_cli(args: argparse.Namespace, storage: StorageManager, api: RobloxAPI, r
         accounts = storage.list_accounts()
         print(f"\n==================== ROBLOX ACCOUNTS ({len(accounts)}) ====================")
         if not accounts:
-            print("No accounts configured yet. Run 'aeram add <cookie>' or 'aeram import <file>'.")
+            print("No accounts configured yet. Run 'aeram --add <cookie>' or 'aeram --import <file>'.")
         else:
             fmt = "{:<4} {:<20} {:<18} {:<14} {:<14} {:<12}"
             print(fmt.format("#", "USERNAME", "ALIAS", "GROUP", "MODE", "STATUS"))
