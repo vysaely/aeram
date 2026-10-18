@@ -103,6 +103,84 @@ index eee4d33..520a495 100644
      return true;
    }
    if (std::strcmp(name, "nativeGetCookiesInNetscapeFormat") == 0) {
+diff --git a/src/legacy/legacy_runtime.cc b/src/legacy/legacy_runtime.cc
+index 29d8141..e468ddd 100644
+--- a/src/legacy/legacy_runtime.cc
++++ b/src/legacy/legacy_runtime.cc
+@@ -9,6 +9,7 @@
+ #include <cstdlib>
+ #include <cstring>
+ #include <dlfcn.h>
++#include <fstream>
+ #include <link.h>
+ #include <iomanip>
+ #include <iostream>
+@@ -2295,6 +2296,47 @@ std::string MocktailCookiePath() {
+   return MocktailConfigRoot() + "/cookie";
+ }
+ 
++// The typed credential carries only .ROBLOSECURITY, but the Android app's
++// CookieManager also hands the engine RBXEventTrackerV2, the device identity
++// the BrowserTracker bootstrap keeps next to the session cookie. Roblox
++// rejects some requests (blocking a player, for one) from sessions without it.
++std::string BrowserTrackerCookieValue() {
++  std::string text;
++  const std::string env_cookies = GetEnvString("MOCKTAIL_ROBLOX_COOKIES", "");
++  if (!env_cookies.empty()) {
++    text = env_cookies;
++  } else {
++    std::ifstream input(GetEnvString("MOCKTAIL_COOKIE_FILE",
++                                     MocktailCookiePath().c_str()),
++                        std::ios::binary);
++    char buffer[64 * 1024];
++    input.read(buffer, sizeof(buffer));
++    text.assign(buffer, static_cast<std::size_t>(input.gcount()));
++    std::fill(std::begin(buffer), std::end(buffer), '\0');
++  }
++  std::string value;
++  constexpr std::string_view kPrefix = "RBXEventTrackerV2=";
++  const std::size_t pos = text.find(kPrefix);
++  if (pos != std::string::npos &&
++      (pos == 0 || text[pos - 1] == ';' ||
++       std::isspace(static_cast<unsigned char>(text[pos - 1])))) {
++    const std::size_t start = pos + kPrefix.size();
++    const std::size_t end = text.find_first_of(";\r\n\t", start);
++    value = text.substr(start, end == std::string::npos ? std::string::npos
++                                                        : end - start);
++    while (!value.empty() && value.back() == ' ') value.pop_back();
++    const bool printable =
++        std::all_of(value.begin(), value.end(), [](unsigned char ch) {
++          return ch >= 0x20 && ch < 0x7f && ch != ';' && ch != ',';
++        });
++    if (!printable || value.find("browserid=") == std::string::npos) {
++      value.clear();
++    }
++  }
++  mocktail::runtime::SecurelyClearString(&text);
++  return value;
++}
++
+ bool CookieHasAttribute(const std::string& cookie, const char* attribute) {
+   std::string lower_cookie = cookie;
+   std::string lower_attribute = attribute ? attribute : "";
+@@ -3179,8 +3221,15 @@ void ConfigureNativeSettings(JNIEnv* env, jclass settings_class,
+   jstring http_proxy_host_string = env->NewStringUTF(http_proxy_host.c_str());
+   jstring cookie_base_url_string = env->NewStringUTF(cookie_base_url.c_str());
+   jstring cookie_domain_string = env->NewStringUTF(cookie_domain.c_str());
+-  jstring roblox_cookies_string = env->NewStringUTF(
+-      credential != nullptr ? credential->c_str() : "");
++  std::string multiple_cookies(credential != nullptr ? credential->c_str()
++                                                     : "");
++  const std::string browser_tracker = BrowserTrackerCookieValue();
++  if (!multiple_cookies.empty() && !browser_tracker.empty()) {
++    multiple_cookies.append("; RBXEventTrackerV2=").append(browser_tracker);
++    std::cout << "  [engine] BrowserTracker cookie added to session cookies\n";
++  }
++  jstring roblox_cookies_string = env->NewStringUTF(multiple_cookies.c_str());
++  mocktail::runtime::SecurelyClearString(&multiple_cookies);
+   jstring cookie_manager_cookies_string =
+       env->NewStringUTF(cookie_manager_cookies.c_str());
+   jstring android_id_string = env->NewStringUTF(android_id.c_str());
 diff --git a/tests/jnivm_test.cc b/tests/jnivm_test.cc
 index 183676f..2f399fc 100644
 --- a/tests/jnivm_test.cc
