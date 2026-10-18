@@ -120,11 +120,23 @@ except Exception as _e:
     log.warning(f"PyQt6-WebEngine is not available: {WEBENGINE_ERROR}")
 
 
-CHROME_USER_AGENT = (
-    "Mozilla/5.0 (X11; Linux x86_64) "
-    "AppleWebKit/537.36 (KHTML, like Gecko) "
-    "Chrome/133.0.0.0 Safari/537.36"
-)
+def _chrome_user_agent() -> str:
+    """Chrome's reduced user agent for the Chromium version QtWebEngine really runs.
+
+    Without the QtWebEngine token, and with the same major version the engine
+    reports in its client-hint headers; a hard-coded older Chrome version
+    contradicted those headers, which anti-bot checks flag.
+    """
+    try:
+        from PyQt6.QtWebEngineCore import qWebEngineChromiumVersion
+        major = qWebEngineChromiumVersion().split(".")[0]
+    except Exception:
+        major = "140"
+    return (
+        "Mozilla/5.0 (X11; Linux x86_64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        f"Chrome/{major}.0.0.0 Safari/537.36"
+    )
 
 ROBLOX_LOGIN_URL = "https://www.roblox.com/login"
 
@@ -257,84 +269,6 @@ ROBLOX_2FA_DOM_FIX_JS = """
     setInterval(checkProtectScreen, 800);
 })();
 """
-
-ROBLOX_ENVIRONMENT_RICHNESS_JS = """
-(function() {
-    'use strict';
-    // Completely exempt Arkose Labs, FunCaptcha, Cloudflare, and captcha iframes from any DOM or API tampering
-    try {
-        var loc = (window.location ? (window.location.href || window.location.hostname || '') : '').toLowerCase();
-        if (loc.indexOf('arkose') !== -1 || loc.indexOf('funcaptcha') !== -1 ||
-            loc.indexOf('hcaptcha') !== -1 || loc.indexOf('recaptcha') !== -1 ||
-            loc.indexOf('cloudflare') !== -1) {
-            return;
-        }
-    } catch(e) {}
-
-    if (window._aeram_richness_installed) return;
-    window._aeram_richness_installed = true;
-
-    // 1. Suppress automation indicators (navigator.webdriver)
-    try {
-        if ('webdriver' in Navigator.prototype) {
-            delete Navigator.prototype.webdriver;
-        }
-        if ('webdriver' in navigator) {
-            delete navigator.webdriver;
-        }
-    } catch (e) {}
-
-    // 2. Realistic Chrome runtime, app, csi, loadTimes
-    try {
-        if (!window.chrome) {
-            window.chrome = {};
-        }
-        if (!window.chrome.runtime) {
-            window.chrome.runtime = {
-                connect: function() { return { disconnect: function() {}, onDisconnect: { addListener: function() {} }, onMessage: { addListener: function() {} }, postMessage: function() {} }; },
-                sendMessage: function() {}
-            };
-        }
-    } catch (e) {}
-
-    // 3. Realistic Navigator Hardware & Platform properties matching native Linux desktop
-    try {
-        Object.defineProperty(Navigator.prototype, 'platform', { get: () => 'Linux x86_64', configurable: true });
-        Object.defineProperty(Navigator.prototype, 'vendor', { get: () => 'Google Inc.', configurable: true });
-        Object.defineProperty(Navigator.prototype, 'deviceMemory', { get: () => 8, configurable: true });
-        Object.defineProperty(Navigator.prototype, 'hardwareConcurrency', { get: () => 8, configurable: true });
-        Object.defineProperty(Navigator.prototype, 'languages', { get: () => ['en-US', 'en'], configurable: true });
-        Object.defineProperty(Navigator.prototype, 'language', { get: () => 'en-US', configurable: true });
-    } catch (e) {}
-
-    // 4. Realistic Chrome PluginArray
-    try {
-        var dummyPlugins = [
-            { name: 'PDF Viewer', filename: 'internal-pdf-viewer', description: 'Portable Document Format' },
-            { name: 'Chrome PDF Viewer', filename: 'internal-pdf-viewer', description: 'Portable Document Format' },
-            { name: 'Chromium PDF Viewer', filename: 'internal-pdf-viewer', description: 'Portable Document Format' }
-        ];
-    } catch (e) {}
-
-    // 5. Authentic GPU WebGL Vendor & Renderer
-    try {
-        var UNMASKED_VENDOR_WEBGL = 0x9245;
-        var UNMASKED_RENDERER_WEBGL = 0x9246;
-        function patchContext(proto) {
-            if (!proto || !proto.getParameter) return;
-            var origGet = proto.getParameter;
-            proto.getParameter = function(param) {
-                if (param === UNMASKED_VENDOR_WEBGL) return 'Google Inc. (AMD)';
-                if (param === UNMASKED_RENDERER_WEBGL) return 'ANGLE (AMD, AMD Radeon Graphics (RADV NAVI48), OpenGL 4.6)';
-                return origGet.apply(this, arguments);
-            };
-        }
-        if (typeof WebGLRenderingContext !== 'undefined') patchContext(WebGLRenderingContext.prototype);
-        if (typeof WebGL2RenderingContext !== 'undefined') patchContext(WebGL2RenderingContext.prototype);
-    } catch (e) {}
-})();
-"""
-
 
 class WebLoginDialog(BorderlessDialog):
     """
@@ -602,7 +536,7 @@ class WebLoginDialog(BorderlessDialog):
         # ─── Isolated Chromium WebEngine ───
         # Use an off-the-record profile so logins are completely isolated and never persist to disk
         self.profile = QWebEngineProfile(self)
-        self.profile.setHttpUserAgent(CHROME_USER_AGENT)
+        self.profile.setHttpUserAgent(_chrome_user_agent())
 
         self.page = RobloxWebPage(self.profile, self, navigation_handler=self._handle_roblox_protocol)
 
@@ -619,15 +553,6 @@ class WebLoginDialog(BorderlessDialog):
             s.setAttribute(QWebEngineSettings.WebAttribute.AllowWindowActivationFromJavaScript, True)
             s.setAttribute(QWebEngineSettings.WebAttribute.JavascriptCanOpenWindows, True)
             s.setAttribute(QWebEngineSettings.WebAttribute.LinksIncludedInFocusChain, True)
-
-        # Install stealth anti-fingerprinting & richness injection script at DocumentCreation
-        stealth_script = QWebEngineScript()
-        stealth_script.setName("aeram_environment_richness")
-        stealth_script.setInjectionPoint(QWebEngineScript.InjectionPoint.DocumentCreation)
-        stealth_script.setWorldId(QWebEngineScript.ScriptWorldId.MainWorld)
-        stealth_script.setRunsOnSubFrames(True)
-        stealth_script.setSourceCode(ROBLOX_ENVIRONMENT_RICHNESS_JS)
-        self.profile.scripts().insert(stealth_script)
 
         # Install global script running across all main frames and cross-origin subframes/iframes
         subframe_fix = QWebEngineScript()
