@@ -52,3 +52,5 @@ Uninstall: `./install.sh --uninstall` (your accounts in `~/.local/share/aeram` a
 ## License
 
 [GPL-3.0](LICENSE)
+
+The patches in `native/mocktail/` modify [Mocktail](https://github.com/komaruworld/mocktail), which is licensed under Apache-2.0; those patches are released under Apache-2.0 as well.
