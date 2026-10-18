@@ -417,6 +417,16 @@ class InstanceRunner:
         env["MOCKTAIL_COOKIE_FILE"] = str(profile_dir / "roblox.cookie")
         env["MOCKTAIL_DISABLE_FAILURE_DIALOG"] = "1"
         env["MOCKTAIL_GRAPHICS_BACKEND"] = graphics_backend
+        # Always present a Windows PC with mouse and keyboard and no touchscreen.
+        # Roblox only offers PC settings (camera sensitivity, shift lock, mouse
+        # UI) when it sees a mouse, and a stray variable from the user's session
+        # (or a legacy playability switch) must not flip it to the phone layout.
+        for key in [k for k in env if k.startswith("MOCKTAIL_DEVICE_") or k == "MOCKTAIL_DESKTOP_PLAYABILITY"]:
+            del env[key]
+        env["MOCKTAIL_DEVICE_PROFILE"] = "pc-windows-11"
+        env["MOCKTAIL_TOUCH_MODE"] = "0"
+        env["MOCKTAIL_MOUSE_MODE"] = "1"
+        env["MOCKTAIL_KEYBOARD_MODE"] = "1"
 
         # Detect Mocktail installation details
         from core.mocktail_manager import MocktailManager
