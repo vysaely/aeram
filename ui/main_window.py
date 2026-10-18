@@ -512,6 +512,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self._init_ui()
         is_startup_check = self.storage.get_setting("check_cookies_on_startup", "true").lower() == "true"
         self._load_accounts(validate_auth=is_startup_check)
+        if not is_startup_check:
+            # Startup checks are off: later reloads only check new or changed cookies.
+            self._auth_checked_cookies = {a.account_id: a.cookie for a in self.accounts}
 
         self.poll_timer = QtCore.QTimer(self)
         self.poll_timer.timeout.connect(self._poll_instances)
@@ -1032,7 +1035,12 @@ class MainWindow(QtWidgets.QMainWindow):
         self._update_group_combo_items()
         self._populate_table()
         if validate_auth:
-            self._start_background_auth_validation()
+            # Every edit, login or import reloads the list; re-checking all accounts
+            # each time flooded Roblox with requests. Only check what changed.
+            checked = getattr(self, "_auth_checked_cookies", {})
+            changed = [a for a in self.accounts if checked.get(a.account_id) != a.cookie]
+            if changed:
+                self._start_background_auth_validation(changed)
 
     def _start_background_auth_validation(self, specific_accounts: Optional[List[RobloxAccount]] = None):
         """
@@ -1061,9 +1069,20 @@ class MainWindow(QtWidgets.QMainWindow):
             retire_thread(self._auth_validator_worker)
 
         worker = AuthValidatorWorker(acc_payload, self.api)
+        payload_cookies = dict(acc_payload)
+        worker.account_checked.connect(
+            lambda aid, ok, reason: self._remember_auth_check(aid, reason, payload_cookies.get(aid))
+        )
         worker.account_checked.connect(self._on_background_auth_checked)
         self._auth_validator_worker = worker
         worker.start()
+
+    def _remember_auth_check(self, account_id: str, status_reason: str, cookie: Optional[str]) -> None:
+        if status_reason.startswith("ERROR_"):
+            return  # network trouble: try again on the next reload
+        if not hasattr(self, "_auth_checked_cookies"):
+            self._auth_checked_cookies = {}
+        self._auth_checked_cookies[account_id] = cookie
 
     def _on_background_auth_checked(self, account_id: str, is_valid: bool, status_reason: str):
         if not hasattr(self.runner, "auth_state_manager"):

@@ -42,3 +42,31 @@ def dispose_window(window) -> None:
         window.deleteLater()
     except RuntimeError:
         pass
+
+
+class _CallWorker(QtCore.QThread):
+    result = QtCore.pyqtSignal(object)
+
+    def __init__(self, fn, parent):
+        super().__init__(parent)
+        self._fn = fn
+
+    def run(self):
+        try:
+            value = self._fn()
+        except Exception as e:  # handed to the callback like a normal result
+            value = e
+        self.result.emit(value)
+
+
+def run_in_thread(owner: QtCore.QObject, fn, on_done) -> QtCore.QThread:
+    """Runs fn() off the GUI thread and calls on_done(result) on it.
+
+    on_done should be a method of owner: if owner is deleted first, Qt drops the
+    connection and the result is discarded. An exception is passed as the result.
+    """
+    worker = _CallWorker(fn, owner)
+    worker.result.connect(on_done)
+    worker.finished.connect(worker.deleteLater)
+    worker.start()
+    return worker

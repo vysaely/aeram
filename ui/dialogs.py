@@ -22,6 +22,7 @@ from core.updater import AppUpdater
 from ui.theme import DARK_THEME_QSS
 from ui.web_login_dialog import WebLoginDialog
 from ui.borderless_dialog import BorderlessDialog, BorderlessInputDialog, BorderlessMessageBox as QMessageBox
+from ui.thread_keeper import run_in_thread
 from core.totp import generate_totp, get_totp_remaining_seconds
 
 
@@ -96,10 +97,13 @@ class AddAccountDialog(BorderlessDialog):
         self.add_btn.setEnabled(False)
         self.status_label.setStyleSheet("color: #cccccc;")
         self.status_label.setText("Validating cookie against Roblox API...")
-        QtWidgets.QApplication.processEvents()
+        self._pending_cookie = cookie
+        run_in_thread(self, lambda: self.api.enrich_account(cookie), self._on_cookie_enriched)
 
-        # Enrich via API
-        data = self.api.enrich_account(cookie)
+    def _on_cookie_enriched(self, data):
+        cookie = self._pending_cookie
+        if isinstance(data, Exception):
+            data = None
         if not data:
             self.status_label.setStyleSheet("color: #ffffff; font-weight: bold;")
             self.status_label.setText("Cookie is invalid, expired, or offline. Could not authenticate.")
@@ -1823,8 +1827,14 @@ class UnblockEveryoneDialog(BorderlessDialog):
     def _load_blocked_users(self):
         if self.worker is not None:
             return
+        cookie = self.account.cookie
+        run_in_thread(self, lambda: self.api.get_blocked_users(cookie), self._on_blocked_users_loaded)
+
+    def _on_blocked_users_loaded(self, result):
         try:
-            self.blocked_users = self.api.get_blocked_users(self.account.cookie)
+            if isinstance(result, Exception):
+                raise result
+            self.blocked_users = result
             count = len(self.blocked_users)
             if count == 0:
                 self.status_lbl.setText("No blocked users found for this account. Your block list is completely clean!")
