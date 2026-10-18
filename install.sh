@@ -11,7 +11,7 @@ PREFIX="${HOME}/.local"
 
 # Parse CLI arguments
 UNINSTALL=false
-WITH_MOCKTAIL=false
+WITH_MOCKTAIL=true
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --uninstall|-u)
@@ -19,7 +19,12 @@ while [[ $# -gt 0 ]]; do
             shift
             ;;
         --with-mocktail)
+            # Default since the patch moved into the installer; kept for old instructions.
             WITH_MOCKTAIL=true
+            shift
+            ;;
+        --no-mocktail)
+            WITH_MOCKTAIL=false
             shift
             ;;
         --prefix|-p)
@@ -31,8 +36,9 @@ while [[ $# -gt 0 ]]; do
             echo ""
             echo "Options:"
             echo "  --prefix <path>   Installation prefix (default: ~/.local)"
-            echo "  --with-mocktail   Build and install Mocktail with AERAM's input-latency patch"
-            echo "                    (hardware cursor, 1 ms input polling, no 240 FPS cap)"
+            echo "  --no-mocktail     Don't build AERAM's patched Mocktail; use a system Mocktail package"
+            echo "                    (by default the installer builds upstream Mocktail with native/mocktail/*.patch:"
+            echo "                    hardware cursor, 1 ms input polling, no 240 FPS cap)"
             echo "  --uninstall, -u   Remove AERAM desktop entries and launcher shortcuts"
             echo "  --help, -h        Show this help message"
             exit 0
@@ -177,12 +183,22 @@ print(MocktailManager().get_installation_instructions())
 fi
 
 if [ "${WITH_MOCKTAIL}" = true ]; then
-    echo "[3b] Building AERAM-patched Mocktail..."
-    if ! "${SCRIPT_DIR}/scripts/build_mocktail.sh"; then
-        echo "  [!] Patched Mocktail was not installed; AERAM keeps using the Mocktail found above."
+    # Same fingerprint build_mocktail.sh writes, so re-running the installer skips the rebuild.
+    PATCH_STAMP="$(tr -d '[:space:]' < "${SCRIPT_DIR}/native/mocktail/UPSTREAM_COMMIT") $(cat "${SCRIPT_DIR}"/native/mocktail/*.patch | sha256sum | cut -c1-16)"
+    if [ -x "${HOME}/.local/bin/mocktail" ] \
+        && [ "$(cat "${HOME}/.local/lib/mocktail/aeram-mocktail-patch" 2>/dev/null)" = "${PATCH_STAMP}" ]; then
+        echo "  [✓] AERAM-patched Mocktail is up to date."
+    else
+        echo "[3b] Building AERAM-patched Mocktail (skip with --no-mocktail)..."
+        if ! "${SCRIPT_DIR}/scripts/build_mocktail.sh"; then
+            if [[ "${MOCKTAIL_INFO}" == INSTALLED* ]]; then
+                echo "  [!] Patched Mocktail was not installed; AERAM keeps using the Mocktail found above."
+            else
+                echo "  [!] Patched Mocktail was not installed and no other Mocktail was found."
+                echo "      Fix the build or install a Mocktail package, then re-run ./install.sh."
+            fi
+        fi
     fi
-elif [[ "${MOCKTAIL_INFO}" == INSTALLED* ]] && [ "${M_PATCHED:-0}" != "1" ]; then
-    echo "  [i] For a cursor that keeps up with the mouse, rerun with --with-mocktail."
 fi
 
 # 4. Native companion helper compilation

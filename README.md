@@ -18,8 +18,10 @@ Vibecoded.
 
 ## Installation
 
-**Requirements:** Linux x86_64 (Wayland or X11), Python 3.10+, and Mocktail installed as a **native package**
-(AUR `mocktail-bin`, or the `.deb` / `.rpm` from [Mocktail releases](https://github.com/komaruworld/mocktail/releases)).
+**Requirements:** Linux x86_64 (Wayland or X11), Python 3.10+, and Mocktail. `./install.sh` builds AERAM's
+patched Mocktail from source by default (see [Patched Mocktail](#patched-mocktail)), so you only need Mocktail's
+build dependencies. If you skip that build (`--no-mocktail`) or it fails, install Mocktail as a **native package**
+instead (AUR `mocktail-bin`, or the `.deb` / `.rpm` from [Mocktail releases](https://github.com/komaruworld/mocktail/releases)).
 The Mocktail **Flatpak and AppImage do not work** with AERAM: running several accounts at once needs a separate
 copy of the Mocktail program per account, which their sandboxes don't allow.
 
@@ -27,14 +29,19 @@ copy of the Mocktail program per account, which their sandboxes don't allow.
 
 ```bash
 sudo pacman -S --needed python python-pyqt6 python-pyqt6-webengine python-pynacl python-evdev base-devel sdl3 mesa
-paru -S --needed mocktail-bin   # or: yay -S mocktail-bin
+# Patched Mocktail build dependencies:
+sudo pacman -S --needed cmake git ninja pkgconf lld sdl3_ttf curl openssl nlohmann-json libyaml libelf minizip \
+    capstone gtk4 libadwaita webkitgtk-6.0 libutf8proc fontconfig libglvnd libplacebo vulkan-headers \
+    vulkan-icd-loader zlib
+# Or, with ./install.sh --no-mocktail:  paru -S --needed mocktail-bin
 ```
 
 ### Debian / Ubuntu
 
 ```bash
 sudo apt install python3-pyqt6 python3-pyqt6.qtwebengine python3-nacl python3-evdev build-essential libsdl3-dev libgles-dev
-# Mocktail: download mocktail_<version>_amd64.deb from the releases page, then:
+# Patched Mocktail: install the packages from Mocktail's "Build from source" section.
+# Or, with ./install.sh --no-mocktail, download mocktail_<version>_amd64.deb from the releases page, then:
 sudo apt install ./mocktail_*_amd64.deb
 ```
 
@@ -42,7 +49,8 @@ sudo apt install ./mocktail_*_amd64.deb
 
 ```bash
 sudo dnf install python3-pyqt6 python3-pyqt6-webengine python3-pynacl python3-evdev gcc make SDL3-devel mesa-libGLES-devel
-# Mocktail: download mocktail-<version>.x86_64.rpm from the releases page, then:
+# Patched Mocktail: install the packages from Mocktail's "Build from source" section.
+# Or, with ./install.sh --no-mocktail, download mocktail-<version>.x86_64.rpm from the releases page, then:
 sudo dnf install ./mocktail-*.x86_64.rpm
 ```
 
@@ -57,15 +65,14 @@ cd aeram
 ./install.sh
 ```
 
-### Patched Mocktail (recommended for the main account)
+### Patched Mocktail
 
-```bash
-./install.sh --with-mocktail     # or: ./scripts/build_mocktail.sh
-```
-
-Builds upstream Mocktail with `native/mocktail/*.patch` and installs it to `~/.local` (the previous install is
-backed up to `~/.local/lib/mocktail-backup/`). Needs Mocktail's build dependencies; the script lists them if
-any are missing. AERAM uses this build automatically, even when a system Mocktail package is installed. It adds:
+`./install.sh` clones upstream Mocktail at the commit in `native/mocktail/UPSTREAM_COMMIT`, applies
+`native/mocktail/*.patch`, builds it and installs it to `~/.local` (the previous install is backed up to
+`~/.local/lib/mocktail-backup/`). Re-running the installer skips the build while the patches are unchanged;
+`./scripts/build_mocktail.sh` forces a rebuild and `./install.sh --no-mocktail` skips it. The script lists
+Mocktail's build dependencies if any are missing. AERAM uses this build automatically, even when a system
+Mocktail package is installed. It adds:
 
 - **Hardware cursor:** the desktop cursor replaces the arrow Roblox draws into each frame, so it no longer trails
   the mouse. Toggle under Settings → Client Engine & FastFlags → Main Cursor.

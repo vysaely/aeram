@@ -232,7 +232,7 @@ class DiagnosticsRunner:
                     category="Mocktail",
                     status="INFO",
                     message="Stock Mocktail: the in-game cursor is drawn by Roblox and trails the mouse, FPS is capped at 240",
-                    fix_suggestion=f"Run {self.project_root / 'scripts' / 'build_mocktail.sh'} (or ./install.sh --with-mocktail)",
+                    fix_suggestion=f"Run {self.project_root / 'install.sh'} (it builds the patched Mocktail)",
                 ))
         else:
             checks.append(DiagnosticCheck(

@@ -17,7 +17,7 @@ AERAM is a PyQt6 desktop app (plus a CLI) that stores Roblox accounts and runs o
 | `core/paths.py` | Data directory: `~/.local/share/aeram`, or the pre-rename `~/.local/share/ram-linux` when that is where the accounts are |
 | `ui/` | Main window and dialogs |
 | `native/libmocktail_mouse_helper.c` | `LD_PRELOAD` helper inside each game: chat overlay, mouse fixes, in-process anti-AFK, 240 FPS clamp removal |
-| `native/mocktail/*.patch` | Optional patches on upstream Mocktail (`scripts/build_mocktail.sh`) |
+| `native/mocktail/*.patch` | Patches on upstream Mocktail, built by `install.sh` via `scripts/build_mocktail.sh` |
 
 ## Storage
 
