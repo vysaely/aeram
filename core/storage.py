@@ -1068,10 +1068,23 @@ class StorageManager:
         if shared_payloads.exists() and not direct_payloads.exists():
             _link_directory(shared_payloads, direct_payloads)
 
-        # 3b. Link shared content asset cache (rbx-storage) to eliminate redundant downloads and CDN HTTP 429
+        # 3b. Content asset cache (rbx-storage). Alts share one folder to avoid redundant
+        # downloads and CDN HTTP 429. Each account keeps its own cache index, though, and
+        # Roblox deletes files when its index evicts them, leaving other accounts' indexes
+        # pointing at missing files; mains therefore get a private folder.
         shared_rbx = self.base_dir / "shared_rbx_storage"
         shared_rbx.mkdir(mode=0o700, parents=True, exist_ok=True)
         for r_dest in (data_dir / "rbx-storage", profile_dir / "data" / "rbx-storage"):
+            if self.is_main_account(account):
+                if r_dest.is_symlink():
+                    try:
+                        r_dest.unlink()
+                        self._seed_private_rbx_storage(shared_rbx, r_dest)
+                    except Exception as e:
+                        log.warning(f"Failed to give {account.username} a private asset cache: {e}")
+                if not r_dest.exists():
+                    r_dest.mkdir(mode=0o700, parents=True, exist_ok=True)
+                continue
             if r_dest.exists() and not r_dest.is_symlink():
                 try:
                     for item in r_dest.iterdir():
@@ -1240,6 +1253,23 @@ class StorageManager:
                 log.warning(f"Could not write runtime cookie to {c_path}: {e}")
 
         return written_paths
+
+    @staticmethod
+    def _seed_private_rbx_storage(shared: Path, dest: Path) -> None:
+        """Hardlinks the shared cache into a new private one: the account's existing
+        index keeps resolving, no disk space is used, and a file another account
+        evicts from the shared folder stays here."""
+        for src in shared.rglob("*"):
+            if not src.is_file() or src.is_symlink():
+                continue
+            target = dest / src.relative_to(shared)
+            target.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+            try:
+                os.link(src, target)
+            except FileExistsError:
+                pass
+            except OSError:
+                shutil.copy2(src, target)
 
     def get_browser_tracker(self, account: RobloxAccount) -> Optional[str]:
         """The account's saved RBXEventTrackerV2 value (its device identity), if any."""
