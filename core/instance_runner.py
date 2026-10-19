@@ -611,6 +611,9 @@ class InstanceRunner:
             "FFlagHideChallengeWebViewsUntilDisplayed": False,
         }
         fflags_dict.update(challenge_flags)
+        # Roblox enables the animation clip memory cache for the Windows client but
+        # not for the Android build Mocktail runs; keep decoded clips like a PC does.
+        fflags_dict.setdefault("FFlagAnimationClipMemCacheEnabled", True)
 
         fflags_raw = json.dumps(fflags_dict)
         env["MOCKTAIL_CLIENT_SETTINGS_OVERRIDES_JSON"] = fflags_raw
